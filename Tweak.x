@@ -489,9 +489,15 @@ static void VCamSelectVideo(void) {
 @implementation VCamFloat {
     UIWindow *_win;
     UIViewController *_rootVC;
-    UIButton *_btn;
-    UIView  *_menuOverlay;
+    UIButton *_btn;            // Circular floating ball
+    UIView *_menuOverlay;      // Touch-outside dismiss layer
+    UIView *_dockView;         // Vertical capsule dock
+    UIView *_branchView;       // Popout horizontal branch for Zoom & Pan
+    UILabel *_zoomLabel;
     UISlider *_zoomSlider;
+    UIButton *_btnPause;
+    UIButton *_btnZoom;
+    BOOL _isBranchVisible;
     CGFloat _curOffsetX;
     CGFloat _curOffsetY;
 }
@@ -510,14 +516,7 @@ static VCamFloat *gVCamFloat = nil;
 + (void)refreshButton {
     if (!gVCamFloat) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        BOOL active = VCamIsActive();
-        BOOL isPaused = VCamIsPaused();
-        gVCamFloat->_btn.alpha = active ? 0.90 : 0.40;
-        if (!active) {
-            [gVCamFloat->_btn setTitle:@"📷" forState:UIControlStateNormal];
-        } else {
-            [gVCamFloat->_btn setTitle:isPaused ? @"⏸️" : @"🎥" forState:UIControlStateNormal];
-        }
+        [gVCamFloat _updateFloatingState];
     });
 }
 
@@ -525,9 +524,24 @@ static VCamFloat *gVCamFloat = nil;
     if (gVCamFloat) [gVCamFloat _hideMenu];
 }
 
+- (void)_updateFloatingState {
+    BOOL active = VCamIsActive();
+    BOOL isPaused = VCamIsPaused();
+    _btn.alpha = active ? 0.95 : 0.45;
+    if (!active) {
+        [_btn setTitle:@"📷" forState:UIControlStateNormal];
+        _btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
+    } else {
+        [_btn setTitle:isPaused ? @"⏸️" : @"🎥" forState:UIControlStateNormal];
+        _btn.layer.borderColor = isPaused
+            ? [UIColor colorWithRed:1.0 green:0.8 blue:0.2 alpha:0.85].CGColor
+            : [UIColor colorWithRed:0.25 green:0.90 blue:0.45 alpha:0.85].CGColor;
+    }
+}
+
 - (void)_setup {
     if (_win) return;
-    CGFloat sz = 46;
+    CGFloat sz = 50;
     CGRect screen = UIScreen.mainScreen.bounds;
 
     if (@available(iOS 13.0, *)) {
@@ -549,16 +563,20 @@ static VCamFloat *gVCamFloat = nil;
     _rootVC.view.userInteractionEnabled = NO;
     _win.rootViewController = _rootVC;
 
-    // Mini Floating Ball
+    // Floating Button (Model 5 Collapsed Ball)
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(0, 0, sz, sz);
-    btn.center = CGPointMake(screen.size.width - sz / 2 - 10, screen.size.height * 0.40);
-    btn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+    btn.center = CGPointMake(screen.size.width - sz / 2 - 10, screen.size.height * 0.42);
+    btn.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.75];
     btn.layer.cornerRadius = sz / 2;
-    btn.layer.borderWidth = 1.0;
-    btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
+    btn.layer.borderWidth = 1.5;
+    btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
+    btn.layer.shadowColor = [UIColor blackColor].CGColor;
+    btn.layer.shadowOpacity = 0.4;
+    btn.layer.shadowRadius = 6.0;
+    btn.layer.shadowOffset = CGSizeMake(0, 3);
     [btn setTitle:@"📷" forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:19];
+    btn.titleLabel.font = [UIFont systemFontOfSize:22];
     btn.userInteractionEnabled = YES;
     [btn addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
 
@@ -569,16 +587,212 @@ static VCamFloat *gVCamFloat = nil;
     _rootVC.view.userInteractionEnabled = YES;
     _btn = btn;
     _win.hidden = NO;
+    [self _updateFloatingState];
 }
 
 - (void)_tap {
-    if (_menuOverlay) { [self _hideMenu]; return; }
-    [self _showMenu];
+    if (_dockView) {
+        [self _hideMenu];
+    } else {
+        [self _showMenu];
+    }
 }
 
-- (void)_hideMenu {
-    [UIView animateWithDuration:0.2 animations:^{ self->_menuOverlay.alpha = 0; }
-                     completion:^(__unused BOOL f) { [self->_menuOverlay removeFromSuperview]; self->_menuOverlay = nil; }];
+- (UIButton *)_createDockRoundButtonWithTitle:(NSString *)title iconSize:(CGFloat)iconSize tag:(NSInteger)tag sel:(SEL)sel {
+    CGFloat btnSz = 50;
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = CGRectMake(0, 0, btnSz, btnSz);
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:iconSize];
+    b.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.60];
+    b.layer.cornerRadius = btnSz / 2;
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
+    b.layer.shadowColor = [UIColor blackColor].CGColor;
+    b.layer.shadowOpacity = 0.25;
+    b.layer.shadowRadius = 4.0;
+    b.layer.shadowOffset = CGSizeMake(0, 2);
+    b.tag = tag;
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)_showMenu {
+    if (_dockView) return;
+
+    CGRect screen = UIScreen.mainScreen.bounds;
+    BOOL isRight = (_btn.center.x > screen.size.width / 2);
+    _curOffsetX = VCamGetOffsetX();
+    _curOffsetY = VCamGetOffsetY();
+    _isBranchVisible = NO;
+
+    // Full screen dismiss overlay
+    UIView *overlay = [[UIView alloc] initWithFrame:_rootVC.view.bounds];
+    overlay.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.15];
+    UITapGestureRecognizer *dismiss = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(_hideMenu)];
+    [overlay addGestureRecognizer:dismiss];
+
+    // Vertical Capsule Dock Frame: 64 wide x 310 high (5 buttons)
+    CGFloat dockW = 64, dockH = 310;
+    CGFloat dockX = isRight ? (_btn.frame.origin.x - dockW - 10) : (CGRectGetMaxX(_btn.frame) + 10);
+    dockX = MAX(10, MIN(dockX, screen.size.width - dockW - 10));
+
+    CGFloat dockY = _btn.center.y - dockH / 2;
+    dockY = MAX(60, MIN(dockY, screen.size.height - dockH - 40));
+
+    UIView *dock = [[UIView alloc] initWithFrame:CGRectMake(dockX, dockY, dockW, dockH)];
+    dock.backgroundColor = [UIColor clearColor];
+    dock.layer.cornerRadius = dockW / 2; // Capsule shape
+    dock.layer.masksToBounds = YES;
+
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+    blur.frame = dock.bounds;
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    blur.alpha = 0.88;
+    [dock addSubview:blur];
+
+    UIView *borderOverlay = [[UIView alloc] initWithFrame:dock.bounds];
+    borderOverlay.backgroundColor = [UIColor clearColor];
+    borderOverlay.layer.cornerRadius = dockW / 2;
+    borderOverlay.layer.borderWidth = 1.2;
+    borderOverlay.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
+    borderOverlay.userInteractionEnabled = NO;
+    [dock addSubview:borderOverlay];
+
+    // Buttons stacked vertically: 5 large 50x50 buttons
+    CGFloat btnSz = 50;
+    CGFloat startY = 10;
+    CGFloat spacing = 10;
+
+    // 1. Pick Video (🎬)
+    UIButton *btnPick = [self _createDockRoundButtonWithTitle:@"🎬" iconSize:24 tag:1 sel:@selector(_menuSelectVideo)];
+    btnPick.center = CGPointMake(dockW / 2, startY + btnSz / 2);
+    [dock addSubview:btnPick];
+
+    // 2. Play / Pause (⏯️)
+    BOOL isPaused = VCamIsPaused();
+    NSString *pauseTitle = isPaused ? @"▶️" : @"⏸️";
+    _btnPause = [self _createDockRoundButtonWithTitle:pauseTitle iconSize:24 tag:2 sel:@selector(_menuTogglePause)];
+    _btnPause.center = CGPointMake(dockW / 2, startY + (btnSz + spacing) + btnSz / 2);
+    if (VCamIsActive()) {
+        _btnPause.layer.borderColor = isPaused
+            ? [UIColor colorWithRed:1.0 green:0.8 blue:0.2 alpha:0.9].CGColor
+            : [UIColor colorWithRed:0.25 green:0.90 blue:0.45 alpha:0.9].CGColor;
+    }
+    [dock addSubview:_btnPause];
+
+    // 3. Zoom & Pan (🔍)
+    _btnZoom = [self _createDockRoundButtonWithTitle:@"🔍" iconSize:22 tag:3 sel:@selector(_toggleBranch)];
+    _btnZoom.center = CGPointMake(dockW / 2, startY + (btnSz + spacing) * 2 + btnSz / 2);
+    [dock addSubview:_btnZoom];
+
+    // 4. Trash / Disable (🗑️)
+    UIButton *btnTrash = [self _createDockRoundButtonWithTitle:@"🗑️" iconSize:22 tag:4 sel:@selector(_menuDisable)];
+    btnTrash.center = CGPointMake(dockW / 2, startY + (btnSz + spacing) * 3 + btnSz / 2);
+    btnTrash.backgroundColor = [UIColor colorWithRed:0.8 green:0.15 blue:0.15 alpha:0.35];
+    btnTrash.layer.borderColor = [UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:0.5].CGColor;
+    [dock addSubview:btnTrash];
+
+    // 5. Close / Collapse (✕)
+    UIButton *btnClose = [self _createDockRoundButtonWithTitle:@"✕" iconSize:20 tag:5 sel:@selector(_hideMenu)];
+    btnClose.center = CGPointMake(dockW / 2, startY + (btnSz + spacing) * 4 + btnSz / 2);
+    [btnClose setTitleColor:[UIColor colorWithWhite:0.9 alpha:1.0] forState:UIControlStateNormal];
+    [dock addSubview:btnClose];
+
+    [overlay addSubview:dock];
+    _dockView = dock;
+    _menuOverlay = overlay;
+
+    // Popout Branch for Zoom & Pan (initially hidden/collapsed)
+    [self _buildBranchViewIsRight:isRight dockFrame:dock.frame];
+
+    [_rootVC.view insertSubview:overlay belowSubview:_btn];
+
+    // Smooth opening spring animation
+    dock.transform = CGAffineTransformMakeScale(0.7, 0.7);
+    dock.alpha = 0;
+    overlay.alpha = 0;
+    [UIView animateWithDuration:0.30 delay:0
+         usingSpringWithDamping:0.75 initialSpringVelocity:0.5
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        overlay.alpha = 1.0;
+        dock.alpha = 1.0;
+        dock.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+
+- (void)_buildBranchViewIsRight:(BOOL)isRight dockFrame:(CGRect)dockFrame {
+    CGRect screen = UIScreen.mainScreen.bounds;
+    CGFloat branchW = 190, branchH = 145;
+
+    // Align branch horizontally with Zoom button
+    CGFloat zoomCenterY = dockFrame.origin.y + 10 + (50 + 10) * 2 + 25;
+    CGFloat branchY = zoomCenterY - branchH / 2;
+    branchY = MAX(60, MIN(branchY, screen.size.height - branchH - 40));
+
+    CGFloat branchX = isRight ? (dockFrame.origin.x - branchW - 8) : (CGRectGetMaxX(dockFrame) + 8);
+    branchX = MAX(8, MIN(branchX, screen.size.width - branchW - 8));
+
+    UIView *branch = [[UIView alloc] initWithFrame:CGRectMake(branchX, branchY, branchW, branchH)];
+    branch.backgroundColor = [UIColor clearColor];
+    branch.layer.cornerRadius = 20;
+    branch.layer.masksToBounds = YES;
+
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
+    blur.frame = branch.bounds;
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    blur.alpha = 0.90;
+    [branch addSubview:blur];
+
+    UIView *border = [[UIView alloc] initWithFrame:branch.bounds];
+    border.layer.cornerRadius = 20;
+    border.layer.borderWidth = 1.2;
+    border.layer.borderColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:0.6].CGColor;
+    border.userInteractionEnabled = NO;
+    [branch addSubview:border];
+
+    // Top: Zoom label & slider
+    CGFloat curScale = VCamGetScale();
+    _zoomLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 8, branchW - 20, 18)];
+    _zoomLabel.text = [NSString stringWithFormat:@"Zoom: %.1fx", curScale];
+    _zoomLabel.textColor = [UIColor whiteColor];
+    _zoomLabel.font = [UIFont boldSystemFontOfSize:13];
+    _zoomLabel.textAlignment = NSTextAlignmentCenter;
+    [branch addSubview:_zoomLabel];
+
+    _zoomSlider = [[UISlider alloc] initWithFrame:CGRectMake(12, 28, branchW - 24, 24)];
+    _zoomSlider.minimumValue = 1.0f;
+    _zoomSlider.maximumValue = 2.5f;
+    _zoomSlider.value = curScale;
+    _zoomSlider.tintColor = [UIColor colorWithRed:0.25 green:0.85 blue:1.0 alpha:1.0];
+    [_zoomSlider addTarget:self action:@selector(_sliderChanged:) forControlEvents:UIControlEventValueChanged];
+    [branch addSubview:_zoomSlider];
+
+    // Bottom: D-Pad 4 directional buttons + Center Reset
+    CGFloat dW = 38, dH = 26;
+    CGFloat midX = (branchW - dW) / 2;
+    CGFloat padTopY = 56;
+
+    // Up
+    [branch addSubview:[self _dpadButtonWithTitle:@"▲" x:midX y:padTopY w:dW h:dH sel:@selector(_moveUp)]];
+
+    // Left | Reset | Right
+    CGFloat row2Y = padTopY + dH + 3;
+    [branch addSubview:[self _dpadButtonWithTitle:@"◀" x:midX - dW - 6 y:row2Y w:dW h:dH sel:@selector(_moveLeft)]];
+    [branch addSubview:[self _dpadButtonWithTitle:@"●" x:midX y:row2Y w:dW h:dH sel:@selector(_moveReset)]];
+    [branch addSubview:[self _dpadButtonWithTitle:@"▶" x:midX + dW + 6 y:row2Y w:dW h:dH sel:@selector(_moveRight)]];
+
+    // Down
+    CGFloat row3Y = row2Y + dH + 3;
+    [branch addSubview:[self _dpadButtonWithTitle:@"▼" x:midX y:row3Y w:dW h:dH sel:@selector(_moveDown)]];
+
+    branch.alpha = 0;
+    branch.hidden = YES;
+    [_menuOverlay addSubview:branch];
+    _branchView = branch;
 }
 
 - (UIButton *)_dpadButtonWithTitle:(NSString *)title x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h sel:(SEL)action {
@@ -586,179 +800,68 @@ static VCamFloat *gVCamFloat = nil;
     b.frame = CGRectMake(x, y, w, h);
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:13.5];
-    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    b.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.55];
     b.layer.cornerRadius = 6;
-    b.layer.borderWidth = 0.6;
-    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
+    b.layer.borderWidth = 0.8;
+    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
 
-- (UIButton *)_iconButtonWithTitle:(NSString *)title x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h color:(UIColor *)color sel:(SEL)action {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(x, y, w, h);
-    [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:color forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:14];
-    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.22];
-    b.layer.cornerRadius = 8;
-    b.layer.borderWidth = 0.6;
-    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.30].CGColor;
-    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    return b;
+- (void)_toggleBranch {
+    _isBranchVisible = !_isBranchVisible;
+    if (_isBranchVisible) {
+        _branchView.hidden = NO;
+        _btnZoom.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.9 alpha:0.45];
+        _btnZoom.layer.borderColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:0.85].CGColor;
+        _branchView.transform = CGAffineTransformMakeScale(0.8, 0.8);
+        [UIView animateWithDuration:0.25 delay:0
+             usingSpringWithDamping:0.75 initialSpringVelocity:0.5
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            self->_branchView.alpha = 1.0;
+            self->_branchView.transform = CGAffineTransformIdentity;
+        } completion:nil];
+    } else {
+        _btnZoom.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.60];
+        _btnZoom.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
+        [UIView animateWithDuration:0.20 animations:^{
+            self->_branchView.alpha = 0;
+            self->_branchView.transform = CGAffineTransformMakeScale(0.8, 0.8);
+        } completion:^(__unused BOOL f) {
+            self->_branchView.hidden = YES;
+        }];
+    }
 }
 
-- (void)_showMenu {
-    BOOL isPaused = VCamIsPaused();
-    CGFloat currentScale = VCamGetScale();
-    _curOffsetX = VCamGetOffsetX();
-    _curOffsetY = VCamGetOffsetY();
-
-    CGRect screen = UIScreen.mainScreen.bounds;
-    CGFloat w = 175, h = 175;
-
-    // Fully clear touch-outside dismiss overlay
-    UIView *overlay = [[UIView alloc] initWithFrame:_rootVC.view.bounds];
-    overlay.backgroundColor = [UIColor clearColor];
-    UITapGestureRecognizer *dismiss = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(_hideMenu)];
-    [overlay addGestureRecognizer:dismiss];
-
-    CGFloat panelX = (_btn.center.x > screen.size.width / 2)
-        ? _btn.frame.origin.x - w - 8
-        : CGRectGetMaxX(_btn.frame) + 8;
-    panelX = MAX(8, MIN(panelX, screen.size.width - w - 8));
-    CGFloat panelY = MIN(_btn.center.y - h / 2,
-                         screen.size.height - h - 15);
-    panelY = MAX(15, panelY);
-
-    // Compact Rounded Square Panel (~175x175)
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(panelX, panelY, w, h)];
-    panel.backgroundColor = [UIColor clearColor];
-    panel.layer.cornerRadius = 18;
-    panel.layer.masksToBounds = YES;
-
-    UIVisualEffectView *blurView = [[UIVisualEffectView alloc] initWithEffect:
-        [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
-    blurView.frame = panel.bounds;
-    blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    blurView.alpha = 0.20;
-    [panel addSubview:blurView];
-
-    UIView *tintOverlay = [[UIView alloc] initWithFrame:panel.bounds];
-    tintOverlay.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.18];
-    tintOverlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    tintOverlay.layer.borderWidth = 0.8;
-    tintOverlay.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
-    tintOverlay.layer.cornerRadius = 18;
-    [panel addSubview:tintOverlay];
-
-    UITapGestureRecognizer *noop = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
-    [panel addGestureRecognizer:noop];
-
-    // ── 1. Top: Mini Zoom Slider with [-] and [+] ──
-    CGFloat minusBtnW = 22, plusBtnW = 22, ctrlY = 8, ctrlH = 22;
-    UIButton *minusBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    minusBtn.frame = CGRectMake(8, ctrlY, minusBtnW, ctrlH);
-    [minusBtn setTitle:@"−" forState:UIControlStateNormal];
-    [minusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    minusBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    minusBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
-    minusBtn.layer.cornerRadius = 5;
-    minusBtn.layer.borderWidth = 0.6;
-    minusBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.30].CGColor;
-    [minusBtn addTarget:self action:@selector(_zoomMinus) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:minusBtn];
-
-    CGFloat sliderX = CGRectGetMaxX(minusBtn.frame) + 6;
-    CGFloat sliderW = w - sliderX - plusBtnW - 8 - 6;
-    _zoomSlider = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, ctrlY, sliderW, ctrlH)];
-    _zoomSlider.minimumValue = 1.0f;
-    _zoomSlider.maximumValue = 2.5f;
-    _zoomSlider.value = currentScale;
-    _zoomSlider.tintColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
-    [_zoomSlider addTarget:self action:@selector(_sliderChanged:) forControlEvents:UIControlEventValueChanged];
-    [panel addSubview:_zoomSlider];
-
-    UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    plusBtn.frame = CGRectMake(w - plusBtnW - 8, ctrlY, plusBtnW, ctrlH);
-    [plusBtn setTitle:@"+" forState:UIControlStateNormal];
-    [plusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    plusBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    plusBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
-    plusBtn.layer.cornerRadius = 5;
-    plusBtn.layer.borderWidth = 0.6;
-    plusBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.30].CGColor;
-    [plusBtn addTarget:self action:@selector(_zoomPlus) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:plusBtn];
-
-    // ── 2. Middle: D-Pad 4-Way Cross Controller ──
-    CGFloat dBtnW = 34, dBtnH = 24;
-    CGFloat midX = (w - dBtnW) / 2.0;
-
-    // Up
-    [panel addSubview:[self _dpadButtonWithTitle:@"▲" x:midX y:36 w:dBtnW h:dBtnH sel:@selector(_moveUp)]];
-
-    // Left | Center | Right
-    CGFloat row2Y = 36 + dBtnH + 3;
-    [panel addSubview:[self _dpadButtonWithTitle:@"◀" x:midX - dBtnW - 5 y:row2Y w:dBtnW h:dBtnH sel:@selector(_moveLeft)]];
-    [panel addSubview:[self _dpadButtonWithTitle:@"●" x:midX y:row2Y w:dBtnW h:dBtnH sel:@selector(_moveReset)]];
-    [panel addSubview:[self _dpadButtonWithTitle:@"▶" x:midX + dBtnW + 5 y:row2Y w:dBtnW h:dBtnH sel:@selector(_moveRight)]];
-
-    // Down
-    CGFloat row3Y = row2Y + dBtnH + 3;
-    [panel addSubview:[self _dpadButtonWithTitle:@"▼" x:midX y:row3Y w:dBtnW h:dBtnH sel:@selector(_moveDown)]];
-
-    // ── 3. Bottom: 4 Action Icon Buttons (Horizontal Row) ──
-    CGFloat iconW = 34, iconH = 30, iconY = 135;
-    CGFloat totalIconsW = 4 * iconW + 3 * 6;
-    CGFloat startIconX = (w - totalIconsW) / 2.0;
-
-    // Icon 1: Chọn video (🎬)
-    UIButton *pickBtn = [self _iconButtonWithTitle:@"🎬" x:startIconX y:iconY w:iconW h:iconH color:[UIColor whiteColor] sel:@selector(_menuSelectVideo)];
-    [panel addSubview:pickBtn];
-
-    // Icon 2: Tạm dừng / Tiếp tục (⏸️ / ▶️)
-    NSString *pauseIcon = isPaused ? @"▶️" : @"⏸️";
-    UIColor *pauseCol = isPaused ? [UIColor colorWithRed:0.4 green:0.95 blue:0.5 alpha:1] : [UIColor colorWithRed:1.0 green:0.85 blue:0.3 alpha:1];
-    UIButton *pauseBtn = [self _iconButtonWithTitle:pauseIcon x:startIconX + iconW + 6 y:iconY w:iconW h:iconH color:pauseCol sel:@selector(_menuTogglePause)];
-    [panel addSubview:pauseBtn];
-
-    // Icon 3: Xóa video (🗑️)
-    UIButton *trashBtn = [self _iconButtonWithTitle:@"🗑️" x:startIconX + (iconW + 6)*2 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:1 green:0.45 blue:0.45 alpha:1] sel:@selector(_menuDisable)];
-    [panel addSubview:trashBtn];
-
-    // Icon 4: Đóng (✕)
-    UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + 6)*3 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
-    [panel addSubview:closeBtn];
-
-    [overlay addSubview:panel];
-    [_rootVC.view insertSubview:overlay belowSubview:_btn];
-    _menuOverlay = overlay;
-
-    overlay.alpha = 0;
-    [UIView animateWithDuration:0.2 animations:^{ overlay.alpha = 1.0; }];
-}
-
-- (void)_updateZoomValue:(CGFloat)scale {
-    if (scale < 1.0f) scale = 1.0f;
-    if (scale > 2.5f) scale = 2.5f;
-    VCamSetScale(scale);
-    _zoomSlider.value = scale;
+- (void)_hideMenu {
+    if (!_dockView) return;
+    [UIView animateWithDuration:0.22 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
+        self->_dockView.alpha = 0;
+        self->_dockView.transform = CGAffineTransformMakeScale(0.7, 0.7);
+        if (self->_branchView) {
+            self->_branchView.alpha = 0;
+            self->_branchView.transform = CGAffineTransformMakeScale(0.7, 0.7);
+        }
+        self->_menuOverlay.alpha = 0;
+    } completion:^(__unused BOOL f) {
+        [self->_dockView removeFromSuperview];
+        [self->_branchView removeFromSuperview];
+        [self->_menuOverlay removeFromSuperview];
+        self->_dockView = nil;
+        self->_branchView = nil;
+        self->_menuOverlay = nil;
+        self->_isBranchVisible = NO;
+    }];
 }
 
 - (void)_sliderChanged:(UISlider *)slider {
-    [self _updateZoomValue:slider.value];
-}
-
-- (void)_zoomMinus {
-    CGFloat current = VCamGetScale();
-    [self _updateZoomValue:current - 0.05f];
-}
-
-- (void)_zoomPlus {
-    CGFloat current = VCamGetScale();
-    [self _updateZoomValue:current + 0.05f];
+    CGFloat scale = slider.value;
+    if (scale < 1.0f) scale = 1.0f;
+    if (scale > 2.5f) scale = 2.5f;
+    VCamSetScale(scale);
+    _zoomLabel.text = [NSString stringWithFormat:@"Zoom: %.1fx", scale];
 }
 
 - (void)_moveUp {
@@ -789,7 +892,9 @@ static VCamFloat *gVCamFloat = nil;
     _curOffsetX = 0.0f;
     _curOffsetY = 0.0f;
     VCamSetOffsets(0.0f, 0.0f);
-    [self _updateZoomValue:1.0f];
+    VCamSetScale(1.0f);
+    _zoomSlider.value = 1.0f;
+    _zoomLabel.text = @"Zoom: 1.0x";
 }
 
 - (void)_menuTogglePause {
@@ -798,8 +903,12 @@ static VCamFloat *gVCamFloat = nil;
     } else {
         VCamWriteFlag(kVCamPauseFlagPath, "1");
     }
-    [self _hideMenu];
-    VCamFloatRefreshButton();
+    BOOL isPaused = VCamIsPaused();
+    [_btnPause setTitle:(isPaused ? @"▶️" : @"⏸️") forState:UIControlStateNormal];
+    _btnPause.layer.borderColor = isPaused
+        ? [UIColor colorWithRed:1.0 green:0.8 blue:0.2 alpha:0.9].CGColor
+        : [UIColor colorWithRed:0.25 green:0.90 blue:0.45 alpha:0.9].CGColor;
+    [self _updateFloatingState];
 }
 
 - (void)_menuSelectVideo {
@@ -826,13 +935,13 @@ static VCamFloat *gVCamFloat = nil;
 
 - (void)_snapButton:(UIView *)btn {
     CGRect screen = UIScreen.mainScreen.bounds;
-    CGFloat pad = 10 + btn.bounds.size.width / 2;
+    CGFloat pad = 12 + btn.bounds.size.width / 2;
     CGFloat x = btn.center.x < screen.size.width / 2
         ? pad : screen.size.width - pad;
     CGFloat halfH = btn.bounds.size.height / 2;
     CGFloat y = MAX(80 + halfH, MIN(btn.center.y, screen.size.height - 80 - halfH));
     [UIView animateWithDuration:0.35 delay:0
-         usingSpringWithDamping:0.7 initialSpringVelocity:0.5
+         usingSpringWithDamping:0.72 initialSpringVelocity:0.5
                         options:UIViewAnimationOptionCurveEaseOut
                      animations:^{ btn.center = CGPointMake(x, y); }
                      completion:nil];
@@ -845,7 +954,19 @@ static void VCamFloatRefreshButton(void)     { [VCamFloat refreshButton]; }
 static void VCamFloatHideMenu(void)          { [VCamFloat hideMenu]; }
 
 static void VCamInitSpringBoardHooks(void) {
+    if (@available(iOS 13.0, *)) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:UISceneDidActivateNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            [VCamFloat show];
+        }];
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [VCamFloat show];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [VCamFloat show];
     });
