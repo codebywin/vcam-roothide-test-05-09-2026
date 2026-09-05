@@ -93,6 +93,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
+git fetch --tags origin >nul 2>&1
+git show-ref --tags --quiet
+if errorlevel 1 (
+    echo No tags found. Creating initial version v1.0.0...
+    git tag -a v1.0.0 -m "Version 1.0.0"
+    if errorlevel 1 (
+        echo Failed to create tag v1.0.0.
+        pause
+        exit /b 1
+    )
+    git push origin v1.0.0
+    if errorlevel 1 (
+        echo Failed to push tag v1.0.0.
+        pause
+        exit /b 1
+    )
+)
+
 echo.
 echo Commit and push completed successfully.
 pause
