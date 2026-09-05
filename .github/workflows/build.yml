@@ -9,6 +9,9 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -56,3 +59,10 @@ jobs:
           files: packages/*.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create build tag
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        run: |
+          TAG="build-${GITHUB_RUN_ID}-${GITHUB_SHA:0:7}"
+          git tag -a "$TAG" "$GITHUB_SHA" -m "Successful build $TAG"
+          git push origin "$TAG"
