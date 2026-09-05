@@ -7,7 +7,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = vcamios
 
 vcamios_FILES      = Tweak.x
-vcamios_CFLAGS     = -fobjc-arc
+vcamios_CFLAGS     = -fobjc-arc -Wno-unused-variable -Wno-unused-function
 vcamios_FRAMEWORKS = Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage
 vcamios_PRIVATE_FRAMEWORKS = CMCapture
 

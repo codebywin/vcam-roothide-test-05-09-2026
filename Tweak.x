@@ -31,7 +31,6 @@ static NSString *const kVCamTempFile         = @"/private/var/tmp/vcam_temp.mov"
 static NSString *const kVCamTempFileAlt      = @"/var/tmp/vcam_temp.mov";
 
 static NSFileManager *gFileManager = nil;
-static BOOL gNeedsReaderReload = YES;
 static NSDate *gLastTempFileModified = nil;
 static int32_t gVideoExifOrientation = 1;
 
