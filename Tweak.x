@@ -4,6 +4,24 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#if __has_include(<VideoToolbox/VTPixelTransferSession.h>)
+#import <VideoToolbox/VTPixelTransferSession.h>
+#endif
+
+#ifndef VTPixelTransferSessionRef
+typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+OSStatus VTPixelTransferSessionCreate(CFAllocatorRef allocator, VTPixelTransferSessionRef *pixelTransferSessionOut);
+OSStatus VTPixelTransferSessionTransferImage(VTPixelTransferSessionRef session, CVPixelBufferRef sourceBuffer, CVPixelBufferRef destinationBuffer);
+void VTPixelTransferSessionInvalidate(VTPixelTransferSessionRef session);
+#ifdef __cplusplus
+}
+#endif
+
 #import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
@@ -136,11 +154,6 @@ static VTPixelTransferSessionRef VCamGetThreadTransferSession(void) {
     static __thread VTPixelTransferSessionRef threadSession = NULL;
     if (!threadSession) {
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &threadSession);
-        if (threadSession) {
-            VTSessionSetProperty(threadSession,
-                                 kVTPixelTransferPropertyKey_ScalingMode,
-                                 kVTScalingMode_CropSourceToCleanAperture);
-        }
     }
     return threadSession;
 }
