@@ -14,14 +14,21 @@
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-static const char *kVCamTempFilePath    = "/var/tmp/vcam_temp.mov";
-static const char *kVCamEnabledFlagPath = "/var/tmp/vcam_enabled";
-static const char *kVCamPauseFlagPath   = "/var/tmp/vcam_paused";
-static const char *kVCamScaleFilePath   = "/var/tmp/vcam_scale";
-static const char *kVCamOffsetXFilePath = "/var/tmp/vcam_offset_x";
-static const char *kVCamOffsetYFilePath = "/var/tmp/vcam_offset_y";
+static const char *kVCamTempFilePath         = "/private/var/tmp/vcam_temp.mov";
+static const char *kVCamTempFilePathAlt      = "/var/tmp/vcam_temp.mov";
+static const char *kVCamEnabledFlagPath      = "/private/var/tmp/vcam_enabled";
+static const char *kVCamEnabledFlagPathAlt   = "/var/tmp/vcam_enabled";
+static const char *kVCamPauseFlagPath        = "/private/var/tmp/vcam_paused";
+static const char *kVCamPauseFlagPathAlt     = "/var/tmp/vcam_paused";
+static const char *kVCamScaleFilePath        = "/private/var/tmp/vcam_scale";
+static const char *kVCamScaleFilePathAlt     = "/var/tmp/vcam_scale";
+static const char *kVCamOffsetXFilePath      = "/private/var/tmp/vcam_offset_x";
+static const char *kVCamOffsetXFilePathAlt   = "/var/tmp/vcam_offset_x";
+static const char *kVCamOffsetYFilePath      = "/private/var/tmp/vcam_offset_y";
+static const char *kVCamOffsetYFilePathAlt   = "/var/tmp/vcam_offset_y";
 
-static NSString *const kVCamTempFile = @"/var/tmp/vcam_temp.mov";
+static NSString *const kVCamTempFile         = @"/private/var/tmp/vcam_temp.mov";
+static NSString *const kVCamTempFileAlt      = @"/var/tmp/vcam_temp.mov";
 
 static NSFileManager *gFileManager = nil;
 static BOOL gNeedsReaderReload = YES;
@@ -29,6 +36,7 @@ static NSDate *gLastTempFileModified = nil;
 static int32_t gVideoExifOrientation = 1;
 
 static void VCamWriteFlag(const char *path, const char *val) {
+    if (!path) return;
     FILE *f = fopen(path, "w");
     if (f) {
         if (val) fputs(val, f);
@@ -38,19 +46,36 @@ static void VCamWriteFlag(const char *path, const char *val) {
 }
 
 static void VCamRemoveFlag(const char *path) {
-    unlink(path);
+    if (path) unlink(path);
+}
+
+static void VCamWriteFlagDual(const char *p1, const char *p2, const char *val) {
+    VCamWriteFlag(p1, val);
+    if (p2 && strcmp(p1, p2) != 0) VCamWriteFlag(p2, val);
+}
+
+static void VCamRemoveFlagDual(const char *p1, const char *p2) {
+    VCamRemoveFlag(p1);
+    if (p2 && strcmp(p1, p2) != 0) VCamRemoveFlag(p2);
 }
 
 static BOOL VCamIsActive(void) {
-    return (access(kVCamEnabledFlagPath, F_OK) == 0);
+    return (access(kVCamEnabledFlagPath, F_OK) == 0 || access(kVCamEnabledFlagPathAlt, F_OK) == 0);
 }
 
 static BOOL VCamIsPaused(void) {
-    return (access(kVCamPauseFlagPath, F_OK) == 0);
+    return (access(kVCamPauseFlagPath, F_OK) == 0 || access(kVCamPauseFlagPathAlt, F_OK) == 0);
+}
+
+static NSString *VCamGetExistingTempFilePath(void) {
+    if ([gFileManager fileExistsAtPath:kVCamTempFile]) return kVCamTempFile;
+    if ([gFileManager fileExistsAtPath:kVCamTempFileAlt]) return kVCamTempFileAlt;
+    return kVCamTempFile;
 }
 
 static CGFloat VCamGetScale(void) {
     FILE *f = fopen(kVCamScaleFilePath, "r");
+    if (!f) f = fopen(kVCamScaleFilePathAlt, "r");
     if (f) {
         float val = 1.0f;
         if (fscanf(f, "%f", &val) == 1) {
@@ -68,11 +93,12 @@ static void VCamSetScale(CGFloat scale) {
     if (scale > 2.5f) scale = 2.5f;
     char buf[32];
     snprintf(buf, sizeof(buf), "%.2f", scale);
-    VCamWriteFlag(kVCamScaleFilePath, buf);
+    VCamWriteFlagDual(kVCamScaleFilePath, kVCamScaleFilePathAlt, buf);
 }
 
 static CGFloat VCamGetOffsetX(void) {
     FILE *f = fopen(kVCamOffsetXFilePath, "r");
+    if (!f) f = fopen(kVCamOffsetXFilePathAlt, "r");
     if (f) {
         float val = 0.0f;
         if (fscanf(f, "%f", &val) == 1) {
@@ -86,6 +112,7 @@ static CGFloat VCamGetOffsetX(void) {
 
 static CGFloat VCamGetOffsetY(void) {
     FILE *f = fopen(kVCamOffsetYFilePath, "r");
+    if (!f) f = fopen(kVCamOffsetYFilePathAlt, "r");
     if (f) {
         float val = 0.0f;
         if (fscanf(f, "%f", &val) == 1) {
@@ -101,8 +128,8 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
     char bufX[32], bufY[32];
     snprintf(bufX, sizeof(bufX), "%.1f", x);
     snprintf(bufY, sizeof(bufY), "%.1f", y);
-    VCamWriteFlag(kVCamOffsetXFilePath, bufX);
-    VCamWriteFlag(kVCamOffsetYFilePath, bufY);
+    VCamWriteFlagDual(kVCamOffsetXFilePath, kVCamOffsetXFilePathAlt, bufX);
+    VCamWriteFlagDual(kVCamOffsetYFilePath, kVCamOffsetYFilePathAlt, bufY);
 }
 
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
@@ -155,12 +182,34 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     static CIContext *ciCtx = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        ciCtx = [CIContext contextWithOptions:@{
-            kCIContextUseSoftwareRenderer: @NO,
-            kCIContextHighQualityDownsample: @YES
-        }];
+        @try {
+            ciCtx = [CIContext contextWithOptions:@{
+                kCIContextUseSoftwareRenderer: @NO,
+                kCIContextHighQualityDownsample: @YES
+            }];
+        } @catch (NSException *e) {
+            NSLog(@"[vcamios] GPU CIContext init exception: %@", e);
+        }
+        if (!ciCtx) {
+            NSLog(@"[vcamios] GPU CIContext unavailable in mediaserverd, falling back to Software Renderer");
+            @try {
+                ciCtx = [CIContext contextWithOptions:@{
+                    kCIContextUseSoftwareRenderer: @YES,
+                    kCIContextHighQualityDownsample: @NO
+                }];
+            } @catch (NSException *e) {
+                NSLog(@"[vcamios] Software CIContext init exception: %@", e);
+            }
+        }
+        if (!ciCtx) {
+            ciCtx = [CIContext context];
+        }
+        NSLog(@"[vcamios] CIContext initialized: %@", ciCtx);
     });
-    if (!ciCtx) return -2;
+    if (!ciCtx) {
+        NSLog(@"[vcamios] ERROR: Failed to create CIContext");
+        return -2;
+    }
 
     CIImage *img = [CIImage imageWithCVPixelBuffer:source];
 
@@ -206,7 +255,10 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     static OSType readerFormat = 0;
     static CVPixelBufferRef cachedPixelBuffer = nil;
 
-    if (!originSampleBuffer || !VCamIsActive() || (access(kVCamTempFilePath, F_OK) != 0)) return nil;
+    if (!originSampleBuffer || !VCamIsActive()) return nil;
+
+    NSString *tempPath = VCamGetExistingTempFilePath();
+    if (access([tempPath UTF8String], F_OK) != 0) return nil;
 
     CMFormatDescriptionRef originFormat = CMSampleBufferGetFormatDescription(originSampleBuffer);
     if (!originFormat || CMFormatDescriptionGetMediaType(originFormat) != kCMMediaType_Video) return nil;
@@ -240,7 +292,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     static float gVideoFPS = 30.0f;
     static int gCurrentFrameNumber = -1;
 
-    NSDate *modified = [[gFileManager attributesOfItemAtPath:kVCamTempFile error:nil] fileModificationDate];
+    NSDate *modified = [[gFileManager attributesOfItemAtPath:tempPath error:nil] fileModificationDate];
     if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
         gLastTempFileModified = modified;
         gNeedsReaderReload = YES;
@@ -258,15 +310,17 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         output = nil;
 
         if (!cachedAsset) {
-            NSURL *url = [NSURL fileURLWithPath:kVCamTempFile];
+            NSURL *url = [NSURL fileURLWithPath:tempPath];
             cachedAsset = [AVAsset assetWithURL:url];
             cachedTrack = [[cachedAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
             gCachedDuration = CMTimeGetSeconds(cachedAsset.duration);
             float f = cachedTrack ? cachedTrack.nominalFrameRate : 30.0f;
             gVideoFPS = (f >= 10.0f && f <= 120.0f) ? f : 30.0f;
+            NSLog(@"[vcamios] Loaded asset from %@ (duration=%.2fs, fps=%.1f)", tempPath, gCachedDuration, gVideoFPS);
         }
 
         if (!cachedAsset || !cachedTrack) {
+            NSLog(@"[vcamios] Failed to load video asset or video track from %@", tempPath);
             gNeedsReaderReload = YES;
             return nil;
         }
@@ -286,6 +340,9 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
 
         NSError *error = nil;
         AVAssetReader *newReader = [AVAssetReader assetReaderWithAsset:cachedAsset error:&error];
+        if (error) {
+            NSLog(@"[vcamios] AVAssetReader init error: %@", error);
+        }
         AVAssetReaderTrackOutput *newOutput = [[AVAssetReaderTrackOutput alloc]
             initWithTrack:cachedTrack
             outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(outputFormat)}];
@@ -293,6 +350,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         [newReader addOutput:newOutput];
 
         if (![newReader startReading]) {
+            NSLog(@"[vcamios] AVAssetReader startReading failed: %@", newReader.error);
             gNeedsReaderReload = YES;
             return cachedPixelBuffer ? nil : nil;
         }
@@ -364,8 +422,15 @@ static void (*orig_BWNodeOutput_emitSampleBuffer)(id, SEL, CMSampleBufferRef) = 
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
     CMSampleBufferRef fakeBuffer = VCamCopyFrameMatching(sampleBuffer);
     if (fakeBuffer) {
-        VCamCopyPixelBuffer(CMSampleBufferGetImageBuffer(fakeBuffer),
-                            CMSampleBufferGetImageBuffer(sampleBuffer));
+        OSStatus st = VCamCopyPixelBuffer(CMSampleBufferGetImageBuffer(fakeBuffer),
+                                          CMSampleBufferGetImageBuffer(sampleBuffer));
+        if (st != noErr) {
+            static NSTimeInterval lastErrLog = 0;
+            if (CACurrentMediaTime() - lastErrLog > 3.0) {
+                lastErrLog = CACurrentMediaTime();
+                NSLog(@"[vcamios] VCamCopyPixelBuffer failed with error: %d", (int)st);
+            }
+        }
         orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
         CFRelease(fakeBuffer);
     } else {
@@ -394,6 +459,13 @@ static void HookIfPresent(const char *className, SEL selector, IMP replacement, 
 }
 
 static void VCamInitMediaServerHooks(void) {
+    void *hCMCapture = dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_NOW);
+    if (!hCMCapture) {
+        NSLog(@"[vcamios] dlopen CMCapture failed: %s", dlerror());
+        hCMCapture = dlopen("/System/Library/PrivateFrameworks/Celestial.framework/Celestial", RTLD_NOW);
+    }
+    NSLog(@"[vcamios] CMCapture handle = %p", hCMCapture);
+
     HookIfPresent("BWNodeOutput", @selector(emitSampleBuffer:),
                   (IMP)&hook_BWNodeOutput_emitSampleBuffer,
                   (IMP *)&orig_BWNodeOutput_emitSampleBuffer);
@@ -425,7 +497,8 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
     if (!url) return;
 
     [gFileManager removeItemAtPath:kVCamTempFile error:nil];
-    VCamRemoveFlag(kVCamPauseFlagPath);
+    [gFileManager removeItemAtPath:kVCamTempFileAlt error:nil];
+    VCamRemoveFlagDual(kVCamPauseFlagPath, kVCamPauseFlagPathAlt);
 
     NSError *err = nil;
     BOOL copied = [gFileManager copyItemAtPath:url.path toPath:kVCamTempFile error:&err];
@@ -437,9 +510,13 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
                                resultingItemURL:nil
                                           error:&err];
     }
-    if ([gFileManager fileExistsAtPath:kVCamTempFile]) {
+    [gFileManager copyItemAtPath:url.path toPath:kVCamTempFileAlt error:nil];
+
+    if ([gFileManager fileExistsAtPath:kVCamTempFile] || [gFileManager fileExistsAtPath:kVCamTempFileAlt]) {
         chmod(kVCamTempFilePath, 0666);
-        VCamWriteFlag(kVCamEnabledFlagPath, "1");
+        chmod(kVCamTempFilePathAlt, 0666);
+        VCamWriteFlagDual(kVCamEnabledFlagPath, kVCamEnabledFlagPathAlt, "1");
+        NSLog(@"[vcamios] Picker saved video to %s and %s", kVCamTempFilePath, kVCamTempFilePathAlt);
     }
     VCamFloatRefreshButton();
     VCamFloatHideMenu();
@@ -794,9 +871,9 @@ static VCamFloat *gVCamFloat = nil;
 
 - (void)_menuTogglePause {
     if (VCamIsPaused()) {
-        VCamRemoveFlag(kVCamPauseFlagPath);
+        VCamRemoveFlagDual(kVCamPauseFlagPath, kVCamPauseFlagPathAlt);
     } else {
-        VCamWriteFlag(kVCamPauseFlagPath, "1");
+        VCamWriteFlagDual(kVCamPauseFlagPath, kVCamPauseFlagPathAlt, "1");
     }
     [self _hideMenu];
     VCamFloatRefreshButton();
@@ -808,8 +885,8 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_menuDisable {
-    VCamRemoveFlag(kVCamEnabledFlagPath);
-    VCamRemoveFlag(kVCamPauseFlagPath);
+    VCamRemoveFlagDual(kVCamEnabledFlagPath, kVCamEnabledFlagPathAlt);
+    VCamRemoveFlagDual(kVCamPauseFlagPath, kVCamPauseFlagPathAlt);
     [self _hideMenu];
     VCamFloatRefreshButton();
 }
@@ -854,11 +931,15 @@ static void VCamInitSpringBoardHooks(void) {
 %ctor {
     @autoreleasepool {
         gFileManager = NSFileManager.defaultManager;
+        [gFileManager createDirectoryAtPath:@"/private/var/tmp"
+                withIntermediateDirectories:YES attributes:nil error:nil];
         [gFileManager createDirectoryAtPath:@"/var/tmp"
                 withIntermediateDirectories:YES attributes:nil error:nil];
+        chmod("/private/var/tmp", 0777);
         chmod("/var/tmp", 0777);
 
         NSString *processName = NSProcessInfo.processInfo.processName;
+        NSLog(@"[vcamios] ctor loaded in process: %@", processName);
         if ([processName isEqualToString:@"mediaserverd"]) {
             VCamInitMediaServerHooks();
         } else if ([processName isEqualToString:@"SpringBoard"]) {
