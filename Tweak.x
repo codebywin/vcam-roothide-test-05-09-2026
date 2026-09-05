@@ -53,6 +53,20 @@ static NSFileManager *gFileManager = nil;
 static NSDate *gLastTempFileModified = nil;
 static int32_t gVideoExifOrientation = 1;
 
+static void VCamLog(NSString *msg) {
+    if (!msg) return;
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    FILE *f = fopen("/private/var/tmp/vcam_debug.log", "a");
+    if (!f) f = fopen("/var/tmp/vcam_debug.log", "a");
+    if (f) {
+        fputs(line.UTF8String, f);
+        fflush(f);
+        fclose(f);
+        chmod("/private/var/tmp/vcam_debug.log", 0666);
+    }
+    NSLog(@"[vcamios] %@", msg);
+}
+
 static void VCamWriteFlag(const char *path, const char *val) {
     if (!path) return;
     FILE *f = fopen(path, "w");
@@ -153,7 +167,11 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
 static VTPixelTransferSessionRef VCamGetThreadTransferSession(void) {
     static __thread VTPixelTransferSessionRef threadSession = NULL;
     if (!threadSession) {
-        VTPixelTransferSessionCreate(kCFAllocatorDefault, &threadSession);
+        OSStatus err = VTPixelTransferSessionCreate(kCFAllocatorDefault, &threadSession);
+        if (err != noErr) {
+            VCamLog([NSString stringWithFormat:@"VTPixelTransferSessionCreate failed: %d", (int)err]);
+            threadSession = NULL;
+        }
     }
     return threadSession;
 }
@@ -161,58 +179,65 @@ static VTPixelTransferSessionRef VCamGetThreadTransferSession(void) {
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
     if (!source || !target) return -1;
 
-    size_t srcW = CVPixelBufferGetWidth(source);
-    size_t srcH = CVPixelBufferGetHeight(source);
-    size_t dstW = CVPixelBufferGetWidth(target);
-    size_t dstH = CVPixelBufferGetHeight(target);
-    OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
-    OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
-
-    // Fast path: exact same format and dimensions
-    if (srcW == dstW && srcH == dstH && srcFmt == dstFmt) {
-        CVReturn retSrc = CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        CVReturn retDst = CVPixelBufferLockBaseAddress(target, 0);
-        if (retSrc == kCVReturnSuccess && retDst == kCVReturnSuccess) {
-            size_t planes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
-            for (size_t plane = 0; plane < planes; plane++) {
-                void *srcBase = CVPixelBufferIsPlanar(source)
-                    ? CVPixelBufferGetBaseAddressOfPlane(source, plane)
-                    : CVPixelBufferGetBaseAddress(source);
-                void *dstBase = CVPixelBufferIsPlanar(target)
-                    ? CVPixelBufferGetBaseAddressOfPlane(target, plane)
-                    : CVPixelBufferGetBaseAddress(target);
-                if (!srcBase || !dstBase) continue;
-
-                size_t srcBPR = CVPixelBufferIsPlanar(source)
-                    ? CVPixelBufferGetBytesPerRowOfPlane(source, plane)
-                    : CVPixelBufferGetBytesPerRow(source);
-                size_t dstBPR = CVPixelBufferIsPlanar(target)
-                    ? CVPixelBufferGetBytesPerRowOfPlane(target, plane)
-                    : CVPixelBufferGetBytesPerRow(target);
-                size_t planeH = CVPixelBufferIsPlanar(source)
-                    ? CVPixelBufferGetHeightOfPlane(source, plane)
-                    : srcH;
-                size_t bpr = MIN(srcBPR, dstBPR);
-                for (size_t r = 0; r < planeH; r++) {
-                    memcpy((uint8_t *)dstBase + r * dstBPR,
-                           (uint8_t *)srcBase + r * srcBPR, bpr);
-                }
-            }
-            CVPixelBufferUnlockBaseAddress(target, 0);
-            CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-            return noErr;
-        }
-        if (retSrc == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        if (retDst == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(target, 0);
-    }
-
-    // Hardware scaler via VideoToolbox (thread-local session, zero IOFence risk)
+    // First attempt VideoToolbox hardware transfer (scaling & format conversion)
     VTPixelTransferSessionRef session = VCamGetThreadTransferSession();
     if (session) {
-        return VTPixelTransferSessionTransferImage(session, source, target);
+        OSStatus status = VTPixelTransferSessionTransferImage(session, source, target);
+        if (status == noErr) {
+            return noErr;
+        }
+        static int sTransferErr = 0;
+        if (++sTransferErr <= 3) {
+            VCamLog([NSString stringWithFormat:@"VTPixelTransferSessionTransferImage error: %d", (int)status]);
+        }
     }
 
-    return -1;
+    // Fallback: Planar memcpy
+    CVReturn retSrc = CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+    CVReturn retDst = CVPixelBufferLockBaseAddress(target, 0);
+    if (retSrc != kCVReturnSuccess || retDst != kCVReturnSuccess) {
+        if (retSrc == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+        if (retDst == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(target, 0);
+        return -1;
+    }
+
+    size_t srcPlanes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
+    size_t dstPlanes = CVPixelBufferIsPlanar(target) ? CVPixelBufferGetPlaneCount(target) : 1;
+
+    if (srcPlanes == dstPlanes) {
+        for (size_t plane = 0; plane < srcPlanes; plane++) {
+            uint8_t *srcBase = (uint8_t *)(CVPixelBufferIsPlanar(source)
+                ? CVPixelBufferGetBaseAddressOfPlane(source, plane)
+                : CVPixelBufferGetBaseAddress(source));
+            uint8_t *dstBase = (uint8_t *)(CVPixelBufferIsPlanar(target)
+                ? CVPixelBufferGetBaseAddressOfPlane(target, plane)
+                : CVPixelBufferGetBaseAddress(target));
+            if (!srcBase || !dstBase) continue;
+
+            size_t srcBPR = CVPixelBufferIsPlanar(source)
+                ? CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+                : CVPixelBufferGetBytesPerRow(source);
+            size_t dstBPR = CVPixelBufferIsPlanar(target)
+                ? CVPixelBufferGetBytesPerRowOfPlane(target, plane)
+                : CVPixelBufferGetBytesPerRow(target);
+            size_t srcPlaneH = CVPixelBufferIsPlanar(source)
+                ? CVPixelBufferGetHeightOfPlane(source, plane)
+                : CVPixelBufferGetHeight(source);
+            size_t dstPlaneH = CVPixelBufferIsPlanar(target)
+                ? CVPixelBufferGetHeightOfPlane(target, plane)
+                : CVPixelBufferGetHeight(target);
+
+            size_t rows = MIN(srcPlaneH, dstPlaneH);
+            size_t bpr = MIN(srcBPR, dstBPR);
+            for (size_t r = 0; r < rows; r++) {
+                memcpy(dstBase + r * dstBPR, srcBase + r * srcBPR, bpr);
+            }
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(target, 0);
+    CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+    return noErr;
 }
 
 static os_unfair_lock gReaderLock = OS_UNFAIR_LOCK_INIT;
@@ -228,8 +253,6 @@ static int64_t gLastFrameIndex = -1;
 
 static void VCamTearDownReader(void) {
     if (gReader) {
-        // Safe tear down: only cancel if actively reading
-        // Never cancel if status is Completed/Failed to avoid CFRelease(NULL) crash on iOS 16
         if (gReader.status == AVAssetReaderStatusReading) {
             @try {
                 [gReader cancelReading];
@@ -243,22 +266,31 @@ static void VCamTearDownReader(void) {
 static void VCamStartReader(NSString *path) {
     VCamTearDownReader();
 
-    if (!path || access(path.UTF8String, F_OK) != 0) return;
+    if (!path || access(path.UTF8String, F_OK) != 0) {
+        VCamLog([NSString stringWithFormat:@"VCamStartReader: path missing: %@", path]);
+        return;
+    }
 
-    if (!gAsset) {
+    if (!gAsset || !gTrack) {
         NSURL *url = [NSURL fileURLWithPath:path];
-        gAsset = [AVAsset assetWithURL:url];
-        gTrack = [[gAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-        if (gAsset && gTrack) {
+        NSDictionary *options = @{AVURLAssetPreferPreciseDurationAndTimingKey: @YES};
+        gAsset = [AVURLAsset URLAssetWithURL:url options:options];
+        NSArray *tracks = [gAsset tracksWithMediaType:AVMediaTypeVideo];
+        if (tracks.count > 0) {
+            gTrack = tracks.firstObject;
             gDuration = CMTimeGetSeconds(gAsset.duration);
             float f = gTrack.nominalFrameRate;
             gFPS = (f >= 10.0f && f <= 120.0f) ? f : 30.0f;
-            NSLog(@"[vcamios] Asset loaded: duration=%.2fs, fps=%.1f", gDuration, gFPS);
+            VCamLog([NSString stringWithFormat:@"Asset loaded: dur=%.2fs, fps=%.1f, size=%.0fx%.0f",
+                     gDuration, gFPS, gTrack.naturalSize.width, gTrack.naturalSize.height]);
+        } else {
+            VCamLog(@"VCamStartReader: tracksWithMediaType returned empty");
+            gAsset = nil;
+            gTrack = nil;
+            return;
         }
     }
-    if (!gAsset || !gTrack) return;
 
-    // Decode in standard BiPlanar Video Range (420v) at native video resolution
     NSDictionary *settings = @{
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
     };
@@ -266,7 +298,7 @@ static void VCamStartReader(NSString *path) {
     NSError *err = nil;
     gReader = [AVAssetReader assetReaderWithAsset:gAsset error:&err];
     if (!gReader || err) {
-        NSLog(@"[vcamios] Failed to create AVAssetReader: %@", err);
+        VCamLog([NSString stringWithFormat:@"Failed to create AVAssetReader: %@", err]);
         gReader = nil;
         return;
     }
@@ -275,14 +307,19 @@ static void VCamStartReader(NSString *path) {
     gOutput.alwaysCopiesSampleData = NO;
     if ([gReader canAddOutput:gOutput]) {
         [gReader addOutput:gOutput];
+    } else {
+        VCamLog(@"Cannot add output to AVAssetReader");
+        VCamTearDownReader();
+        return;
     }
 
     if (![gReader startReading]) {
-        NSLog(@"[vcamios] startReading failed: %@", gReader.error);
+        VCamLog([NSString stringWithFormat:@"startReading failed: %@", gReader.error]);
         VCamTearDownReader();
     } else {
         gPlaybackStartTime = CACurrentMediaTime();
         gLastFrameIndex = -1;
+        VCamLog(@"AVAssetReader startReading OK");
     }
 }
 
@@ -360,13 +397,23 @@ static CVPixelBufferRef VCamAcquireCurrentPixelBufferLocked(void) {
 
 static void (*orig_BWNodeOutput_emitSampleBuffer)(id, SEL, CMSampleBufferRef) = NULL;
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
-    if (!sampleBuffer || !VCamIsActive()) {
+    static int sCallCount = 0;
+    BOOL logThis = (++sCallCount <= 5 || sCallCount % 120 == 0);
+
+    if (!sampleBuffer) {
+        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        return;
+    }
+
+    if (!VCamIsActive()) {
+        if (logThis) VCamLog(@"hook_BWNodeOutput: inactive");
         orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
         return;
     }
 
     CVImageBufferRef camPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!camPixelBuffer) {
+        if (logThis) VCamLog(@"hook_BWNodeOutput: camPixelBuffer is NULL");
         orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
         return;
     }
@@ -378,6 +425,15 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         return;
     }
 
+    OSType camFmt = CVPixelBufferGetPixelFormatType(camPixelBuffer);
+
+    if (logThis) {
+        char fmtStr[5] = {0};
+        *(OSType*)fmtStr = CFSwapInt32HostToBig(camFmt);
+        VCamLog([NSString stringWithFormat:@"hook_BWNodeOutput: cam=%zux%zu fmt='%s' (0x%08x) call=%d",
+                 camW, camH, fmtStr, (unsigned int)camFmt, sCallCount]);
+    }
+
     CVPixelBufferRef videoFrame = NULL;
     os_unfair_lock_lock(&gReaderLock);
     CVPixelBufferRef curPB = VCamAcquireCurrentPixelBufferLocked();
@@ -387,8 +443,15 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
     os_unfair_lock_unlock(&gReaderLock);
 
     if (videoFrame) {
-        VCamCopyPixelBuffer(videoFrame, camPixelBuffer);
+        OSStatus st = VCamCopyPixelBuffer(videoFrame, camPixelBuffer);
+        if (logThis) {
+            VCamLog([NSString stringWithFormat:@"VCamCopyPixelBuffer result = %d", (int)st]);
+        }
         CFRelease(videoFrame);
+    } else {
+        if (logThis) {
+            VCamLog(@"VCamAcquireCurrentPixelBufferLocked returned NULL");
+        }
     }
 
     orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
@@ -397,26 +460,27 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
 static void HookIfPresent(const char *className, SEL selector, IMP replacement, IMP *original) {
     Class cls = objc_getClass(className);
     if (!cls) {
-        NSLog(@"[vcamios] class missing: %s", className);
+        VCamLog([NSString stringWithFormat:@"HookIfPresent: class missing: %s", className]);
         return;
     }
     MSHookMessageEx(cls, selector, replacement, original);
-    NSLog(@"[vcamios] hooked %s %@", className, NSStringFromSelector(selector));
+    VCamLog([NSString stringWithFormat:@"HookIfPresent: hooked %s %@", className, NSStringFromSelector(selector)]);
 }
 
 static void VCamInitMediaServerHooks(void) {
+    VCamLog(@"VCamInitMediaServerHooks starting...");
     void *hCMCapture = dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_NOW);
     if (!hCMCapture) {
-        NSLog(@"[vcamios] dlopen CMCapture failed: %s", dlerror());
+        VCamLog([NSString stringWithFormat:@"dlopen CMCapture failed: %s", dlerror()]);
         hCMCapture = dlopen("/System/Library/PrivateFrameworks/Celestial.framework/Celestial", RTLD_NOW);
     }
-    NSLog(@"[vcamios] CMCapture handle = %p", hCMCapture);
+    VCamLog([NSString stringWithFormat:@"CMCapture handle = %p", hCMCapture]);
 
     HookIfPresent("BWNodeOutput", @selector(emitSampleBuffer:),
                   (IMP)&hook_BWNodeOutput_emitSampleBuffer,
                   (IMP *)&orig_BWNodeOutput_emitSampleBuffer);
 
-    NSLog(@"[vcamios] mediaserverd hooks loaded; source=%s", kVCamTempFilePath);
+    VCamLog([NSString stringWithFormat:@"mediaserverd hooks loaded; source=%s", kVCamTempFilePath]);
 }
 
 // ─── SpringBoard UI (Compact Square HUD Layout ~175x175) ───────────────────
@@ -883,16 +947,6 @@ static VCamFloat *gVCamFloat = nil;
 static UIViewController *VCamPresenter(void) { return [VCamFloat presenter]; }
 static void VCamFloatRefreshButton(void)     { [VCamFloat refreshButton]; }
 static void VCamFloatHideMenu(void)          { [VCamFloat hideMenu]; }
-
-static void VCamLog(NSString *msg) {
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
-    FILE *f = fopen("/private/var/tmp/vcam_debug.log", "a");
-    if (!f) f = fopen("/var/tmp/vcam_debug.log", "a");
-    if (f) {
-        fputs(line.UTF8String, f);
-        fclose(f);
-    }
-}
 
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
