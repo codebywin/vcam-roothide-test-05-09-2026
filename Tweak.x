@@ -140,111 +140,65 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     size_t dstH = CVPixelBufferGetHeight(target);
     OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
     OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
-    CGFloat userScale = VCamGetScale();
-    CGFloat userOffsetX = VCamGetOffsetX();
-    CGFloat userOffsetY = VCamGetOffsetY();
 
-    // Fast path: scale exactly 1.0, zero offset, same format & size
-    if (fabs(userScale - 1.0f) < 0.001f && fabs(userOffsetX) < 0.1f && fabs(userOffsetY) < 0.1f &&
-        gVideoExifOrientation == 1 && srcFmt == dstFmt && srcW == dstW && srcH == dstH) {
-        CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        CVPixelBufferLockBaseAddress(target, 0);
-        size_t planes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
-        for (size_t plane = 0; plane < planes; plane++) {
+    CVReturn retSrc = CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+    CVReturn retDst = CVPixelBufferLockBaseAddress(target, 0);
+    if (retSrc != kCVReturnSuccess || retDst != kCVReturnSuccess) {
+        if (retSrc == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+        if (retDst == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(target, 0);
+        return -1;
+    }
+
+    size_t srcPlanes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
+    size_t dstPlanes = CVPixelBufferIsPlanar(target) ? CVPixelBufferGetPlaneCount(target) : 1;
+
+    if (srcFmt == dstFmt && srcPlanes == dstPlanes) {
+        for (size_t plane = 0; plane < srcPlanes; plane++) {
             void *srcBase = CVPixelBufferIsPlanar(source)
                 ? CVPixelBufferGetBaseAddressOfPlane(source, plane)
                 : CVPixelBufferGetBaseAddress(source);
             void *dstBase = CVPixelBufferIsPlanar(target)
                 ? CVPixelBufferGetBaseAddressOfPlane(target, plane)
                 : CVPixelBufferGetBaseAddress(target);
+            if (!srcBase || !dstBase) continue;
+
             size_t srcBPR = CVPixelBufferIsPlanar(source)
                 ? CVPixelBufferGetBytesPerRowOfPlane(source, plane)
                 : CVPixelBufferGetBytesPerRow(source);
             size_t dstBPR = CVPixelBufferIsPlanar(target)
                 ? CVPixelBufferGetBytesPerRowOfPlane(target, plane)
                 : CVPixelBufferGetBytesPerRow(target);
-            size_t rows = CVPixelBufferIsPlanar(source)
+            size_t srcPlaneH = CVPixelBufferIsPlanar(source)
                 ? CVPixelBufferGetHeightOfPlane(source, plane)
                 : srcH;
+            size_t dstPlaneH = CVPixelBufferIsPlanar(target)
+                ? CVPixelBufferGetHeightOfPlane(target, plane)
+                : dstH;
+
+            size_t rows = MIN(srcPlaneH, dstPlaneH);
             size_t bpr = MIN(srcBPR, dstBPR);
             for (size_t row = 0; row < rows; row++) {
                 memcpy((uint8_t *)dstBase + row * dstBPR,
                        (uint8_t *)srcBase + row * srcBPR, bpr);
             }
         }
-        CVPixelBufferUnlockBaseAddress(target, 0);
-        CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        return noErr;
-    }
-
-    // High quality GPU rendering with CIImage (handles Zoom In, Zoom Out, Pan & 100% Solid Black Canvas)
-    static CIContext *ciCtx = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        @try {
-            ciCtx = [CIContext contextWithOptions:@{
-                kCIContextUseSoftwareRenderer: @NO,
-                kCIContextHighQualityDownsample: @YES
-            }];
-        } @catch (NSException *e) {
-            NSLog(@"[vcamios] GPU CIContext init exception: %@", e);
-        }
-        if (!ciCtx) {
-            NSLog(@"[vcamios] GPU CIContext unavailable in mediaserverd, falling back to Software Renderer");
-            @try {
-                ciCtx = [CIContext contextWithOptions:@{
-                    kCIContextUseSoftwareRenderer: @YES,
-                    kCIContextHighQualityDownsample: @NO
-                }];
-            } @catch (NSException *e) {
-                NSLog(@"[vcamios] Software CIContext init exception: %@", e);
+    } else if (srcPlanes == 1 && dstPlanes == 1) {
+        void *srcBase = CVPixelBufferGetBaseAddress(source);
+        void *dstBase = CVPixelBufferGetBaseAddress(target);
+        if (srcBase && dstBase) {
+            size_t srcBPR = CVPixelBufferGetBytesPerRow(source);
+            size_t dstBPR = CVPixelBufferGetBytesPerRow(target);
+            size_t rows = MIN(srcH, dstH);
+            size_t bpr = MIN(srcBPR, dstBPR);
+            for (size_t row = 0; row < rows; row++) {
+                memcpy((uint8_t *)dstBase + row * dstBPR,
+                       (uint8_t *)srcBase + row * srcBPR, bpr);
             }
         }
-        if (!ciCtx) {
-            ciCtx = [CIContext context];
-        }
-        NSLog(@"[vcamios] CIContext initialized: %@", ciCtx);
-    });
-    if (!ciCtx) {
-        NSLog(@"[vcamios] ERROR: Failed to create CIContext");
-        return -2;
     }
 
-    CIImage *img = [CIImage imageWithCVPixelBuffer:source];
-
-    int32_t orient = gVideoExifOrientation;
-    if (orient == 1 && srcW > srcH && dstH > dstW) orient = 8;
-
-    if (orient != 1) {
-        img = [img imageByApplyingOrientation:orient];
-        CGRect ext = img.extent;
-        img = [img imageByApplyingTransform:
-               CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y)];
-    }
-
-    // Aspect-fill scale with user zoom factor (supports Zoom In >= 1.0 and Zoom Out < 1.0)
-    CGRect ext = img.extent;
-    CGFloat sx = (CGFloat)dstW / ext.size.width;
-    CGFloat sy = (CGFloat)dstH / ext.size.height;
-    CGFloat baseScale = MAX(sx, sy);
-    CGFloat totalScale = baseScale * userScale;
-
-    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(totalScale, totalScale)];
-    ext = img.extent;
-    CGFloat tx = (dstW - ext.size.width) * 0.5 - ext.origin.x + userOffsetX;
-    CGFloat ty = (dstH - ext.size.height) * 0.5 - ext.origin.y + userOffsetY;
-    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
-
-    // 100% Pure Solid Black Canvas covering entire camera buffer (eliminates any real camera exposure)
-    CIImage *blackCanvas = [[CIImage imageWithColor:[CIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:1.0]]
-                           imageByCroppingToRect:CGRectMake(0, 0, dstW, dstH)];
-    CIImage *finalImg = [img imageByCompositingOverImage:blackCanvas];
-
-    CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    [ciCtx render:finalImg toCVPixelBuffer:target
-           bounds:CGRectMake(0, 0, dstW, dstH)
-       colorSpace:srgb];
-    CGColorSpaceRelease(srgb);
+    CVPixelBufferUnlockBaseAddress(target, 0);
+    CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
     return noErr;
 }
 
@@ -252,13 +206,16 @@ static AVAsset *gAsset = nil;
 static AVAssetTrack *gTrack = nil;
 static AVAssetReader *gReader = nil;
 static AVAssetReaderTrackOutput *gOutput = nil;
+static OSType gCurrentFormat = 0;
+static size_t gCurrentW = 0;
+static size_t gCurrentH = 0;
 static CVPixelBufferRef gCachedPixelBuffer = nil;
 static CFTimeInterval gPlaybackStartRealTime = 0;
 static Float64 gDuration = 0;
 static float gFPS = 30.0f;
 static int gCurrentFrameNumber = -1;
 
-static void VCamResetReader(NSString *path) {
+static void VCamResetReader(NSString *path, OSType fmt, size_t w, size_t h) {
     if (gReader) {
         [gReader cancelReading];
         gReader = nil;
@@ -272,21 +229,24 @@ static void VCamResetReader(NSString *path) {
             gDuration = CMTimeGetSeconds(gAsset.duration);
             float f = gTrack.nominalFrameRate;
             gFPS = (f >= 10.0f && f <= 120.0f) ? f : 30.0f;
-            double angle = atan2(gTrack.preferredTransform.b, gTrack.preferredTransform.a);
-            if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
-            else if (fabs(angle + M_PI_2) < 0.05)     gVideoExifOrientation = 8;
-            else if (fabs(fabs(angle) - M_PI) < 0.05) gVideoExifOrientation = 3;
-            else                                       gVideoExifOrientation = 1;
-            NSLog(@"[vcamios] Asset loaded: duration=%.2fs, fps=%.1f, orient=%d", gDuration, gFPS, gVideoExifOrientation);
+            NSLog(@"[vcamios] Asset loaded: duration=%.2fs, fps=%.1f", gDuration, gFPS);
         }
     }
     if (!gAsset || !gTrack) return;
 
+    gCurrentFormat = fmt;
+    gCurrentW = w;
+    gCurrentH = h;
+
+    NSDictionary *settings = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
+        (id)kCVPixelBufferWidthKey: @(w),
+        (id)kCVPixelBufferHeightKey: @(h)
+    };
+
     NSError *err = nil;
     gReader = [AVAssetReader assetReaderWithAsset:gAsset error:&err];
-    gOutput = [[AVAssetReaderTrackOutput alloc]
-        initWithTrack:gTrack
-        outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)}];
+    gOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:gTrack outputSettings:settings];
     gOutput.alwaysCopiesSampleData = NO;
     [gReader addOutput:gOutput];
     if (![gReader startReading]) {
@@ -308,6 +268,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     size_t originH = CVPixelBufferGetHeight(originPixelBuffer);
     if (originW < 100 || originH < 100) return nil;
 
+    OSType originFmt = CVPixelBufferGetPixelFormatType(originPixelBuffer);
     CMTime originPTS = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer);
     NSString *tempPath = VCamGetExistingTempFilePath();
 
@@ -317,11 +278,11 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         gLastTempFileModified = modified;
         gAsset = nil;
         gTrack = nil;
-        VCamResetReader(tempPath);
+        VCamResetReader(tempPath, originFmt, originW, originH);
     }
 
-    if (!gReader || !gOutput) {
-        VCamResetReader(tempPath);
+    if (!gReader || !gOutput || gCurrentFormat != originFmt || gCurrentW != originW || gCurrentH != originH) {
+        VCamResetReader(tempPath, originFmt, originW, originH);
     }
 
     // ── Pause / Freeze Frame ──
@@ -348,7 +309,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
 
     // Loop video when time reaches duration
     if (gDuration > 0.05 && elapsed >= gDuration) {
-        VCamResetReader(tempPath);
+        VCamResetReader(tempPath, originFmt, originW, originH);
         gPlaybackStartRealTime = now;
         elapsed = 0;
     }
@@ -366,7 +327,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
             gCurrentFrameNumber = targetFrameNumber;
         } else {
             // EOF reached: reset reader immediately for infinite loop
-            VCamResetReader(tempPath);
+            VCamResetReader(tempPath, originFmt, originW, originH);
             gPlaybackStartRealTime = now;
             CMSampleBufferRef loopBuffer = gOutput ? [gOutput copyNextSampleBuffer] : nil;
             if (loopBuffer) {
