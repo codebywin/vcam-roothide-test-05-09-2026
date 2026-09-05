@@ -543,20 +543,42 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_setup {
-    if (_win) return;
-    CGFloat sz = 46;
-    CGRect screen = UIScreen.mainScreen.bounds;
-
+    UIWindowScene *activeScene = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
             if ([s isKindOfClass:[UIWindowScene class]]) {
-                _win = [[VCamFloatWindow alloc] initWithWindowScene:(UIWindowScene *)s];
-                break;
+                UIWindowScene *ws = (UIWindowScene *)s;
+                if (ws.activationState == UISceneActivationStateForegroundActive) {
+                    activeScene = ws;
+                    break;
+                }
+                if (!activeScene) activeScene = ws;
             }
         }
     }
-    if (!_win) _win = [[VCamFloatWindow alloc] initWithFrame:screen];
 
+    if (!activeScene) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self _setup];
+        });
+        return;
+    }
+
+    if (_win) {
+        if (@available(iOS 13.0, *)) {
+            if (_win.windowScene != activeScene) _win.windowScene = activeScene;
+        }
+        _win.hidden = NO;
+        [_win makeKeyAndVisible];
+        return;
+    }
+
+    CGFloat sz = 46;
+    CGRect screen = activeScene.coordinateSpace.bounds;
+    if (CGRectIsEmpty(screen) || screen.size.width < 100) screen = UIScreen.mainScreen.bounds;
+
+    _win = [[VCamFloatWindow alloc] initWithWindowScene:activeScene];
     _win.frame = screen;
     _win.windowLevel = UIWindowLevelAlert + 300;
     _win.backgroundColor = [UIColor clearColor];
@@ -586,6 +608,7 @@ static VCamFloat *gVCamFloat = nil;
     _rootVC.view.userInteractionEnabled = YES;
     _btn = btn;
     _win.hidden = NO;
+    [_win makeKeyAndVisible];
 }
 
 - (void)_tap {
@@ -861,8 +884,43 @@ static UIViewController *VCamPresenter(void) { return [VCamFloat presenter]; }
 static void VCamFloatRefreshButton(void)     { [VCamFloat refreshButton]; }
 static void VCamFloatHideMenu(void)          { [VCamFloat hideMenu]; }
 
-static void VCamInitSpringBoardHooks(void) {
+static void VCamLog(NSString *msg) {
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    FILE *f = fopen("/private/var/tmp/vcam_debug.log", "a");
+    if (!f) f = fopen("/var/tmp/vcam_debug.log", "a");
+    if (f) {
+        fputs(line.UTF8String, f);
+        fclose(f);
+    }
+}
+
+%hook SpringBoard
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    VCamLog(@"SpringBoard applicationDidFinishLaunching");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [VCamFloat show];
+    });
+}
+%end
+
+static void VCamInitSpringBoardHooks(void) {
+    VCamLog(@"VCamInitSpringBoardHooks called");
+    if (@available(iOS 13.0, *)) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:UISceneDidActivateNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            VCamLog(@"UISceneDidActivateNotification triggered");
+            [VCamFloat show];
+        }];
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [VCamFloat show];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [VCamFloat show];
     });
@@ -879,6 +937,7 @@ static void VCamInitSpringBoardHooks(void) {
         chmod("/var/tmp", 0777);
 
         NSString *processName = NSProcessInfo.processInfo.processName;
+        VCamLog([NSString stringWithFormat:@"ctor loaded in %@", processName]);
         NSLog(@"[vcamios] ctor loaded in process: %@", processName);
         if ([processName isEqualToString:@"mediaserverd"]) {
             VCamInitMediaServerHooks();
