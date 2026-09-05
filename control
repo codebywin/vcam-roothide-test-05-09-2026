@@ -1,0 +1,9 @@
+Package: com.la.winday
+Name: VCAM iOS (Roothide)
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Virtual Camera for roothide jailbreak
+Maintainer: la
+Author: @lawinday
+Section: Tweaks
+Depends: org.coolstar.ellekit | mobilesubstrate (>= 0.9.5000)
