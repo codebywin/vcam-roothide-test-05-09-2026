@@ -6,6 +6,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #import <substrate.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -131,6 +132,19 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
     VCamWriteFlagDual(kVCamOffsetYFilePath, kVCamOffsetYFilePathAlt, bufY);
 }
 
+static VTPixelTransferSessionRef VCamGetThreadTransferSession(void) {
+    static __thread VTPixelTransferSessionRef threadSession = NULL;
+    if (!threadSession) {
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &threadSession);
+        if (threadSession) {
+            VTSessionSetProperty(threadSession,
+                                 kVTPixelTransferPropertyKey_ScalingMode,
+                                 kVTScalingMode_CropSourceToCleanAperture);
+        }
+    }
+    return threadSession;
+}
+
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
     if (!source || !target) return -1;
 
@@ -141,86 +155,83 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
     OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
 
-    CVReturn retSrc = CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-    CVReturn retDst = CVPixelBufferLockBaseAddress(target, 0);
-    if (retSrc != kCVReturnSuccess || retDst != kCVReturnSuccess) {
+    // Fast path: exact same format and dimensions
+    if (srcW == dstW && srcH == dstH && srcFmt == dstFmt) {
+        CVReturn retSrc = CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+        CVReturn retDst = CVPixelBufferLockBaseAddress(target, 0);
+        if (retSrc == kCVReturnSuccess && retDst == kCVReturnSuccess) {
+            size_t planes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
+            for (size_t plane = 0; plane < planes; plane++) {
+                void *srcBase = CVPixelBufferIsPlanar(source)
+                    ? CVPixelBufferGetBaseAddressOfPlane(source, plane)
+                    : CVPixelBufferGetBaseAddress(source);
+                void *dstBase = CVPixelBufferIsPlanar(target)
+                    ? CVPixelBufferGetBaseAddressOfPlane(target, plane)
+                    : CVPixelBufferGetBaseAddress(target);
+                if (!srcBase || !dstBase) continue;
+
+                size_t srcBPR = CVPixelBufferIsPlanar(source)
+                    ? CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+                    : CVPixelBufferGetBytesPerRow(source);
+                size_t dstBPR = CVPixelBufferIsPlanar(target)
+                    ? CVPixelBufferGetBytesPerRowOfPlane(target, plane)
+                    : CVPixelBufferGetBytesPerRow(target);
+                size_t planeH = CVPixelBufferIsPlanar(source)
+                    ? CVPixelBufferGetHeightOfPlane(source, plane)
+                    : srcH;
+                size_t bpr = MIN(srcBPR, dstBPR);
+                for (size_t r = 0; r < planeH; r++) {
+                    memcpy((uint8_t *)dstBase + r * dstBPR,
+                           (uint8_t *)srcBase + r * srcBPR, bpr);
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(target, 0);
+            CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+            return noErr;
+        }
         if (retSrc == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
         if (retDst == kCVReturnSuccess) CVPixelBufferUnlockBaseAddress(target, 0);
-        return -1;
     }
 
-    size_t srcPlanes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
-    size_t dstPlanes = CVPixelBufferIsPlanar(target) ? CVPixelBufferGetPlaneCount(target) : 1;
-
-    if (srcFmt == dstFmt && srcPlanes == dstPlanes) {
-        for (size_t plane = 0; plane < srcPlanes; plane++) {
-            void *srcBase = CVPixelBufferIsPlanar(source)
-                ? CVPixelBufferGetBaseAddressOfPlane(source, plane)
-                : CVPixelBufferGetBaseAddress(source);
-            void *dstBase = CVPixelBufferIsPlanar(target)
-                ? CVPixelBufferGetBaseAddressOfPlane(target, plane)
-                : CVPixelBufferGetBaseAddress(target);
-            if (!srcBase || !dstBase) continue;
-
-            size_t srcBPR = CVPixelBufferIsPlanar(source)
-                ? CVPixelBufferGetBytesPerRowOfPlane(source, plane)
-                : CVPixelBufferGetBytesPerRow(source);
-            size_t dstBPR = CVPixelBufferIsPlanar(target)
-                ? CVPixelBufferGetBytesPerRowOfPlane(target, plane)
-                : CVPixelBufferGetBytesPerRow(target);
-            size_t srcPlaneH = CVPixelBufferIsPlanar(source)
-                ? CVPixelBufferGetHeightOfPlane(source, plane)
-                : srcH;
-            size_t dstPlaneH = CVPixelBufferIsPlanar(target)
-                ? CVPixelBufferGetHeightOfPlane(target, plane)
-                : dstH;
-
-            size_t rows = MIN(srcPlaneH, dstPlaneH);
-            size_t bpr = MIN(srcBPR, dstBPR);
-            for (size_t row = 0; row < rows; row++) {
-                memcpy((uint8_t *)dstBase + row * dstBPR,
-                       (uint8_t *)srcBase + row * srcBPR, bpr);
-            }
-        }
-    } else if (srcPlanes == 1 && dstPlanes == 1) {
-        void *srcBase = CVPixelBufferGetBaseAddress(source);
-        void *dstBase = CVPixelBufferGetBaseAddress(target);
-        if (srcBase && dstBase) {
-            size_t srcBPR = CVPixelBufferGetBytesPerRow(source);
-            size_t dstBPR = CVPixelBufferGetBytesPerRow(target);
-            size_t rows = MIN(srcH, dstH);
-            size_t bpr = MIN(srcBPR, dstBPR);
-            for (size_t row = 0; row < rows; row++) {
-                memcpy((uint8_t *)dstBase + row * dstBPR,
-                       (uint8_t *)srcBase + row * srcBPR, bpr);
-            }
-        }
+    // Hardware scaler via VideoToolbox (thread-local session, zero IOFence risk)
+    VTPixelTransferSessionRef session = VCamGetThreadTransferSession();
+    if (session) {
+        return VTPixelTransferSessionTransferImage(session, source, target);
     }
 
-    CVPixelBufferUnlockBaseAddress(target, 0);
-    CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-    return noErr;
+    return -1;
 }
 
+static os_unfair_lock gReaderLock = OS_UNFAIR_LOCK_INIT;
 static AVAsset *gAsset = nil;
 static AVAssetTrack *gTrack = nil;
 static AVAssetReader *gReader = nil;
 static AVAssetReaderTrackOutput *gOutput = nil;
-static OSType gCurrentFormat = 0;
-static size_t gCurrentW = 0;
-static size_t gCurrentH = 0;
-static CVPixelBufferRef gCachedPixelBuffer = nil;
-static CFTimeInterval gPlaybackStartRealTime = 0;
+static CVPixelBufferRef gCachedPixelBuffer = NULL;
+static CFTimeInterval gPlaybackStartTime = 0;
 static Float64 gDuration = 0;
 static float gFPS = 30.0f;
-static int gCurrentFrameNumber = -1;
+static int64_t gLastFrameIndex = -1;
 
-static void VCamResetReader(NSString *path, OSType fmt, size_t w, size_t h) {
+static void VCamTearDownReader(void) {
     if (gReader) {
-        [gReader cancelReading];
+        // Safe tear down: only cancel if actively reading
+        // Never cancel if status is Completed/Failed to avoid CFRelease(NULL) crash on iOS 16
+        if (gReader.status == AVAssetReaderStatusReading) {
+            @try {
+                [gReader cancelReading];
+            } @catch (__unused id ex) {}
+        }
         gReader = nil;
         gOutput = nil;
     }
+}
+
+static void VCamStartReader(NSString *path) {
+    VCamTearDownReader();
+
+    if (!path || access(path.UTF8String, F_OK) != 0) return;
+
     if (!gAsset) {
         NSURL *url = [NSURL fileURLWithPath:path];
         gAsset = [AVAsset assetWithURL:url];
@@ -234,160 +245,140 @@ static void VCamResetReader(NSString *path, OSType fmt, size_t w, size_t h) {
     }
     if (!gAsset || !gTrack) return;
 
-    gCurrentFormat = fmt;
-    gCurrentW = w;
-    gCurrentH = h;
-
+    // Decode in standard BiPlanar Video Range (420v) at native video resolution
     NSDictionary *settings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
-        (id)kCVPixelBufferWidthKey: @(w),
-        (id)kCVPixelBufferHeightKey: @(h)
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
     };
 
     NSError *err = nil;
     gReader = [AVAssetReader assetReaderWithAsset:gAsset error:&err];
+    if (!gReader || err) {
+        NSLog(@"[vcamios] Failed to create AVAssetReader: %@", err);
+        gReader = nil;
+        return;
+    }
+
     gOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:gTrack outputSettings:settings];
     gOutput.alwaysCopiesSampleData = NO;
-    [gReader addOutput:gOutput];
+    if ([gReader canAddOutput:gOutput]) {
+        [gReader addOutput:gOutput];
+    }
+
     if (![gReader startReading]) {
         NSLog(@"[vcamios] startReading failed: %@", gReader.error);
-        gReader = nil;
-        gOutput = nil;
+        VCamTearDownReader();
     } else {
-        gPlaybackStartRealTime = CACurrentMediaTime();
-        gCurrentFrameNumber = -1;
+        gPlaybackStartTime = CACurrentMediaTime();
+        gLastFrameIndex = -1;
     }
 }
 
-static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuffer) {
-    if (!originSampleBuffer || !VCamIsActive()) return nil;
+// Call with gReaderLock held!
+static CVPixelBufferRef VCamAcquireCurrentPixelBufferLocked(void) {
+    if (!VCamIsActive()) return NULL;
 
-    CVImageBufferRef originPixelBuffer = CMSampleBufferGetImageBuffer(originSampleBuffer);
-    if (!originPixelBuffer) return nil;
-    size_t originW = CVPixelBufferGetWidth(originPixelBuffer);
-    size_t originH = CVPixelBufferGetHeight(originPixelBuffer);
-    if (originW < 100 || originH < 100) return nil;
-
-    OSType originFmt = CVPixelBufferGetPixelFormatType(originPixelBuffer);
-    CMTime originPTS = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer);
     NSString *tempPath = VCamGetExistingTempFilePath();
+    if (access(tempPath.UTF8String, F_OK) != 0) return NULL;
 
-    // Check file modification date to reload if user selected a new video
+    // Check if video file changed
     NSDate *modified = [[gFileManager attributesOfItemAtPath:tempPath error:nil] fileModificationDate];
     if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
         gLastTempFileModified = modified;
         gAsset = nil;
         gTrack = nil;
-        VCamResetReader(tempPath, originFmt, originW, originH);
-    }
-
-    if (!gReader || !gOutput || gCurrentFormat != originFmt || gCurrentW != originW || gCurrentH != originH) {
-        VCamResetReader(tempPath, originFmt, originW, originH);
-    }
-
-    // ── Pause / Freeze Frame ──
-    if (VCamIsPaused() && gCachedPixelBuffer) {
-        CMSampleTimingInfo timing = {
-            .duration               = CMSampleBufferGetDuration(originSampleBuffer),
-            .presentationTimeStamp  = originPTS,
-            .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
-        };
-        CMVideoFormatDescriptionRef fakeFormat = nil;
-        CMSampleBufferRef fakeBuffer = nil;
-        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, &fakeFormat);
-        if (fakeFormat) {
-            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, true,
-                                               nil, nil, fakeFormat, &timing, &fakeBuffer);
-            CFRelease(fakeFormat);
+        if (gCachedPixelBuffer) {
+            CFRelease(gCachedPixelBuffer);
+            gCachedPixelBuffer = NULL;
         }
-        return fakeBuffer;
+        VCamStartReader(tempPath);
+    }
+
+    if (!gReader || !gOutput) {
+        VCamStartReader(tempPath);
+    }
+
+    if (VCamIsPaused()) {
+        return gCachedPixelBuffer;
     }
 
     CFTimeInterval now = CACurrentMediaTime();
-    if (gPlaybackStartRealTime == 0) gPlaybackStartRealTime = now;
-    CFTimeInterval elapsed = now - gPlaybackStartRealTime;
+    if (gPlaybackStartTime <= 0) gPlaybackStartTime = now;
+    CFTimeInterval elapsed = now - gPlaybackStartTime;
 
     // Loop video when time reaches duration
     if (gDuration > 0.05 && elapsed >= gDuration) {
-        VCamResetReader(tempPath, originFmt, originW, originH);
-        gPlaybackStartRealTime = now;
+        VCamStartReader(tempPath);
+        gPlaybackStartTime = now;
         elapsed = 0;
     }
 
-    int targetFrameNumber = (int)(elapsed * gFPS);
-    if (targetFrameNumber != gCurrentFrameNumber) {
-        CMSampleBufferRef rawBuffer = gOutput ? [gOutput copyNextSampleBuffer] : nil;
-        if (rawBuffer) {
-            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(rawBuffer);
+    int64_t targetFrameIndex = (int64_t)(elapsed * gFPS);
+    if (targetFrameIndex != gLastFrameIndex && gOutput) {
+        CMSampleBufferRef sbuf = [gOutput copyNextSampleBuffer];
+        if (sbuf) {
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sbuf);
             if (pb) {
                 if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
                 gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
             }
-            CFRelease(rawBuffer);
-            gCurrentFrameNumber = targetFrameNumber;
+            CFRelease(sbuf);
+            gLastFrameIndex = targetFrameIndex;
         } else {
-            // EOF reached: reset reader immediately for infinite loop
-            VCamResetReader(tempPath, originFmt, originW, originH);
-            gPlaybackStartRealTime = now;
-            CMSampleBufferRef loopBuffer = gOutput ? [gOutput copyNextSampleBuffer] : nil;
-            if (loopBuffer) {
-                CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(loopBuffer);
-                if (pb) {
-                    if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-                    gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
+            // EOF reached: restart reader for loop
+            VCamStartReader(tempPath);
+            gPlaybackStartTime = now;
+            if (gOutput) {
+                CMSampleBufferRef loopBuf = [gOutput copyNextSampleBuffer];
+                if (loopBuf) {
+                    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(loopBuf);
+                    if (pb) {
+                        if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
+                        gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
+                    }
+                    CFRelease(loopBuf);
+                    gLastFrameIndex = 0;
                 }
-                CFRelease(loopBuffer);
-                gCurrentFrameNumber = 0;
             }
         }
     }
 
-    if (!gCachedPixelBuffer) return nil;
-
-    CMSampleTimingInfo timing = {
-        .duration               = CMSampleBufferGetDuration(originSampleBuffer),
-        .presentationTimeStamp  = originPTS,
-        .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
-    };
-    CMVideoFormatDescriptionRef fakeFormat = nil;
-    CMSampleBufferRef fakeBuffer = nil;
-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, &fakeFormat);
-    if (fakeFormat) {
-        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, true,
-                                           nil, nil, fakeFormat, &timing, &fakeBuffer);
-        CFRelease(fakeFormat);
-    }
-    return fakeBuffer;
+    return gCachedPixelBuffer;
 }
 
 static void (*orig_BWNodeOutput_emitSampleBuffer)(id, SEL, CMSampleBufferRef) = NULL;
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
-    CMSampleBufferRef fakeBuffer = VCamCopyFrameMatching(sampleBuffer);
-    if (fakeBuffer) {
-        OSStatus st = VCamCopyPixelBuffer(CMSampleBufferGetImageBuffer(fakeBuffer),
-                                          CMSampleBufferGetImageBuffer(sampleBuffer));
-        if (st != noErr) {
-            static NSTimeInterval lastErrLog = 0;
-            if (CACurrentMediaTime() - lastErrLog > 3.0) {
-                lastErrLog = CACurrentMediaTime();
-                NSLog(@"[vcamios] VCamCopyPixelBuffer failed with error: %d", (int)st);
-            }
-        }
+    if (!sampleBuffer || !VCamIsActive()) {
         orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-        CFRelease(fakeBuffer);
-    } else {
-        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        return;
     }
-}
 
-static void (*orig_BWPixelTransferNode_renderSampleBuffer)(id, SEL, CMSampleBufferRef, id) = NULL;
-static void hook_BWPixelTransferNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
-    orig_BWPixelTransferNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
-}
+    CVImageBufferRef camPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!camPixelBuffer) {
+        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        return;
+    }
 
-static void (*orig_BWNode_renderSampleBuffer)(id, SEL, CMSampleBufferRef, id) = NULL;
-static void hook_BWNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
-    orig_BWNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
+    size_t camW = CVPixelBufferGetWidth(camPixelBuffer);
+    size_t camH = CVPixelBufferGetHeight(camPixelBuffer);
+    if (camW < 100 || camH < 100) {
+        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        return;
+    }
+
+    CVPixelBufferRef videoFrame = NULL;
+    os_unfair_lock_lock(&gReaderLock);
+    CVPixelBufferRef curPB = VCamAcquireCurrentPixelBufferLocked();
+    if (curPB) {
+        videoFrame = (CVPixelBufferRef)CFRetain(curPB);
+    }
+    os_unfair_lock_unlock(&gReaderLock);
+
+    if (videoFrame) {
+        VCamCopyPixelBuffer(videoFrame, camPixelBuffer);
+        CFRelease(videoFrame);
+    }
+
+    orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
 }
 
 static void HookIfPresent(const char *className, SEL selector, IMP replacement, IMP *original) {
@@ -411,12 +402,6 @@ static void VCamInitMediaServerHooks(void) {
     HookIfPresent("BWNodeOutput", @selector(emitSampleBuffer:),
                   (IMP)&hook_BWNodeOutput_emitSampleBuffer,
                   (IMP *)&orig_BWNodeOutput_emitSampleBuffer);
-    HookIfPresent("BWPixelTransferNode", @selector(renderSampleBuffer:forInput:),
-                  (IMP)&hook_BWPixelTransferNode_renderSampleBuffer,
-                  (IMP *)&orig_BWPixelTransferNode_renderSampleBuffer);
-    HookIfPresent("BWNode", @selector(renderSampleBuffer:forInput:),
-                  (IMP)&hook_BWNode_renderSampleBuffer,
-                  (IMP *)&orig_BWNode_renderSampleBuffer);
 
     NSLog(@"[vcamios] mediaserverd hooks loaded; source=%s", kVCamTempFilePath);
 }
