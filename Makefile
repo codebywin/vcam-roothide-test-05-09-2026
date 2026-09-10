@@ -6,9 +6,9 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = vcamios
 
-vcamios_FILES      = Tweak.x
+vcamios_FILES      = Tweak.x VCAMLicenseManager.m
 vcamios_CFLAGS     = -fobjc-arc
-vcamios_FRAMEWORKS = Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage
+vcamios_FRAMEWORKS = Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage Security
 
 vcamios_INSTALL_PATH = /Library/MobileSubstrate/DynamicLibraries
 

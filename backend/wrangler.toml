@@ -1,0 +1,16 @@
+name = "vios"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# KV Namespace binding for persistent license storage
+# After running `npx wrangler kv:namespace create VCAM_LICENSES`,
+# replace the id below with your created KV id.
+kv_namespaces = [
+  { binding = "VCAM_LICENSES", id = "YOUR_KV_NAMESPACE_ID_HERE" }
+]
+
+[vars]
+# Mặc định (có thể override bằng Cloudflare Dashboard -> Settings -> Variables):
+ADMIN_TOKEN = "vcam_admin_secret_2026"
+SECRET_SALT = "vcam_super_secure_salt_key_05_09_2026"
+
