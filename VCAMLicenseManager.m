@@ -139,6 +139,12 @@ static UIWindow *VCAMGetTopWindow(void) {
     uint64_t _monotonicAnchorTime;
     NSTimeInterval _serverAnchorTime;
     NSTimeInterval _lastObservedTime;
+    BOOL _isLicenseValid;
+    NSString *_currentKey;
+    NSString *_hwid;
+    NSString *_signature;
+    NSTimeInterval _expiresAt;
+    BOOL _isChecking;
 }
 @property (nonatomic, assign) BOOL isLicenseValid;
 @property (nonatomic, copy, nullable) NSString *currentKey;
@@ -149,6 +155,13 @@ static UIWindow *VCAMGetTopWindow(void) {
 @end
 
 @implementation VCAMLicenseManager
+
+@synthesize isLicenseValid = _isLicenseValid;
+@synthesize currentKey = _currentKey;
+@synthesize hwid = _hwid;
+@synthesize signature = _signature;
+@synthesize expiresAt = _expiresAt;
+@synthesize isChecking = _isChecking;
 
 + (instancetype)sharedManager {
     static VCAMLicenseManager *mgr = nil;

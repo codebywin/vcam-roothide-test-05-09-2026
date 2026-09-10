@@ -21,6 +21,12 @@
 #define currentKey                      _0x2b4e91
 #define hwid                            _0x11c7e9
 #define expiresAt                       _0x5b31f8
+#define _isLicenseValid                 _0x_iv_lic
+#define _currentKey                     _0x_iv_ckey
+#define _hwid                           _0x_iv_hwid
+#define _signature                      _0x_iv_sig
+#define _expiresAt                      _0x_iv_exp
+#define _isChecking                     _0x_iv_chk
 #define startHeartbeat                  _0x99a12c
 #define stopHeartbeat                   _0x82f41c
 #define activateWithKey                 _0x17a02c
