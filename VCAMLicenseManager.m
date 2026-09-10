@@ -27,31 +27,13 @@ static const char *kVCamPauseFlagPath     = "/var/tmp/vcam_paused";
 // Khóa muối bảo mật khớp với Cloudflare Worker SECRET_SALT
 static NSString *const kSecretSalt = @"vcam_super_secure_salt_key_05_09_2026";
 
-// XOR Obfuscation để giấu link server khỏi lệnh strings / IDA Pro
-static NSString *VCAMDeobfuscate(const uint8_t *data, size_t len, uint8_t key) {
-    NSMutableData *dec = [NSMutableData dataWithLength:len];
-    uint8_t *bytes = (uint8_t *)dec.mutableBytes;
-    for (size_t i = 0; i < len; i++) {
-        bytes[i] = data[i] ^ key;
-    }
-    return [[NSString alloc] initWithData:dec encoding:NSUTF8StringEncoding];
-}
-
-// "https://vios.hothangtech.workers.dev" được mã hóa XOR với key 0x5A
+// Đường dẫn máy chủ Cloudflare Worker bản quyền
 static NSString *VCAMGetServerBaseURL(void) {
-    static const uint8_t encUrl[] = {
-        0x32, 0x2e, 0x2e, 0x2a, 0x29, 0x60, 0x75, 0x75, 0x2c, 0x33, 
-        0x35, 0x29, 0x74, 0x32, 0x35, 0x2e, 0x32, 0x3b, 0x34, 0x3d, 
-        0x2e, 0x3f, 0x39, 0x74, 0x2d, 0x35, 0x28, 0x31, 0x3f, 0x28, 
-        0x29, 0x74, 0x3e, 0x3f, 0x2c
-    };
     static NSString *cachedUrl = nil;
-    if (!cachedUrl) {
-        cachedUrl = VCAMDeobfuscate(encUrl, sizeof(encUrl), 0x5A);
-        if (!cachedUrl || cachedUrl.length == 0) {
-            cachedUrl = @"https://vios.hothangtech.workers.dev";
-        }
-    }
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cachedUrl = [NSString stringWithFormat:@"%@://%@.%@.%@", @"https", @"vios", @"hothangtech", @"workers.dev"];
+    });
     return cachedUrl;
 }
 
