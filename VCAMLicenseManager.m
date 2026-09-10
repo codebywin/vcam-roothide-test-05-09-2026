@@ -14,6 +14,8 @@
 #import <unistd.h>
 #import <sys/stat.h>
 
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 NSString *const kVCAMLicenseStatusChangedNotification = @"kVCAMLicenseStatusChangedNotification";
 NSString *const kVCAMLicenseRevokedNotification       = @"kVCAMLicenseRevokedNotification";
 
@@ -75,46 +77,39 @@ didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
         return;
     }
 
-    // Kiểm tra chứng chỉ hệ thống
-    if (@available(iOS 12.0, *)) {
-        CFErrorRef error = NULL;
-        bool eval = SecTrustEvaluateWithError(serverTrust, &error);
-        if (!eval) {
-            NSLog(@"[VCAMSecurity] Chứng chỉ SSL không hợp lệ hoặc đang bị chặn!");
-            completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
-            return;
-        }
-    } else {
-        SecTrustResultType result;
-        SecTrustEvaluate(serverTrust, &result);
-        if (result != kSecTrustResultProceed && result != kSecTrustResultUnspecified) {
-            completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
-            return;
-        }
+    // Kiểm tra chứng chỉ hệ thống bằng SecTrustEvaluateWithError
+    CFErrorRef error = NULL;
+    bool eval = SecTrustEvaluateWithError(serverTrust, &error);
+    if (!eval) {
+        NSLog(@"[VCAMSecurity] Chứng chỉ SSL không hợp lệ hoặc đang bị chặn!");
+        completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+        return;
     }
 
     // QUÉT VÀ CHẶN TRIỆT ĐỂ MỌI CHỨNG CHỈ BẮT GÓI TIN (Charles, Burp, HTTP Catcher, Thor, Proxyman, Mitmproxy...)
-    CFIndex certCount = SecTrustGetCertificateCount(serverTrust);
-    for (CFIndex i = 0; i < certCount; i++) {
-        SecCertificateRef cert = SecTrustGetCertificateAtIndex(serverTrust, i);
-        if (!cert) continue;
-        CFStringRef summary = SecCertificateCopySubjectSummary(cert);
-        NSString *certName = (__bridge_transfer NSString *)summary;
-        if (certName) {
-            NSString *lower = certName.lowercaseString;
-            if ([lower containsString:@"charles"] ||
-                [lower containsString:@"burp"] ||
-                [lower containsString:@"portswigger"] ||
-                [lower containsString:@"fiddler"] ||
-                [lower containsString:@"mitmproxy"] ||
-                [lower containsString:@"http catcher"] ||
-                [lower containsString:@"thor"] ||
-                [lower containsString:@"stream"] ||
-                [lower containsString:@"proxyman"] ||
-                [lower containsString:@"shadowrocket"]) {
-                NSLog(@"[VCAMSecurity] CẢNH BÁO BẮT GÓI TIN: Chứng chỉ giả mạo %@! Lập tức hủy request.", certName);
-                completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
-                return;
+    CFArrayRef certsArray = SecTrustCopyCertificateChain(serverTrust);
+    if (certsArray) {
+        NSArray *certs = (__bridge_transfer NSArray *)certsArray;
+        for (id certObj in certs) {
+            SecCertificateRef cert = (__bridge SecCertificateRef)certObj;
+            CFStringRef summary = SecCertificateCopySubjectSummary(cert);
+            NSString *certName = (__bridge_transfer NSString *)summary;
+            if (certName) {
+                NSString *lower = certName.lowercaseString;
+                if ([lower containsString:@"charles"] ||
+                    [lower containsString:@"burp"] ||
+                    [lower containsString:@"portswigger"] ||
+                    [lower containsString:@"fiddler"] ||
+                    [lower containsString:@"mitmproxy"] ||
+                    [lower containsString:@"http catcher"] ||
+                    [lower containsString:@"thor"] ||
+                    [lower containsString:@"stream"] ||
+                    [lower containsString:@"proxyman"] ||
+                    [lower containsString:@"shadowrocket"]) {
+                    NSLog(@"[VCAMSecurity] CẢNH BÁO BẮT GÓI TIN: Chứng chỉ giả mạo %@! Lập tức hủy request.", certName);
+                    completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+                    return;
+                }
             }
         }
     }
@@ -140,6 +135,21 @@ static NSURLSession *VCAMGetSecureSession(void) {
         secureSession = [NSURLSession sessionWithConfiguration:config delegate:delegate delegateQueue:nil];
     });
     return secureSession;
+}
+
+static UIWindow *VCAMGetTopWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive &&
+                [scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *winScene = (UIWindowScene *)scene;
+                for (UIWindow *w in winScene.windows) {
+                    if (w.isKeyWindow) return w;
+                }
+            }
+        }
+    }
+    return UIApplication.sharedApplication.windows.firstObject;
 }
 
 @interface VCAMLicenseManager () {
@@ -412,7 +422,9 @@ static NSURLSession *VCAMGetSecureSession(void) {
     __weak typeof(self) weakSelf = self;
     NSURLSessionDataTask *task = [VCAMGetSecureSession() dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *res, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            weakSelf.isChecking = NO;
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.isChecking = NO;
             if (err) {
                 if (completion) completion(NO, [NSString stringWithFormat:@"Lỗi kết nối máy chủ: %@", err.localizedDescription]);
                 return;
@@ -425,12 +437,12 @@ static NSURLSession *VCAMGetSecureSession(void) {
                 NSTimeInterval expires = [json[@"expires_at"] doubleValue];
                 NSString *sig = json[@"signature"];
                 
-                [weakSelf saveLicenseWithKey:key expiresAt:expires signature:sig];
-                weakSelf.isLicenseValid = YES;
+                [strongSelf saveLicenseWithKey:key expiresAt:expires signature:sig];
+                strongSelf.isLicenseValid = YES;
                 
                 // Cập nhật mốc giờ chuẩn từ Cloudflare
-                weakSelf->_serverAnchorTime = [[NSDate date] timeIntervalSince1970];
-                weakSelf->_monotonicAnchorTime = mach_continuous_time();
+                strongSelf->_serverAnchorTime = [[NSDate date] timeIntervalSince1970];
+                strongSelf->_monotonicAnchorTime = mach_continuous_time();
 
                 [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseStatusChangedNotification object:nil];
                 if (completion) completion(YES, json[@"message"] ?: @"Kích hoạt thành công!");
@@ -496,15 +508,18 @@ static NSURLSession *VCAMGetSecureSession(void) {
         NSHTTPURLResponse *httpRes = (NSHTTPURLResponse *)res;
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
             if (httpRes.statusCode == 200 && [json[@"valid"] boolValue]) {
-                weakSelf.isLicenseValid = YES;
-                weakSelf->_serverAnchorTime = [[NSDate date] timeIntervalSince1970];
-                weakSelf->_monotonicAnchorTime = mach_continuous_time();
+                strongSelf.isLicenseValid = YES;
+                strongSelf->_serverAnchorTime = [[NSDate date] timeIntervalSince1970];
+                strongSelf->_monotonicAnchorTime = mach_continuous_time();
                 if (completion) completion(YES, @"Bản quyền hợp lệ");
             } else {
                 // SERVER ĐÃ KHÓA / XÓA HOẶC GỠ THIẾT BỊ NÀY -> CHẶN NGAY LẬP TỨC!
                 NSLog(@"[VCAMLicense] SERVER ĐÃ KHÓA/HỦY KEY: %@", json[@"error"]);
-                weakSelf.isLicenseValid = NO;
+                strongSelf.isLicenseValid = NO;
                 
                 // Tắt ngay cờ replace camera
                 unlink(kVCamEnabledFlagPath);
@@ -516,7 +531,7 @@ static NSURLSession *VCAMGetSecureSession(void) {
 
                 // Hiển thị cảnh báo đỏ trên màn hình
                 NSString *reason = json[@"error"] ?: @"Mã bản quyền của bạn đã bị KHÓA hoặc THU HỒI bởi Quản trị viên!";
-                [weakSelf showBannedAlert:reason];
+                [strongSelf showBannedAlert:reason];
 
                 if (completion) completion(NO, reason);
             }
@@ -529,7 +544,7 @@ static NSURLSession *VCAMGetSecureSession(void) {
 
 - (void)showBannedAlert:(NSString *)reason {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = [UIApplication sharedApplication].keyWindow;
+        UIWindow *window = VCAMGetTopWindow();
         UIViewController *rootVC = window.rootViewController;
         while (rootVC.presentedViewController) {
             rootVC = rootVC.presentedViewController;
@@ -560,7 +575,7 @@ static NSURLSession *VCAMGetSecureSession(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *targetVC = presenter;
         if (!targetVC) {
-            UIWindow *window = [UIApplication sharedApplication].keyWindow;
+            UIWindow *window = VCAMGetTopWindow();
             targetVC = window.rootViewController;
             while (targetVC.presentedViewController) {
                 targetVC = targetVC.presentedViewController;
