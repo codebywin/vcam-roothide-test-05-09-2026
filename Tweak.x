@@ -415,6 +415,7 @@ static void VCamInitMediaServerHooks(void) {
 
 static void VCamFloatRefreshButton(void);
 static void VCamFloatHideMenu(void);
+static UIViewController *VCamPresenter(void);
 
 @interface VCamPickerDelegate : NSObject <UINavigationControllerDelegate, UIImagePickerControllerDelegate>
 @end
@@ -446,7 +447,7 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
         if ([[VCAMLicenseManager sharedManager] isLicenseValid]) {
             VCamWriteFlag(kVCamEnabledFlagPath, "1");
         } else {
-            [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt mã bản quyền để sử dụng video ảo!" presenter:[VCamFloat presenter]];
+            [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt mã bản quyền để sử dụng video ảo!" presenter:VCamPresenter()];
         }
     }
     VCamFloatRefreshButton();
@@ -458,9 +459,7 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
 }
 
 @end
-
-static UIViewController *VCamPresenter(void);
-
+ 
 static void VCamSelectVideo(void) {
     static VCamPickerDelegate *delegate = nil;
     if (!delegate) delegate = [VCamPickerDelegate new];
