@@ -763,7 +763,7 @@ function renderAdminHTML() {
           </select>
         </div>
         <div class="form-group">
-          <label>Số Lượng Máy Được Dùng (Max Devices)</label>
+          <label>Số Lượng Máy Được Dùng</label>
           <select id="keyMaxDevices" class="form-control">
             <option value="1" selected>1 Thiết Bị</option>
             <option value="2">2 Thiết Bị</option>

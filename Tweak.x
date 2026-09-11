@@ -318,6 +318,11 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         elapsed = 0;
         gCurrentFrameNumber = -1;
         if (cachedAsset && cachedTrack) {
+            if (reader) {
+                [reader cancelReading];
+                reader = nil;
+                output = nil;
+            }
             NSError *err = nil;
             AVAssetReader *loopReader = [AVAssetReader assetReaderWithAsset:cachedAsset error:&err];
             AVAssetReaderTrackOutput *loopOutput = [[AVAssetReaderTrackOutput alloc]
@@ -328,6 +333,8 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
             if ([loopReader startReading]) {
                 reader = loopReader;
                 output = loopOutput;
+            } else {
+                gNeedsReaderReload = YES;
             }
         }
     }

@@ -113,6 +113,10 @@ static NSURLSession *VCAMGetSecureSession(void) {
         config.timeoutIntervalForRequest = 10.0;
         config.timeoutIntervalForResource = 10.0;
         
+        config.HTTPAdditionalHeaders = @{
+            @"User-Agent": @"VCAM/1.0 (iPhone; CPU iPhone OS 16_7 like Mac OS X) AppleWebKit/605.1.15"
+        };
+        
         VCAMSecuritySessionDelegate *delegate = [VCAMSecuritySessionDelegate new];
         secureSession = [NSURLSession sessionWithConfiguration:config delegate:delegate delegateQueue:nil];
     });
@@ -352,11 +356,11 @@ static UIWindow *VCAMGetTopWindow(void) {
     dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
     _heartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     
-    // Cài đặt chu kỳ đúng 60 giây
+    // Cài đặt chu kỳ kiểm tra: lần đầu sau 60 giây và lặp lại mỗi 60 giây
     dispatch_source_set_timer(_heartbeatTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), // Lần đầu sau 5s
-                              60 * NSEC_PER_SEC,                                  // Lặp lại mỗi 60s
-                              1 * NSEC_PER_SEC);
+                              dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), // Lần đầu sau 60s
+                              60 * NSEC_PER_SEC,                                   // Lặp lại mỗi 60s
+                              2 * NSEC_PER_SEC);
 
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_heartbeatTimer, ^{
@@ -388,6 +392,7 @@ static UIWindow *VCAMGetTopWindow(void) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"VCAM/1.0 (iPhone; CPU iPhone OS 16_7 like Mac OS X) AppleWebKit/605.1.15" forHTTPHeaderField:@"User-Agent"];
     req.timeoutInterval = 10.0;
 
     NSDictionary *body = @{
@@ -462,6 +467,7 @@ static UIWindow *VCAMGetTopWindow(void) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"VCAM/1.0 (iPhone; CPU iPhone OS 16_7 like Mac OS X) AppleWebKit/605.1.15" forHTTPHeaderField:@"User-Agent"];
     req.timeoutInterval = 8.0;
 
     NSDictionary *body = @{
@@ -499,7 +505,7 @@ static UIWindow *VCAMGetTopWindow(void) {
             return;
         }
 
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSDictionary *json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
         NSHTTPURLResponse *httpRes = (NSHTTPURLResponse *)res;
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -511,8 +517,11 @@ static UIWindow *VCAMGetTopWindow(void) {
                 strongSelf->_serverAnchorTime = [[NSDate date] timeIntervalSince1970];
                 strongSelf->_monotonicAnchorTime = mach_continuous_time();
                 if (completion) completion(YES, @"Bản quyền hợp lệ");
-            } else {
-                // SERVER ĐÃ KHÓA / XÓA HOẶC GỠ THIẾT BỊ NÀY -> CHẶN NGAY LẬP TỨC!
+            } else if (httpRes.statusCode == 403 && json && [json[@"valid"] boolValue] == NO &&
+                       ([json[@"code"] isEqualToString:@"KEY_BANNED"] ||
+                        [json[@"code"] isEqualToString:@"DEVICE_UNBOUND"] ||
+                        [json[@"code"] isEqualToString:@"EXPIRED"])) {
+                // CHỈ KHI SERVER CHỦ ĐỘNG XÁC NHẬN KEY ĐÃ BỊ KHÓA / GỠ / HẾT HẠN MỚI THU HỒI
                 NSLog(@"[VCAMLicense] SERVER ĐÃ KHÓA/HỦY KEY: %@", json[@"error"]);
                 strongSelf.isLicenseValid = NO;
                 
@@ -529,6 +538,18 @@ static UIWindow *VCAMGetTopWindow(void) {
                 [strongSelf showBannedAlert:reason];
 
                 if (completion) completion(NO, reason);
+            } else {
+                // Các trường hợp mạng lag, WAF chặn tạm thời, 429, 500, 502...
+                // FALLBACK VỀ XÁC MINH CHỮ KÝ OFFLINE (KHÔNG TỰ Ý NGẮT CAMERA CỦA KHÁCH HÀNG!)
+                NSLog(@"[VCAMLicense] Máy chủ chưa thể xác thực trực tuyến (Status %ld), chuyển sang kiểm tra offline an toàn.", (long)httpRes.statusCode);
+                BOOL localValid = [strongSelf validateLocalSignatureOffline];
+                if (!localValid) {
+                    unlink(kVCamEnabledFlagPath);
+                    unlink(kVCamPauseFlagPath);
+                    [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseRevokedNotification object:@"Bản quyền không hợp lệ hoặc đã hết hạn."];
+                    [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseStatusChangedNotification object:nil];
+                }
+                if (completion) completion(localValid, @"Đang chạy chế độ offline");
             }
         });
     }];
