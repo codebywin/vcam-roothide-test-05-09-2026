@@ -432,23 +432,37 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
     [gFileManager removeItemAtPath:kVCamTempFile error:nil];
     VCamRemoveFlag(kVCamPauseFlagPath);
 
+    // Bắt đầu truy cập security-scoped URL (cần thiết trên iOS 15 & 16 khi chọn media từ Photos)
+    BOOL accessed = [url startAccessingSecurityScopedResource];
+
     NSError *err = nil;
     BOOL copied = [gFileManager copyItemAtPath:url.path toPath:kVCamTempFile error:&err];
-    if (!copied && [gFileManager fileExistsAtPath:kVCamTempFile]) {
-        copied = [gFileManager replaceItemAtURL:[NSURL fileURLWithPath:kVCamTempFile]
-                                  withItemAtURL:url
-                                 backupItemName:nil
-                                        options:NSFileManagerItemReplacementUsingNewMetadataOnly
-                               resultingItemURL:nil
-                                          error:&err];
+    if (!copied) {
+        // Fallback 1: Thử copy qua NSURL fileURLWithPath
+        copied = [gFileManager copyItemAtURL:url toURL:[NSURL fileURLWithPath:kVCamTempFile] error:&err];
     }
+    if (!copied) {
+        // Fallback 2: Đọc trực tiếp NSData (bỏ qua hạn chế file hardlink/sandbox) và ghi ra file
+        NSData *data = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:&err];
+        if (data && data.length > 0) {
+            copied = [data writeToFile:kVCamTempFile options:NSDataWritingAtomic error:&err];
+        }
+    }
+
+    if (accessed) {
+        [url stopAccessingSecurityScopedResource];
+    }
+
     if ([gFileManager fileExistsAtPath:kVCamTempFile]) {
         chmod(kVCamTempFilePath, 0666);
         if ([[VCAMLicenseManager sharedManager] isLicenseValid]) {
             VCamWriteFlag(kVCamEnabledFlagPath, "1");
+            NSLog(@"[vcamios] Video đã được lưu thành công vào %s, cờ enabled đã bật!", kVCamTempFilePath);
         } else {
             [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt mã bản quyền để sử dụng video ảo!" presenter:VCamPresenter()];
         }
+    } else {
+        NSLog(@"[vcamios] LỖI: Không thể sao chép video vào %s! Chi tiết: %@", kVCamTempFilePath, err.localizedDescription);
     }
     VCamFloatRefreshButton();
     VCamFloatHideMenu();
