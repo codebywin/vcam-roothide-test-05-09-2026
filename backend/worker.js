@@ -170,7 +170,25 @@ export default {
       return new Response(null, { status: 204, headers: isAdminPath ? adminCorsHeaders() : corsHeaders() });
     }
 
-    // === Kiểm tra cấu hình bắt buộc ===
+    // 1. Root Health Check (không cần SECRET_SALT)
+    if (path === "/" || path === "/api/health") {
+      return jsonResponse({
+        service: "VCAM iOS License Server",
+        status: "online",
+        time: new Date().toISOString(),
+        kv_bound: !!env.VCAM_LICENSES,
+        version: "2.0.0 (Multi-device, Lock/Unlock & Revoke)"
+      }, 200, true);
+    }
+
+    // 2. Web Admin Dashboard — không cần SECRET_SALT (chỉ trả HTML)
+    if (path === "/admin") {
+      return new Response(renderAdminHTML(), {
+        headers: { "Content-Type": "text/html; charset=utf-8", ...adminCorsHeaders() },
+      });
+    }
+
+    // === Kiểm tra cấu hình bắt buộc cho các API routes ===
     const secretSalt = env.SECRET_SALT;
     if (!secretSalt) {
       return new Response(JSON.stringify({ error: "Server misconfigured: SECRET_SALT not set in environment" }), {
@@ -179,24 +197,6 @@ export default {
     }
 
     const storage = new LicenseStorage(env.VCAM_LICENSES);
-
-    // 1. Root Health Check
-    if (path === "/" || path === "/api/health") {
-      return jsonResponse({
-        service: "VCAM iOS License Server",
-        status: "online",
-        time: new Date().toISOString(),
-        kv_bound: !!env.VCAM_LICENSES,
-        version: "2.0.0 (Multi-device, Lock/Unlock & Revoke)"
-      });
-    }
-
-    // 2. Web Admin Dashboard — dùng adminCorsHeaders
-    if (path === "/admin") {
-      return new Response(renderAdminHTML(), {
-        headers: { "Content-Type": "text/html; charset=utf-8", ...adminCorsHeaders() },
-      });
-    }
 
     // ==========================================
     // CLIENT APIS
