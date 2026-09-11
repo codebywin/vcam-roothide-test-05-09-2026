@@ -244,11 +244,69 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     return noErr;
 }
 
+static BOOL VCamSetupReader(NSString *videoPath, OSType subtype,
+                            AVAsset **outAsset, AVAssetTrack **outTrack,
+                            AVAssetReader **outReader, AVAssetReaderTrackOutput **outOutput,
+                            Float64 *outDuration, float *outFPS) {
+    if (!videoPath || access([videoPath UTF8String], F_OK) != 0) return NO;
+
+    NSURL *url = [NSURL fileURLWithPath:videoPath];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!track) return NO;
+
+    double angle = atan2(track.preferredTransform.b, track.preferredTransform.a);
+    if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
+    else if (fabs(angle + M_PI_2) < 0.05)     gVideoExifOrientation = 8;
+    else if (fabs(fabs(angle) - M_PI) < 0.05) gVideoExifOrientation = 3;
+    else                                       gVideoExifOrientation = 1;
+
+    OSType outputFormat = subtype;
+    if (outputFormat != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        outputFormat != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
+        outputFormat != kCVPixelFormatType_32BGRA) {
+        outputFormat = kCVPixelFormatType_32BGRA;
+    }
+
+    NSError *err = nil;
+    AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
+    if (!r) return NO;
+
+    AVAssetReaderTrackOutput *outp = [[AVAssetReaderTrackOutput alloc]
+        initWithTrack:track
+        outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(outputFormat)}];
+    outp.alwaysCopiesSampleData = NO;
+    [r addOutput:outp];
+
+    if (![r startReading]) {
+        return NO;
+    }
+
+    *outAsset = asset;
+    *outTrack = track;
+    *outReader = r;
+    *outOutput = outp;
+
+    Float64 dur = CMTimeGetSeconds(asset.duration);
+    if (outDuration) *outDuration = (dur > 0.05) ? dur : 1.0;
+
+    float f = track.nominalFrameRate;
+    if (outFPS) *outFPS = (f >= 10.0f && f <= 120.0f) ? f : 30.0f;
+
+    return YES;
+}
+
 static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuffer) {
+    static AVAsset *readerAsset = nil;
+    static AVAssetTrack *readerTrack = nil;
     static AVAssetReader *reader = nil;
     static AVAssetReaderTrackOutput *output = nil;
     static OSType readerFormat = 0;
     static CVPixelBufferRef cachedPixelBuffer = nil;
+    static CFTimeInterval gPlaybackStartRealTime = 0;
+    static Float64 gCachedDuration = 0.0;
+    static float gVideoFPS = 30.0f;
+    static int gCurrentFrameNumber = -1;
 
     if (!originSampleBuffer || !VCamIsActive() || !VCamCheckFileExists(kVCamTempFileName)) return nil;
 
@@ -277,74 +335,50 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         return fakeBuffer;
     }
 
-    static AVAsset *cachedAsset = nil;
-    static AVAssetTrack *cachedTrack = nil;
-    static CFTimeInterval gPlaybackStartRealTime = 0;
-    static Float64 gCachedDuration = 0.0;
-    static float gVideoFPS = 30.0f;
-    static int gCurrentFrameNumber = -1;
-
     NSString *currentTempPath = VCamFindExistingFilePath(kVCamTempFileName);
     NSDate *modified = [[gFileManager attributesOfItemAtPath:currentTempPath error:nil] fileModificationDate];
     if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
         gLastTempFileModified = modified;
         gNeedsReaderReload = YES;
-        cachedAsset = nil;
-        cachedTrack = nil;
-        gPlaybackStartRealTime = 0;
-        gCurrentFrameNumber = -1;
     }
 
     if (readerFormat != originSubtype) gNeedsReaderReload = YES;
 
-    if (gNeedsReaderReload || !reader) {
-        gNeedsReaderReload = NO;
-        reader = nil;
-        output = nil;
-
-        if (!cachedAsset) {
-            NSURL *url = [NSURL fileURLWithPath:currentTempPath];
-            cachedAsset = [AVAsset assetWithURL:url];
-            cachedTrack = [[cachedAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-            gCachedDuration = CMTimeGetSeconds(cachedAsset.duration);
-            float f = cachedTrack ? cachedTrack.nominalFrameRate : 30.0f;
-            gVideoFPS = (f >= 10.0f && f <= 120.0f) ? f : 30.0f;
+    // Khởi tạo hoặc tải lại reader nếu cần
+    if (gNeedsReaderReload || !reader || reader.status != AVAssetReaderStatusReading) {
+        if (reader) {
+            [reader cancelReading];
+            reader = nil;
+            output = nil;
         }
+        readerAsset = nil;
+        readerTrack = nil;
 
-        if (!cachedAsset || !cachedTrack) {
+        BOOL ok = VCamSetupReader(currentTempPath, originSubtype, &readerAsset, &readerTrack, &reader, &output, &gCachedDuration, &gVideoFPS);
+        if (!ok) {
             gNeedsReaderReload = YES;
+            // Nếu có cached frame, tiếp tục xuất frame cũ để không bị nháy camera thật
+            if (cachedPixelBuffer) {
+                CMSampleTimingInfo timing = {
+                    .duration               = CMSampleBufferGetDuration(originSampleBuffer),
+                    .presentationTimeStamp  = originPTS,
+                    .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
+                };
+                CMVideoFormatDescriptionRef fakeFormat = nil;
+                CMSampleBufferRef fakeBuffer = nil;
+                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, cachedPixelBuffer, &fakeFormat);
+                if (fakeFormat) {
+                    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, cachedPixelBuffer, true,
+                                                       nil, nil, fakeFormat, &timing, &fakeBuffer);
+                    CFRelease(fakeFormat);
+                }
+                return fakeBuffer;
+            }
             return nil;
         }
 
-        double angle = atan2(cachedTrack.preferredTransform.b, cachedTrack.preferredTransform.a);
-        if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
-        else if (fabs(angle + M_PI_2) < 0.05)     gVideoExifOrientation = 8;
-        else if (fabs(fabs(angle) - M_PI) < 0.05) gVideoExifOrientation = 3;
-        else                                       gVideoExifOrientation = 1;
-
-        OSType outputFormat = originSubtype;
-        if (outputFormat != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
-            outputFormat != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
-            outputFormat != kCVPixelFormatType_32BGRA) {
-            outputFormat = kCVPixelFormatType_32BGRA;
-        }
-
-        NSError *error = nil;
-        AVAssetReader *newReader = [AVAssetReader assetReaderWithAsset:cachedAsset error:&error];
-        AVAssetReaderTrackOutput *newOutput = [[AVAssetReaderTrackOutput alloc]
-            initWithTrack:cachedTrack
-            outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(outputFormat)}];
-        newOutput.alwaysCopiesSampleData = NO;
-        [newReader addOutput:newOutput];
-
-        if (![newReader startReading]) {
-            gNeedsReaderReload = YES;
-            return cachedPixelBuffer ? nil : nil;
-        }
-
-        reader = newReader;
-        output = newOutput;
-        readerFormat = outputFormat;
+        gNeedsReaderReload = NO;
+        readerFormat = originSubtype;
         gPlaybackStartRealTime = CACurrentMediaTime();
         gCurrentFrameNumber = -1;
     }
@@ -353,35 +387,27 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     if (gPlaybackStartRealTime == 0) gPlaybackStartRealTime = now;
 
     CFTimeInterval elapsed = now - gPlaybackStartRealTime;
+
+    // Seamless Infinite Loop: Tái sinh reader bằng AVURLAsset mới sạch sẽ
     if (gCachedDuration > 0.05 && elapsed >= gCachedDuration) {
-        // Video loop transition: seamlessly restart reader without any black frame
         gPlaybackStartRealTime = now;
         elapsed = 0;
         gCurrentFrameNumber = -1;
-        if (cachedAsset && cachedTrack) {
-            if (reader) {
-                [reader cancelReading];
-                reader = nil;
-                output = nil;
-            }
-            NSError *err = nil;
-            AVAssetReader *loopReader = [AVAssetReader assetReaderWithAsset:cachedAsset error:&err];
-            AVAssetReaderTrackOutput *loopOutput = [[AVAssetReaderTrackOutput alloc]
-                initWithTrack:cachedTrack
-                outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(readerFormat)}];
-            loopOutput.alwaysCopiesSampleData = NO;
-            [loopReader addOutput:loopOutput];
-            if ([loopReader startReading]) {
-                reader = loopReader;
-                output = loopOutput;
-            } else {
-                gNeedsReaderReload = YES;
-            }
+
+        if (reader) {
+            [reader cancelReading];
+            reader = nil;
+            output = nil;
         }
+        readerAsset = nil;
+        readerTrack = nil;
+
+        VCamSetupReader(currentTempPath, readerFormat, &readerAsset, &readerTrack, &reader, &output, &gCachedDuration, &gVideoFPS);
     }
 
+    // Đọc frame tiếp theo
     int targetFrameNumber = (int)(elapsed * gVideoFPS);
-    if (targetFrameNumber != gCurrentFrameNumber) {
+    if (targetFrameNumber != gCurrentFrameNumber && output) {
         CMSampleBufferRef rawBuffer = [output copyNextSampleBuffer];
         if (rawBuffer) {
             CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(rawBuffer);
@@ -391,6 +417,18 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
             }
             CFRelease(rawBuffer);
             gCurrentFrameNumber = targetFrameNumber;
+        } else {
+            // Hết sample buffer trong reader -> Lập tức khởi tạo lượt loop mới
+            gPlaybackStartRealTime = now;
+            gCurrentFrameNumber = -1;
+            if (reader) {
+                [reader cancelReading];
+                reader = nil;
+                output = nil;
+            }
+            readerAsset = nil;
+            readerTrack = nil;
+            VCamSetupReader(currentTempPath, readerFormat, &readerAsset, &readerTrack, &reader, &output, &gCachedDuration, &gVideoFPS);
         }
     }
 
