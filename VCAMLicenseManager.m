@@ -21,8 +21,6 @@ NSString *const kVCAMLicenseRevokedNotification       = @"kVCAMLicenseRevokedNot
 
 static const char *kVCamSharedLicensePath = "/var/mobile/Library/Preferences/com.vcamios.license.plist";
 static const char *kVCamSharedHwidPath    = "/var/mobile/Library/Preferences/.vcam_device_id";
-static const char *kVCamEnabledFlagPath   = "/var/tmp/vcam_enabled";
-static const char *kVCamPauseFlagPath     = "/var/tmp/vcam_paused";
 
 // Khóa muối bảo mật khớp với Cloudflare Worker SECRET_SALT
 static NSString *const kSecretSalt = @"ZdgM7kzHWw8RV58TFQT7Hc7JZeG6fbEn8bHtdDg2";
