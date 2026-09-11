@@ -25,7 +25,7 @@ static const char *kVCamEnabledFlagPath   = "/var/tmp/vcam_enabled";
 static const char *kVCamPauseFlagPath     = "/var/tmp/vcam_paused";
 
 // Khóa muối bảo mật khớp với Cloudflare Worker SECRET_SALT
-static NSString *const kSecretSalt = @"vcam_super_secure_salt_key_05_09_2026";
+static NSString *const kSecretSalt = @"ZdgM7kzHWw8RV58TFQT7Hc7JZeG6fbEn8bHtdDg2";
 
 // Đường dẫn máy chủ Cloudflare Worker bản quyền
 static NSString *VCAMGetServerBaseURL(void) {

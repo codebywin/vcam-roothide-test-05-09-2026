@@ -537,7 +537,7 @@ static VCamFloat *gVCamFloat = nil;
 
 - (void)_setup {
     if (_win) return;
-    CGFloat sz = 46;
+    CGFloat sz = 52;
     CGRect screen = UIScreen.mainScreen.bounds;
 
     if (@available(iOS 13.0, *)) {
@@ -559,16 +559,16 @@ static VCamFloat *gVCamFloat = nil;
     _rootVC.view.userInteractionEnabled = NO;
     _win.rootViewController = _rootVC;
 
-    // Mini Floating Ball
+    // Mini Floating Ball (Enlarged)
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(0, 0, sz, sz);
     btn.center = CGPointMake(screen.size.width - sz / 2 - 10, screen.size.height * 0.40);
     btn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
     btn.layer.cornerRadius = sz / 2;
-    btn.layer.borderWidth = 1.0;
-    btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.55].CGColor;
+    btn.layer.borderWidth = 1.2;
+    btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.60].CGColor;
     [btn setTitle:@"📷" forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:19];
+    btn.titleLabel.font = [UIFont systemFontOfSize:22];
     btn.userInteractionEnabled = YES;
     [btn addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
 
@@ -600,11 +600,11 @@ static VCamFloat *gVCamFloat = nil;
     b.frame = CGRectMake(x, y, w, h);
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:13.5];
-    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
-    b.layer.cornerRadius = 6;
-    b.layer.borderWidth = 0.6;
-    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
+    b.layer.cornerRadius = 8;
+    b.layer.borderWidth = 0.8;
+    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -614,11 +614,11 @@ static VCamFloat *gVCamFloat = nil;
     b.frame = CGRectMake(x, y, w, h);
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:color forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:14];
-    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.22];
-    b.layer.cornerRadius = 8;
-    b.layer.borderWidth = 0.6;
-    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.30].CGColor;
+    b.titleLabel.font = [UIFont systemFontOfSize:17];
+    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.25];
+    b.layer.cornerRadius = 10;
+    b.layer.borderWidth = 0.8;
+    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.35].CGColor;
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }

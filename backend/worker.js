@@ -90,32 +90,72 @@ class LicenseStorage {
   }
 }
 
-// Tiện ích CORS & Response
+// Tiện ích CORS — Chỉ cho phép request từ thiết bị iOS (không phải browser lạ)
 function corsHeaders() {
   return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token, X-VCAM-Signature, X-VCAM-Timestamp",
+    // API mobile không cần mở wildcard CORS
+    "Access-Control-Allow-Origin": "null",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, X-VCAM-Signature, X-VCAM-Timestamp",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
   };
 }
 
-function jsonResponse(data, status = 200) {
+// CORS header riêng cho Admin Dashboard (cho phép browser)
+function adminCorsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+  };
+}
+
+function jsonResponse(data, status = 200, isAdmin = false) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders(),
+      ...(isAdmin ? adminCorsHeaders() : corsHeaders()),
     },
   });
 }
 
 function checkAdminAuth(request, env) {
-  const adminSecret = env.ADMIN_TOKEN || "vcam_admin_secret_2026";
+  // Bắt buộc phải set ADMIN_TOKEN trong Cloudflare env — không có fallback!
+  const adminSecret = env.ADMIN_TOKEN;
+  if (!adminSecret) return false;
   const authHeader = request.headers.get("Authorization") || "";
   const tokenHeader = request.headers.get("X-Admin-Token") || "";
   const bearerMatch = authHeader.match(/^Bearer\s+(.*)$/i);
   const token = bearerMatch ? bearerMatch[1].trim() : tokenHeader.trim();
   return token === adminSecret;
+}
+
+// Rate Limiter đơn giản dùng KV (max 15 request / 60 giây / IP)
+async function checkRateLimit(env, ip, action) {
+  if (!env.VCAM_LICENSES) return true; // Bỏ qua nếu không có KV
+  const key = `rl:${action}:${ip}`;
+  const now = Math.floor(Date.now() / 1000);
+  const windowSec = 60;
+  const maxRequests = 15;
+  try {
+    const raw = await env.VCAM_LICENSES.get(key);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (now - data.start < windowSec) {
+        if (data.count >= maxRequests) return false; // Vượt giới hạn
+        await env.VCAM_LICENSES.put(key, JSON.stringify({ start: data.start, count: data.count + 1 }), { expirationTtl: windowSec });
+      } else {
+        await env.VCAM_LICENSES.put(key, JSON.stringify({ start: now, count: 1 }), { expirationTtl: windowSec });
+      }
+    } else {
+      await env.VCAM_LICENSES.put(key, JSON.stringify({ start: now, count: 1 }), { expirationTtl: windowSec });
+    }
+  } catch (_) { /* Ignore KV errors */ }
+  return true;
 }
 
 export default {
@@ -126,11 +166,19 @@ export default {
 
     // CORS preflight
     if (method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      const isAdminPath = path.startsWith("/api/admin") || path === "/admin";
+      return new Response(null, { status: 204, headers: isAdminPath ? adminCorsHeaders() : corsHeaders() });
+    }
+
+    // === Kiểm tra cấu hình bắt buộc ===
+    const secretSalt = env.SECRET_SALT;
+    if (!secretSalt) {
+      return new Response(JSON.stringify({ error: "Server misconfigured: SECRET_SALT not set in environment" }), {
+        status: 500, headers: { "Content-Type": "application/json" }
+      });
     }
 
     const storage = new LicenseStorage(env.VCAM_LICENSES);
-    const secretSalt = env.SECRET_SALT || "vcam_super_secure_salt_key_05_09_2026";
 
     // 1. Root Health Check
     if (path === "/" || path === "/api/health") {
@@ -143,10 +191,10 @@ export default {
       });
     }
 
-    // 2. Web Admin Dashboard
+    // 2. Web Admin Dashboard — dùng adminCorsHeaders
     if (path === "/admin") {
       return new Response(renderAdminHTML(), {
-        headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders() },
+        headers: { "Content-Type": "text/html; charset=utf-8", ...adminCorsHeaders() },
       });
     }
 
@@ -157,6 +205,13 @@ export default {
     // POST /api/activate
     // Body: { "key": "VCAM-...", "hwid": "...", "device_name"?: "..." }
     if (path === "/api/activate" && method === "POST") {
+      // Rate limit: tối đa 15 lần activate / IP / phút
+      const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
+      const allowed = await checkRateLimit(env, clientIP, "activate");
+      if (!allowed) {
+        return jsonResponse({ error: "Quá nhiều yêu cầu! Vui lòng thử lại sau 60 giây." }, 429);
+      }
+
       try {
         const body = await request.json();
         const key = (body.key || "").trim().toUpperCase();
@@ -271,6 +326,13 @@ export default {
     // POST /api/verify
     // Body: { "key": "...", "hwid": "...", "signature": "...", "expires_at": 123456 }
     if (path === "/api/verify" && method === "POST") {
+      // Rate limit: tối đa 15 lần verify / IP / phút
+      const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
+      const allowed = await checkRateLimit(env, clientIP, "verify");
+      if (!allowed) {
+        return jsonResponse({ valid: false, error: "Quá nhiều yêu cầu! Vui lòng thử lại sau 60 giây." }, 429);
+      }
+
       try {
         const body = await request.json();
         const key = (body.key || "").trim().toUpperCase();
@@ -328,8 +390,11 @@ export default {
     // ==========================================
 
     if (path.startsWith("/api/admin/")) {
+      if (!env.ADMIN_TOKEN) {
+        return jsonResponse({ error: "Server misconfigured: ADMIN_TOKEN not set in environment" }, 500, true);
+      }
       if (!checkAdminAuth(request, env)) {
-        return jsonResponse({ error: "Không có quyền truy cập (Sai Admin Token)!" }, 401);
+        return jsonResponse({ error: "Không có quyền truy cập (Sai Admin Token)!" }, 401, true);
       }
 
       // POST /api/admin/create-key
