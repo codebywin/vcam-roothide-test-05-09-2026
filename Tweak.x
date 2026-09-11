@@ -456,7 +456,7 @@ static void VCamInitMediaServerHooks(void) {
                   (IMP)&hook_BWNode_renderSampleBuffer,
                   (IMP *)&orig_BWNode_renderSampleBuffer);
 
-    NSLog(@"[vcamios] mediaserverd hooks loaded; source=%s", kVCamTempFilePath);
+    NSLog(@"[vcamios] mediaserverd hooks loaded; source=%s", kVCamTempFileName);
 }
 
 // ─── SpringBoard UI (Compact Square HUD Layout ~175x175) ───────────────────
