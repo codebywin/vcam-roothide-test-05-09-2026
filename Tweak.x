@@ -15,46 +15,84 @@
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-static const char *kVCamTempFilePath    = "/var/tmp/vcam_temp.mov";
-static const char *kVCamEnabledFlagPath = "/var/tmp/vcam_enabled";
-static const char *kVCamPauseFlagPath   = "/var/tmp/vcam_paused";
-static const char *kVCamScaleFilePath   = "/var/tmp/vcam_scale";
-static const char *kVCamOffsetXFilePath = "/var/tmp/vcam_offset_x";
-static const char *kVCamOffsetYFilePath = "/var/tmp/vcam_offset_y";
-
-static NSString *const kVCamTempFile = @"/var/tmp/vcam_temp.mov";
+static const char *kVCamTempFileName    = "vcam_temp.mov";
+static const char *kVCamEnabledFlagName = "vcam_enabled";
+static const char *kVCamPauseFlagName   = "vcam_paused";
+static const char *kVCamScaleFileName   = "vcam_scale";
+static const char *kVCamOffsetXFileName = "vcam_offset_x";
+static const char *kVCamOffsetYFileName = "vcam_offset_y";
 
 static NSFileManager *gFileManager = nil;
 static BOOL gNeedsReaderReload = YES;
 static NSDate *gLastTempFileModified = nil;
 static int32_t gVideoExifOrientation = 1;
 
-static void VCamWriteFlag(const char *path, const char *val) {
-    FILE *f = fopen(path, "w");
-    if (f) {
-        if (val) fputs(val, f);
-        fclose(f);
-    }
-    chmod(path, 0666);
+static NSArray<NSString *> *VCamPossibleTmpDirs(void) {
+    static NSArray<NSString *> *dirs = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSMutableArray *list = [NSMutableArray arrayWithObjects:@"/var/tmp", @"/private/var/tmp", nil];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:@"/rootfs/private/var/tmp"]) {
+            [list addObject:@"/rootfs/private/var/tmp"];
+        }
+        dirs = [list copy];
+    });
+    return dirs;
 }
 
-static void VCamRemoveFlag(const char *path) {
-    unlink(path);
+static void VCamWriteFlag(const char *name, const char *val) {
+    for (NSString *dir in VCamPossibleTmpDirs()) {
+        NSString *filePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        FILE *f = fopen([filePath UTF8String], "w");
+        if (f) {
+            if (val) fputs(val, f);
+            fclose(f);
+        }
+        chmod([filePath UTF8String], 0666);
+    }
+}
+
+static void VCamRemoveFlag(const char *name) {
+    for (NSString *dir in VCamPossibleTmpDirs()) {
+        NSString *filePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        unlink([filePath UTF8String]);
+    }
+}
+
+static BOOL VCamCheckFileExists(const char *name) {
+    for (NSString *dir in VCamPossibleTmpDirs()) {
+        NSString *filePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        if (access([filePath UTF8String], F_OK) == 0) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static NSString *VCamFindExistingFilePath(const char *name) {
+    for (NSString *dir in VCamPossibleTmpDirs()) {
+        NSString *filePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+        if (access([filePath UTF8String], F_OK) == 0) {
+            return filePath;
+        }
+    }
+    return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
 }
 
 static BOOL VCamIsActive(void) {
     if (![[VCAMLicenseManager sharedManager] isLicenseValid]) {
         return NO;
     }
-    return (access(kVCamEnabledFlagPath, F_OK) == 0);
+    return VCamCheckFileExists(kVCamEnabledFlagName);
 }
 
 static BOOL VCamIsPaused(void) {
-    return (access(kVCamPauseFlagPath, F_OK) == 0);
+    return VCamCheckFileExists(kVCamPauseFlagName);
 }
 
 static CGFloat VCamGetScale(void) {
-    FILE *f = fopen(kVCamScaleFilePath, "r");
+    NSString *path = VCamFindExistingFilePath(kVCamScaleFileName);
+    FILE *f = fopen([path UTF8String], "r");
     if (f) {
         float val = 1.0f;
         if (fscanf(f, "%f", &val) == 1) {
@@ -72,11 +110,12 @@ static void VCamSetScale(CGFloat scale) {
     if (scale > 2.5f) scale = 2.5f;
     char buf[32];
     snprintf(buf, sizeof(buf), "%.2f", scale);
-    VCamWriteFlag(kVCamScaleFilePath, buf);
+    VCamWriteFlag(kVCamScaleFileName, buf);
 }
 
 static CGFloat VCamGetOffsetX(void) {
-    FILE *f = fopen(kVCamOffsetXFilePath, "r");
+    NSString *path = VCamFindExistingFilePath(kVCamOffsetXFileName);
+    FILE *f = fopen([path UTF8String], "r");
     if (f) {
         float val = 0.0f;
         if (fscanf(f, "%f", &val) == 1) {
@@ -89,7 +128,8 @@ static CGFloat VCamGetOffsetX(void) {
 }
 
 static CGFloat VCamGetOffsetY(void) {
-    FILE *f = fopen(kVCamOffsetYFilePath, "r");
+    NSString *path = VCamFindExistingFilePath(kVCamOffsetYFileName);
+    FILE *f = fopen([path UTF8String], "r");
     if (f) {
         float val = 0.0f;
         if (fscanf(f, "%f", &val) == 1) {
@@ -105,8 +145,8 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
     char bufX[32], bufY[32];
     snprintf(bufX, sizeof(bufX), "%.1f", x);
     snprintf(bufY, sizeof(bufY), "%.1f", y);
-    VCamWriteFlag(kVCamOffsetXFilePath, bufX);
-    VCamWriteFlag(kVCamOffsetYFilePath, bufY);
+    VCamWriteFlag(kVCamOffsetXFileName, bufX);
+    VCamWriteFlag(kVCamOffsetYFileName, bufY);
 }
 
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
@@ -210,7 +250,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     static OSType readerFormat = 0;
     static CVPixelBufferRef cachedPixelBuffer = nil;
 
-    if (!originSampleBuffer || !VCamIsActive() || (access(kVCamTempFilePath, F_OK) != 0)) return nil;
+    if (!originSampleBuffer || !VCamIsActive() || !VCamCheckFileExists(kVCamTempFileName)) return nil;
 
     CMFormatDescriptionRef originFormat = CMSampleBufferGetFormatDescription(originSampleBuffer);
     if (!originFormat || CMFormatDescriptionGetMediaType(originFormat) != kCMMediaType_Video) return nil;
@@ -244,7 +284,8 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     static float gVideoFPS = 30.0f;
     static int gCurrentFrameNumber = -1;
 
-    NSDate *modified = [[gFileManager attributesOfItemAtPath:kVCamTempFile error:nil] fileModificationDate];
+    NSString *currentTempPath = VCamFindExistingFilePath(kVCamTempFileName);
+    NSDate *modified = [[gFileManager attributesOfItemAtPath:currentTempPath error:nil] fileModificationDate];
     if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
         gLastTempFileModified = modified;
         gNeedsReaderReload = YES;
@@ -262,7 +303,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         output = nil;
 
         if (!cachedAsset) {
-            NSURL *url = [NSURL fileURLWithPath:kVCamTempFile];
+            NSURL *url = [NSURL fileURLWithPath:currentTempPath];
             cachedAsset = [AVAsset assetWithURL:url];
             cachedTrack = [[cachedAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
             gCachedDuration = CMTimeGetSeconds(cachedAsset.duration);
@@ -434,25 +475,39 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
 
     NSURL *url = info[UIImagePickerControllerMediaURL];
+    if (!url) {
+        url = info[UIImagePickerControllerReferenceURL];
+    }
     if (!url) return;
 
-    [gFileManager removeItemAtPath:kVCamTempFile error:nil];
-    VCamRemoveFlag(kVCamPauseFlagPath);
+    VCamRemoveFlag(kVCamPauseFlagName);
 
-    // Bắt đầu truy cập security-scoped URL (cần thiết trên iOS 15 & 16 khi chọn media từ Photos)
+    // Bắt đầu truy cập security-scoped URL (cần thiết trên iOS 15 & 16)
     BOOL accessed = [url startAccessingSecurityScopedResource];
 
+    // Đọc data video an toàn
     NSError *err = nil;
-    BOOL copied = [gFileManager copyItemAtPath:url.path toPath:kVCamTempFile error:&err];
-    if (!copied) {
-        // Fallback 1: Thử copy qua NSURL fileURLWithPath
-        copied = [gFileManager copyItemAtURL:url toURL:[NSURL fileURLWithPath:kVCamTempFile] error:&err];
-    }
-    if (!copied) {
-        // Fallback 2: Đọc trực tiếp NSData (bỏ qua hạn chế file hardlink/sandbox) và ghi ra file
-        NSData *data = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:&err];
+    NSData *data = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:&err];
+
+    BOOL anySaved = NO;
+    for (NSString *dir in VCamPossibleTmpDirs()) {
+        NSString *destPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempFileName]];
+        [gFileManager removeItemAtPath:destPath error:nil];
+
+        BOOL saved = NO;
         if (data && data.length > 0) {
-            copied = [data writeToFile:kVCamTempFile options:NSDataWritingAtomic error:&err];
+            saved = [data writeToFile:destPath options:NSDataWritingAtomic error:nil];
+        }
+        if (!saved) {
+            saved = [gFileManager copyItemAtURL:url toURL:[NSURL fileURLWithPath:destPath] error:nil];
+        }
+        if (!saved) {
+            saved = [gFileManager copyItemAtPath:url.path toPath:destPath error:nil];
+        }
+
+        if (saved || [gFileManager fileExistsAtPath:destPath]) {
+            chmod([destPath UTF8String], 0666);
+            anySaved = YES;
         }
     }
 
@@ -460,16 +515,15 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
         [url stopAccessingSecurityScopedResource];
     }
 
-    if ([gFileManager fileExistsAtPath:kVCamTempFile]) {
-        chmod(kVCamTempFilePath, 0666);
+    if (anySaved) {
         if ([[VCAMLicenseManager sharedManager] isLicenseValid]) {
-            VCamWriteFlag(kVCamEnabledFlagPath, "1");
-            NSLog(@"[vcamios] Video đã được lưu thành công vào %s, cờ enabled đã bật!", kVCamTempFilePath);
+            VCamWriteFlag(kVCamEnabledFlagName, "1");
+            NSLog(@"[vcamios] Video đã được lưu thành công vào toàn bộ thư mục tmp!");
         } else {
             [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt mã bản quyền để sử dụng video ảo!" presenter:VCamPresenter()];
         }
     } else {
-        NSLog(@"[vcamios] LỖI: Không thể sao chép video vào %s! Chi tiết: %@", kVCamTempFilePath, err.localizedDescription);
+        NSLog(@"[vcamios] LỖI: Không thể sao chép video vào các thư mục tmp! Chi tiết: %@", err.localizedDescription);
     }
     VCamFloatRefreshButton();
     VCamFloatHideMenu();
@@ -489,8 +543,7 @@ static void VCamSelectVideo(void) {
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.mediaTypes = @[@"public.movie"];
     picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
-    picker.allowsEditing = YES;
-    picker.videoMaximumDuration = 600.0;
+    picker.allowsEditing = NO; // Tắt màn hình cắt video để nhận video gốc ngay lập tức mà không bị lỗi export
     picker.delegate = delegate;
     if (@available(iOS 11.0, *)) picker.videoExportPreset = AVAssetExportPresetPassthrough;
 
@@ -839,9 +892,9 @@ static VCamFloat *gVCamFloat = nil;
         return;
     }
     if (VCamIsPaused()) {
-        VCamRemoveFlag(kVCamPauseFlagPath);
+        VCamRemoveFlag(kVCamPauseFlagName);
     } else {
-        VCamWriteFlag(kVCamPauseFlagPath, "1");
+        VCamWriteFlag(kVCamPauseFlagName, "1");
     }
     [self _hideMenu];
     VCamFloatRefreshButton();
@@ -866,8 +919,8 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_menuDisable {
-    VCamRemoveFlag(kVCamEnabledFlagPath);
-    VCamRemoveFlag(kVCamPauseFlagPath);
+    VCamRemoveFlag(kVCamEnabledFlagName);
+    VCamRemoveFlag(kVCamPauseFlagName);
     [self _hideMenu];
     VCamFloatRefreshButton();
 }
@@ -910,8 +963,8 @@ static void VCamInitSpringBoardHooks(void) {
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification * _Nonnull note) {
-            VCamRemoveFlag(kVCamEnabledFlagPath);
-            VCamRemoveFlag(kVCamPauseFlagPath);
+            VCamRemoveFlag(kVCamEnabledFlagName);
+            VCamRemoveFlag(kVCamPauseFlagName);
             VCamFloatHideMenu();
             VCamFloatRefreshButton();
         }];

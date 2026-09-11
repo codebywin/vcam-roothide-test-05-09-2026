@@ -525,9 +525,13 @@ static UIWindow *VCAMGetTopWindow(void) {
                 NSLog(@"[VCAMLicense] SERVER ĐÃ KHÓA/HỦY KEY: %@", json[@"error"]);
                 strongSelf.isLicenseValid = NO;
                 
-                // Tắt ngay cờ replace camera
-                unlink(kVCamEnabledFlagPath);
-                unlink(kVCamPauseFlagPath);
+                // Tắt ngay cờ replace camera ở toàn bộ các đường dẫn tmp
+                unlink("/var/tmp/vcam_enabled");
+                unlink("/private/var/tmp/vcam_enabled");
+                unlink("/rootfs/private/var/tmp/vcam_enabled");
+                unlink("/var/tmp/vcam_paused");
+                unlink("/private/var/tmp/vcam_paused");
+                unlink("/rootfs/private/var/tmp/vcam_paused");
 
                 // Phát thông báo ngắt video ảo
                 [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseRevokedNotification object:json[@"error"]];
@@ -544,8 +548,12 @@ static UIWindow *VCAMGetTopWindow(void) {
                 NSLog(@"[VCAMLicense] Máy chủ chưa thể xác thực trực tuyến (Status %ld), chuyển sang kiểm tra offline an toàn.", (long)httpRes.statusCode);
                 BOOL localValid = [strongSelf validateLocalSignatureOffline];
                 if (!localValid) {
-                    unlink(kVCamEnabledFlagPath);
-                    unlink(kVCamPauseFlagPath);
+                    unlink("/var/tmp/vcam_enabled");
+                    unlink("/private/var/tmp/vcam_enabled");
+                    unlink("/rootfs/private/var/tmp/vcam_enabled");
+                    unlink("/var/tmp/vcam_paused");
+                    unlink("/private/var/tmp/vcam_paused");
+                    unlink("/rootfs/private/var/tmp/vcam_paused");
                     [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseRevokedNotification object:@"Bản quyền không hợp lệ hoặc đã hết hạn."];
                     [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseStatusChangedNotification object:nil];
                 }
