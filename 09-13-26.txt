@@ -1,0 +1,4 @@
+VIB not pass
+acb khôi phục user và pass oke , login chưa pass
+test login VPBANK điện thoại khác OKE
+test login EIB điện thoại khác OKE
