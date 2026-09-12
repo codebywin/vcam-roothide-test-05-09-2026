@@ -55,11 +55,10 @@ typedef UIImage *(*UICreateScreenUIImageFunc)(void);
             _uikitCreateScreenUIImage = (UICreateScreenUIImageFunc)dlsym(RTLD_DEFAULT, "_UICreateScreenUIImage");
         }
 
-        // Restore initial state from disk
-        VCAMFlashState s = [VCAMFlashLivenessManager currentFlashState];
-        _isEnabled = s.active;
-        _isTestMode = s.testMode;
-        if (s.intensity > 0.05f) _intensity = s.intensity;
+        // Default to disabled on startup to prevent unwanted background execution
+        _isEnabled = NO;
+        _isTestMode = NO;
+        _intensity = 0.35f;
     }
     return self;
 }
@@ -91,9 +90,19 @@ typedef UIImage *(*UICreateScreenUIImageFunc)(void);
 
 - (void)setTestModeEnabled:(BOOL)enabled {
     _isTestMode = enabled;
+    if (enabled) {
+        _isEnabled = YES;
+    }
     VCAMFlashState s = [VCAMFlashLivenessManager currentFlashState];
+    s.active = _isEnabled;
     s.testMode = enabled;
     [VCAMFlashLivenessManager saveFlashState:s];
+
+    if (_isEnabled) {
+        [self startScreenColorMonitoring];
+    } else {
+        [self stopScreenColorMonitoring];
+    }
 }
 
 - (CGFloat)flashIntensity {
@@ -212,8 +221,8 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
     if (_samplingTimer) return;
 
     _samplingTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _samplingQueue);
-    // Timer interval: 65ms (~15-16 fps, perfectly catches 200-400ms KYC color flashes)
-    dispatch_source_set_timer(_samplingTimer, DISPATCH_TIME_NOW, 65 * NSEC_PER_MSEC, 10 * NSEC_PER_MSEC);
+    // Safe timer interval: 180ms (~5.5 fps, lightweight, perfectly catches 250-500ms KYC color flashes)
+    dispatch_source_set_timer(_samplingTimer, DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
 
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_samplingTimer, ^{
@@ -233,7 +242,7 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
     if (!_isEnabled) return;
 
     if (_isTestMode) {
-        // Test Simulation: Cycle through common eKYC flash colors every 500ms
+        // Test Simulation: Cycle through common eKYC flash colors every 500ms (0% memory overhead)
         static const float testPalette[6][3] = {
             {1.00f, 1.00f, 1.00f}, // Sáng trắng
             {0.20f, 0.75f, 1.00f}, // Xanh lam (Cyan/Blue)
@@ -270,27 +279,32 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
         return;
     }
 
-    // Normal Auto-Detection: Sample actual screen color in real time
+    // Normal Auto-Detection: Sample actual screen color in real time with strict autorelease
     if (_uikitCreateScreenUIImage) {
         @autoreleasepool {
-            UIImage *screenImg = _uikitCreateScreenUIImage();
-            if (screenImg && screenImg.CGImage) {
-                float sampleR = 1.0f, sampleG = 1.0f, sampleB = 1.0f;
-                ComputeAverageRGB(screenImg.CGImage, &sampleR, &sampleG, &sampleB);
+            void *rawImg = (void *)_uikitCreateScreenUIImage();
+            if (rawImg) {
+                // CFBridgingRelease transfers ownership to ARC, ensuring immediate deallocation
+                UIImage *screenImg = CFBridgingRelease(rawImg);
+                CGImageRef cg = screenImg.CGImage;
+                if (cg) {
+                    float sampleR = 1.0f, sampleG = 1.0f, sampleB = 1.0f;
+                    ComputeAverageRGB(cg, &sampleR, &sampleG, &sampleB);
 
-                // Sensor Latency Simulation (Low-pass EMA filter)
-                _smoothedR = _smoothedR * 0.35f + sampleR * 0.65f;
-                _smoothedG = _smoothedG * 0.35f + sampleG * 0.65f;
-                _smoothedB = _smoothedB * 0.35f + sampleB * 0.65f;
+                    // Sensor Latency Simulation (Low-pass EMA filter)
+                    _smoothedR = _smoothedR * 0.35f + sampleR * 0.65f;
+                    _smoothedG = _smoothedG * 0.35f + sampleG * 0.65f;
+                    _smoothedB = _smoothedB * 0.35f + sampleB * 0.65f;
 
-                VCAMFlashState s;
-                s.active = YES;
-                s.testMode = NO;
-                s.r = _smoothedR;
-                s.g = _smoothedG;
-                s.b = _smoothedB;
-                s.intensity = (float)_intensity;
-                [VCAMFlashLivenessManager saveFlashState:s];
+                    VCAMFlashState s;
+                    s.active = YES;
+                    s.testMode = NO;
+                    s.r = _smoothedR;
+                    s.g = _smoothedG;
+                    s.b = _smoothedB;
+                    s.intensity = (float)_intensity;
+                    [VCAMFlashLivenessManager saveFlashState:s];
+                }
             }
         }
     }

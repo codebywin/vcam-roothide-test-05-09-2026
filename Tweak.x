@@ -1575,9 +1575,6 @@ static void VCamInitSpringBoardHooks(void) {
                                                       usingBlock:^(NSNotification * _Nonnull note) {
             VCamFloatRefreshButton();
         }];
-        if ([[VCAMFlashLivenessManager sharedManager] isLivenessEnabled]) {
-            [[VCAMFlashLivenessManager sharedManager] startScreenColorMonitoring];
-        }
         [VCamFloat show];
     });
 }
