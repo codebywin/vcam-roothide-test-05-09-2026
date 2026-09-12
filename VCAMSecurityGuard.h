@@ -44,3 +44,4 @@ NSString *VCAMGetSharedDeviceHWID(void);
 @end
 
 NS_ASSUME_NONNULL_END
+
