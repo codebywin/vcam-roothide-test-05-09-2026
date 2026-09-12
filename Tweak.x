@@ -175,17 +175,17 @@ static int VCamGetRotation(void) {
             int val = 0;
             if (fscanf(f, "%d", &val) == 1) {
                 fclose(f);
-                return val;
+                return ((val % 360) + 360) % 360;
             }
             fclose(f);
         }
     }
-    return 90; // Mặc định xoay 90 độ để video dọc hiển thị chuẩn trên camera ngang
+    return 0; // Mặc định 0 độ (portrait chuẩn theo video gốc)
 }
 
 static void VCamSetRotation(int deg) {
     char buf[16];
-    snprintf(buf, sizeof(buf), "%d", deg);
+    snprintf(buf, sizeof(buf), "%d", ((deg % 360) + 360) % 360);
     VCamWriteFlag(kVCamRotationFileName, buf);
 }
 
@@ -196,7 +196,6 @@ typedef OSStatus (*VTSessionSetPropertyFunc)(CFTypeRef, CFStringRef, CFTypeRef);
 
 static VTPixelTransferSessionRef gTransferSession = NULL;
 static VTPixelTransferSessionTransferImageFunc gVTPixelTransferSessionTransferImage = NULL;
-static dispatch_once_t gTransferOnce;
 static os_unfair_lock gTransferLock = OS_UNFAIR_LOCK_INIT;
 
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
@@ -249,24 +248,44 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     }
 
     // Hardware accelerated scaling & format conversion via VideoToolbox
-    // (100% Native, 0% Metal IOFence / GPU deadlock)
-    dispatch_once(&gTransferOnce, ^{
-        dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
-        VTPixelTransferSessionCreateFunc createFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
-        gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
-        VTSessionSetPropertyFunc setPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
+    // Tự động tái tạo session khi kích thước khung hình hoặc định dạng thay đổi (tránh nghẽn GPU khi xoay)
+    static size_t gLastSrcW = 0, gLastSrcH = 0;
+    static size_t gLastDstW = 0, gLastDstH = 0;
+    static OSType gLastSrcFmt = 0, gLastDstFmt = 0;
 
+    static VTPixelTransferSessionCreateFunc createFunc = NULL;
+    static VTSessionSetPropertyFunc setPropFunc = NULL;
+    static dispatch_once_t gSymbolsOnce;
+    dispatch_once(&gSymbolsOnce, ^{
+        dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+        createFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
+        gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
+        setPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
+    });
+
+    if (!gTransferSession || srcW != gLastSrcW || srcH != gLastSrcH || dstW != gLastDstW || dstH != gLastDstH || srcFmt != gLastSrcFmt || dstFmt != gLastDstFmt) {
+        if (gTransferSession) {
+            VTPixelTransferSessionInvalidate(gTransferSession);
+            CFRelease(gTransferSession);
+            gTransferSession = NULL;
+        }
         if (createFunc && gVTPixelTransferSessionTransferImage) {
             OSStatus err = createFunc(kCFAllocatorDefault, &gTransferSession);
             if (err == noErr && gTransferSession && setPropFunc) {
                 setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("CropAspectRatioPreserving"));
             }
         }
-    });
+        gLastSrcW = srcW;
+        gLastSrcH = srcH;
+        gLastDstW = dstW;
+        gLastDstH = dstH;
+        gLastSrcFmt = srcFmt;
+        gLastDstFmt = dstFmt;
+    }
 
     OSStatus status = -1;
     if (gTransferSession && gVTPixelTransferSessionTransferImage) {
-        // Ensure clean aperture attachment exists so VideoToolbox doesn't hit null dictionary
+        // Đảm bảo clean aperture attachment tồn tại để VideoToolbox không gặp lỗi NULL dictionary
         if (!CVBufferGetAttachment(source, kCVImageBufferCleanApertureKey, NULL)) {
             NSDictionary *cleanAperture = @{
                 (id)kCVImageBufferCleanApertureWidthKey: @(srcW),
@@ -277,6 +296,28 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
             CVBufferSetAttachment(source, kCVImageBufferCleanApertureKey, (__bridge CFDictionaryRef)cleanAperture, kCVAttachmentMode_ShouldPropagate);
         }
         status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
+    }
+
+    // Software fallback nếu VideoToolbox trả về lỗi mà hai buffer cùng định dạng
+    if (status != noErr && srcFmt == dstFmt) {
+        CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferLockBaseAddress(target, 0);
+        size_t planes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
+        for (size_t plane = 0; plane < planes; plane++) {
+            void *srcBase = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetBaseAddressOfPlane(source, plane) : CVPixelBufferGetBaseAddress(source);
+            void *dstBase = CVPixelBufferIsPlanar(target) ? CVPixelBufferGetBaseAddressOfPlane(target, plane) : CVPixelBufferGetBaseAddress(target);
+            size_t srcBPR = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetBytesPerRowOfPlane(source, plane) : CVPixelBufferGetBytesPerRow(source);
+            size_t dstBPR = CVPixelBufferIsPlanar(target) ? CVPixelBufferGetBytesPerRowOfPlane(target, plane) : CVPixelBufferGetBytesPerRow(target);
+            size_t rows = MIN(CVPixelBufferIsPlanar(source) ? CVPixelBufferGetHeightOfPlane(source, plane) : srcH,
+                              CVPixelBufferIsPlanar(target) ? CVPixelBufferGetHeightOfPlane(target, plane) : dstH);
+            size_t bpr = MIN(srcBPR, dstBPR);
+            for (size_t r = 0; r < rows; r++) {
+                memcpy((uint8_t *)dstBase + r * dstBPR, (uint8_t *)srcBase + r * srcBPR, bpr);
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(target, 0);
+        CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+        status = noErr;
     }
 
     os_unfair_lock_unlock(&gTransferLock);
@@ -298,15 +339,11 @@ static float                     gVideoFPS = 30.0f;
 static CVPixelBufferRef VCamCreateRotatedPixelBuffer(CVPixelBufferRef src, int rotation) {
     if (!src) return NULL;
     int rot = ((rotation % 360) + 360) % 360;
-    if (rot == 0) {
-        CFRetain(src);
-        return src;
-    }
 
     size_t srcW = CVPixelBufferGetWidth(src);
     size_t srcH = CVPixelBufferGetHeight(src);
-    size_t dstW = (rot == 180) ? srcW : srcH;
-    size_t dstH = (rot == 180) ? srcH : srcW;
+    size_t dstW = (rot == 90 || rot == 270) ? srcH : srcW;
+    size_t dstH = (rot == 90 || rot == 270) ? srcW : srcH;
     OSType fmt = CVPixelBufferGetPixelFormatType(src);
 
     NSDictionary *options = @{
@@ -323,7 +360,32 @@ static CVPixelBufferRef VCamCreateRotatedPixelBuffer(CVPixelBufferRef src, int r
     CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferLockBaseAddress(dst, 0);
 
-    if (CVPixelBufferIsPlanar(src) && CVPixelBufferGetPlaneCount(src) >= 2) {
+    if (rot == 0) {
+        // Sao chép trực tiếp từng plane sang IOSurface buffer độc lập (tránh phụ thuộc buffer pool của AVAssetReader)
+        size_t planes = CVPixelBufferIsPlanar(src) ? CVPixelBufferGetPlaneCount(src) : 1;
+        for (size_t plane = 0; plane < planes; plane++) {
+            void *srcBase = CVPixelBufferIsPlanar(src)
+                ? CVPixelBufferGetBaseAddressOfPlane(src, plane)
+                : CVPixelBufferGetBaseAddress(src);
+            void *dstBase = CVPixelBufferIsPlanar(dst)
+                ? CVPixelBufferGetBaseAddressOfPlane(dst, plane)
+                : CVPixelBufferGetBaseAddress(dst);
+            size_t srcBPR = CVPixelBufferIsPlanar(src)
+                ? CVPixelBufferGetBytesPerRowOfPlane(src, plane)
+                : CVPixelBufferGetBytesPerRow(src);
+            size_t dstBPR = CVPixelBufferIsPlanar(dst)
+                ? CVPixelBufferGetBytesPerRowOfPlane(dst, plane)
+                : CVPixelBufferGetBytesPerRow(dst);
+            size_t rows = CVPixelBufferIsPlanar(src)
+                ? CVPixelBufferGetHeightOfPlane(src, plane)
+                : srcH;
+            size_t bpr = MIN(srcBPR, dstBPR);
+            for (size_t row = 0; row < rows; row++) {
+                memcpy((uint8_t *)dstBase + row * dstBPR,
+                       (uint8_t *)srcBase + row * srcBPR, bpr);
+            }
+        }
+    } else if (CVPixelBufferIsPlanar(src) && CVPixelBufferGetPlaneCount(src) >= 2) {
         uint8_t *srcY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 0);
         uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0);
         size_t srcYBPR = CVPixelBufferGetBytesPerRowOfPlane(src, 0);
@@ -471,7 +533,10 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
 
     AVAssetReaderTrackOutput *outp = [[AVAssetReaderTrackOutput alloc]
         initWithTrack:track
-        outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(outputFormat)}];
+        outputSettings:@{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(outputFormat),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }];
     outp.alwaysCopiesSampleData = NO;
     [r addOutput:outp];
 
