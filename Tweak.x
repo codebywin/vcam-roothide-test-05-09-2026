@@ -8,6 +8,7 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 #import "VCAMLicenseManager.h"
+#import "VCAMFlashLivenessManager.h"
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -333,7 +334,9 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         }
     });
 
-    BOOL hasTransform = (fabs(userScale - 1.0f) > 0.01f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f);
+    VCAMFlashState flashState = [VCAMFlashLivenessManager currentFlashState];
+    BOOL hasFlash = (flashState.active && flashState.intensity > 0.01f);
+    BOOL hasTransform = (fabs(userScale - 1.0f) > 0.01f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f || hasFlash);
 
     if (hasTransform && gCIContext) {
         CGFloat scale = userScale;
@@ -381,6 +384,12 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
             t = CGAffineTransformConcat(t, CGAffineTransformMakeTranslation(tx, ty));
 
             img = [img imageByApplyingTransform:t];
+
+            // 4. Áp dụng hiệu ứng ánh sáng phản quang KYC Flash Liveness
+            if (hasFlash) {
+                img = [VCAMFlashLivenessManager applyFlashLightingToImage:img size:CGSizeMake(dstW, dstH) state:flashState];
+            }
+
             [gCIContext render:img toCVPixelBuffer:target bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:nil];
             status = noErr;
         } @catch (NSException *e) {
@@ -394,7 +403,12 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         if (now - lastLog > 1.0) {
             lastLog = now;
-            VCamDebugLog([NSString stringWithFormat:@"[CIContext render] scale=%.2f offX=%.1f offY=%.1f", scale, userOffsetX, userOffsetY]);
+            if (hasFlash) {
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext+Flash] scale=%.2f offX=%.1f offY=%.1f RGB=(%.2f,%.2f,%.2f) inten=%.2f",
+                              scale, userOffsetX, userOffsetY, flashState.r, flashState.g, flashState.b, flashState.intensity]);
+            } else {
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext render] scale=%.2f offX=%.1f offY=%.1f", scale, userOffsetX, userOffsetY]);
+            }
         }
     } else if (gTransferSession && gVTPixelTransferSessionTransferImage) {
         status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
@@ -1279,6 +1293,26 @@ static VCamFloat *gVCamFloat = nil;
     CGFloat row3Y = row2Y + dBtnH + 4;
     [panel addSubview:[self _dpadButtonWithTitle:@"▼" x:midX y:row3Y w:dBtnW h:dBtnH sel:@selector(_moveDown)]];
 
+    // KYC Flash Liveness Toggle (⚡) at bottom-left of D-Pad
+    BOOL isFlashOn = [[VCAMFlashLivenessManager sharedManager] isLivenessEnabled];
+    UIButton *flashBtn = [self _dpadButtonWithTitle:@"⚡" x:12 y:row3Y w:44 h:dBtnH sel:@selector(_toggleKYCFlash:)];
+    flashBtn.titleLabel.font = [UIFont systemFontOfSize:18];
+    if (isFlashOn) {
+        flashBtn.backgroundColor = [UIColor colorWithRed:1.0 green:0.80 blue:0.1 alpha:0.35];
+        flashBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:0.9].CGColor;
+    }
+    [panel addSubview:flashBtn];
+
+    // KYC Test Mode (🧪) at bottom-right of D-Pad
+    BOOL isTestOn = [[VCAMFlashLivenessManager sharedManager] isTestModeEnabled];
+    UIButton *testBtn = [self _dpadButtonWithTitle:@"🧪" x:w - 44 - 12 y:row3Y w:44 h:dBtnH sel:@selector(_toggleKYCTestMode:)];
+    testBtn.titleLabel.font = [UIFont systemFontOfSize:18];
+    if (isTestOn) {
+        testBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.90 blue:0.5 alpha:0.35];
+        testBtn.layer.borderColor = [UIColor colorWithRed:0.2 green:1.00 blue:0.6 alpha:0.9].CGColor;
+    }
+    [panel addSubview:testBtn];
+
     // ── 3. Bottom: 5 Action Icon Buttons (Horizontal Row, enlarged 38x40) ──
     CGFloat iconW = 38, iconH = 40, iconY = 184;
     CGFloat iconSpacing = 5;
@@ -1411,6 +1445,37 @@ static VCamFloat *gVCamFloat = nil;
     [self _showToast:@"▶ Phải"];
 }
 
+- (void)_toggleKYCFlash:(UIButton *)sender {
+    BOOL next = ![[VCAMFlashLivenessManager sharedManager] isLivenessEnabled];
+    [[VCAMFlashLivenessManager sharedManager] setLivenessEnabled:next];
+    if (next) {
+        sender.backgroundColor = [UIColor colorWithRed:1.0 green:0.80 blue:0.1 alpha:0.35];
+        sender.layer.borderColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:0.9].CGColor;
+        [self _showToast:@"⚡ KYC Flash: ĐÃ BẬT"];
+    } else {
+        sender.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
+        sender.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.48].CGColor;
+        [self _showToast:@"⚡ KYC Flash: ĐÃ TẮT"];
+    }
+}
+
+- (void)_toggleKYCTestMode:(UIButton *)sender {
+    BOOL next = ![[VCAMFlashLivenessManager sharedManager] isTestModeEnabled];
+    [[VCAMFlashLivenessManager sharedManager] setTestModeEnabled:next];
+    if (next) {
+        if (![[VCAMFlashLivenessManager sharedManager] isLivenessEnabled]) {
+            [[VCAMFlashLivenessManager sharedManager] setLivenessEnabled:YES];
+        }
+        sender.backgroundColor = [UIColor colorWithRed:0.2 green:0.90 blue:0.5 alpha:0.35];
+        sender.layer.borderColor = [UIColor colorWithRed:0.2 green:1.00 blue:0.6 alpha:0.9].CGColor;
+        [self _showToast:@"🧪 Test Chớp: BẬT"];
+    } else {
+        sender.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
+        sender.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.48].CGColor;
+        [self _showToast:@"🧪 Test Chớp: TẮT"];
+    }
+}
+
 - (void)_moveReset {
     VCamDebugLog(@"[UI] _moveReset");
     _curOffsetX = 0.0f;
@@ -1510,6 +1575,9 @@ static void VCamInitSpringBoardHooks(void) {
                                                       usingBlock:^(NSNotification * _Nonnull note) {
             VCamFloatRefreshButton();
         }];
+        if ([[VCAMFlashLivenessManager sharedManager] isLivenessEnabled]) {
+            [[VCAMFlashLivenessManager sharedManager] startScreenColorMonitoring];
+        }
         [VCamFloat show];
     });
 }
