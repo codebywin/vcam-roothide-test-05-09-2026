@@ -986,52 +986,66 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_setup {
-    if (_win) return;
     CGFloat sz = 58;
     CGRect screen = UIScreen.mainScreen.bounds;
 
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]]) {
-                _win = [[VCamFloatWindow alloc] initWithWindowScene:(UIWindowScene *)s];
-                break;
+    if (!_win) {
+        UIWindowScene *activeScene = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) {
+                    UIWindowScene *ws = (UIWindowScene *)s;
+                    if (ws.activationState == UISceneActivationStateForegroundActive ||
+                        ws.activationState == UISceneActivationStateForegroundInactive) {
+                        activeScene = ws;
+                        break;
+                    }
+                }
             }
         }
+
+        if (activeScene) {
+            _win = [[VCamFloatWindow alloc] initWithWindowScene:activeScene];
+        } else {
+            _win = [[VCamFloatWindow alloc] initWithFrame:screen];
+        }
+
+        _win.frame = screen;
+        _win.windowLevel = 999999;
+        _win.backgroundColor = [UIColor clearColor];
+
+        _rootVC = [UIViewController new];
+        _rootVC.view.backgroundColor = [UIColor clearColor];
+        _rootVC.view.userInteractionEnabled = NO;
+        _win.rootViewController = _rootVC;
+
+        // Mini Floating Ball (Enlarged to 58x58)
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.frame = CGRectMake(0, 0, sz, sz);
+        btn.center = CGPointMake(screen.size.width - sz / 2 - 10, screen.size.height * 0.40);
+        btn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+        btn.layer.cornerRadius = sz / 2;
+        btn.layer.borderWidth = 1.5;
+        btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.60].CGColor;
+        [btn setTitle:@"📷" forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont systemFontOfSize:26];
+        btn.userInteractionEnabled = YES;
+        [btn addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                                              action:@selector(_pan:)];
+        [btn addGestureRecognizer:pan];
+        [_rootVC.view addSubview:btn];
+        _rootVC.view.userInteractionEnabled = YES;
+        _btn = btn;
+
+        [NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(_periodicRefresh) userInfo:nil repeats:YES];
     }
-    if (!_win) _win = [[VCamFloatWindow alloc] initWithFrame:screen];
 
-    _win.frame = screen;
-    _win.windowLevel = UIWindowLevelAlert + 300;
-    _win.backgroundColor = [UIColor clearColor];
-
-    _rootVC = [UIViewController new];
-    _rootVC.view.backgroundColor = [UIColor clearColor];
-    _rootVC.view.userInteractionEnabled = NO;
-    _win.rootViewController = _rootVC;
-
-    // Mini Floating Ball (Enlarged to 58x58)
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = CGRectMake(0, 0, sz, sz);
-    btn.center = CGPointMake(screen.size.width - sz / 2 - 10, screen.size.height * 0.40);
-    btn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
-    btn.layer.cornerRadius = sz / 2;
-    btn.layer.borderWidth = 1.5;
-    btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.60].CGColor;
-    [btn setTitle:@"📷" forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:26];
-    btn.userInteractionEnabled = YES;
-    [btn addTarget:self action:@selector(_tap) forControlEvents:UIControlEventTouchUpInside];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                          action:@selector(_pan:)];
-    [btn addGestureRecognizer:pan];
-    [_rootVC.view addSubview:btn];
-    _rootVC.view.userInteractionEnabled = YES;
-    _btn = btn;
     _win.hidden = NO;
-
+    [_win makeKeyAndVisible];
     [VCamFloat refreshButton];
-    [NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(_periodicRefresh) userInfo:nil repeats:YES];
+    VCamDebugLog(@"[UI] VCamFloat _setup finished and window made visible");
 }
 
 - (void)_periodicRefresh {
@@ -1499,8 +1513,10 @@ static void VCamFloatRefreshButton(void)     { [VCamFloat refreshButton]; }
 static void VCamFloatHideMenu(void)          { [VCamFloat hideMenu]; }
 
 static void VCamInitSpringBoardHooks(void) {
+    VCamDebugLog(@"[SB] VCamInitSpringBoardHooks called");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        [[VCAMLicenseManager sharedManager] loadSavedLicense];
         [[VCAMLicenseManager sharedManager] startHeartbeat];
         [[NSNotificationCenter defaultCenter] addObserverForName:kVCAMLicenseRevokedNotification
                                                           object:nil
@@ -1519,7 +1535,23 @@ static void VCamInitSpringBoardHooks(void) {
         }];
         [VCamFloat show];
     });
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [VCamFloat show];
+    });
 }
+
+%hook SpringBoard
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    VCamDebugLog(@"[SB] SpringBoard applicationDidFinishLaunching called");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [VCamFloat show];
+    });
+}
+%end
 
 %ctor {
     @autoreleasepool {
@@ -1529,10 +1561,12 @@ static void VCamInitSpringBoardHooks(void) {
         chmod("/var/tmp", 0777);
 
         NSString *processName = NSProcessInfo.processInfo.processName;
+        VCamDebugLog([NSString stringWithFormat:@"[CTOR] processName=%@", processName]);
         if ([processName isEqualToString:@"mediaserverd"]) {
             VCamInitMediaServerHooks();
         } else if ([processName isEqualToString:@"SpringBoard"]) {
             VCamInitSpringBoardHooks();
+            %init(SpringBoard);
         }
     }
 }
