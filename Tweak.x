@@ -1516,7 +1516,7 @@ static void VCamInitSpringBoardHooks(void) {
     VCamDebugLog(@"[SB] VCamInitSpringBoardHooks called");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [[VCAMLicenseManager sharedManager] loadSavedLicense];
+        [[VCAMLicenseManager sharedManager] isLicenseValid];
         [[VCAMLicenseManager sharedManager] startHeartbeat];
         [[NSNotificationCenter defaultCenter] addObserverForName:kVCAMLicenseRevokedNotification
                                                           object:nil
