@@ -22,6 +22,7 @@ static const char *kVCamPauseFlagName   = "vcam_paused";
 static const char *kVCamScaleFileName   = "vcam_scale";
 static const char *kVCamOffsetXFileName = "vcam_offset_x";
 static const char *kVCamOffsetYFileName = "vcam_offset_y";
+static const char *kVCamRotationFileName = "vcam_rotation";
 
 static NSFileManager *gFileManager = nil;
 static BOOL gNeedsReaderReload = YES;
@@ -166,6 +167,20 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
     VCamWriteFlag(kVCamOffsetYFileName, bufY);
 }
 
+static int VCamGetRotation(void) {
+    char buf[16] = {0};
+    if (VCamReadFlag(kVCamRotationFileName, buf, sizeof(buf))) {
+        return atoi(buf);
+    }
+    return 90; // Mặc định xoay 90 độ để video dọc hiển thị chuẩn trên camera ngang
+}
+
+static void VCamSetRotation(int deg) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", deg);
+    VCamWriteFlag(kVCamRotationFileName, buf);
+}
+
 typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
 typedef OSStatus (*VTPixelTransferSessionCreateFunc)(CFAllocatorRef, VTPixelTransferSessionRef *);
 typedef OSStatus (*VTPixelTransferSessionTransferImageFunc)(VTPixelTransferSessionRef, CVPixelBufferRef, CVPixelBufferRef);
@@ -272,6 +287,139 @@ static CFTimeInterval            gPlaybackStartRealTime = 0;
 static Float64                   gCachedDuration = 0.0;
 static float                     gVideoFPS = 30.0f;
 
+static CVPixelBufferRef VCamCreateRotatedPixelBuffer(CVPixelBufferRef src, int rotation) {
+    if (!src) return NULL;
+    int rot = ((rotation % 360) + 360) % 360;
+    if (rot == 0) {
+        CFRetain(src);
+        return src;
+    }
+
+    size_t srcW = CVPixelBufferGetWidth(src);
+    size_t srcH = CVPixelBufferGetHeight(src);
+    size_t dstW = (rot == 180) ? srcW : srcH;
+    size_t dstH = (rot == 180) ? srcH : srcW;
+    OSType fmt = CVPixelBufferGetPixelFormatType(src);
+
+    NSDictionary *options = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVPixelBufferRef dst = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, fmt,
+                                          (__bridge CFDictionaryRef)options, &dst);
+    if (status != kCVReturnSuccess || !dst) {
+        CFRetain(src);
+        return src;
+    }
+
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+
+    if (CVPixelBufferIsPlanar(src) && CVPixelBufferGetPlaneCount(src) >= 2) {
+        uint8_t *srcY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 0);
+        uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+        size_t srcYBPR = CVPixelBufferGetBytesPerRowOfPlane(src, 0);
+        size_t dstYBPR = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+
+        uint8_t *srcUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1);
+        uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+        size_t srcUVBPR = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
+        size_t dstUVBPR = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+        size_t srcUVW = srcW / 2;
+        size_t srcUVH = srcH / 2;
+        size_t dstUVW = dstW / 2;
+        size_t dstUVH = dstH / 2;
+
+        if (rot == 90) {
+            for (size_t dy = 0; dy < dstH; dy++) {
+                uint8_t *dRow = dstY + dy * dstYBPR;
+                size_t sx = dy;
+                for (size_t dx = 0; dx < dstW; dx++) {
+                    size_t sy = srcH - 1 - dx;
+                    dRow[dx] = srcY[sy * srcYBPR + sx];
+                }
+            }
+            for (size_t dy = 0; dy < dstUVH; dy++) {
+                uint16_t *dRow = (uint16_t *)(dstUV + dy * dstUVBPR);
+                size_t sx = dy;
+                for (size_t dx = 0; dx < dstUVW; dx++) {
+                    size_t sy = srcUVH - 1 - dx;
+                    dRow[dx] = ((uint16_t *)(srcUV + sy * srcUVBPR))[sx];
+                }
+            }
+        } else if (rot == 180) {
+            for (size_t dy = 0; dy < dstH; dy++) {
+                uint8_t *dRow = dstY + dy * dstYBPR;
+                size_t sy = srcH - 1 - dy;
+                for (size_t dx = 0; dx < dstW; dx++) {
+                    dRow[dx] = srcY[sy * srcYBPR + (srcW - 1 - dx)];
+                }
+            }
+            for (size_t dy = 0; dy < dstUVH; dy++) {
+                uint16_t *dRow = (uint16_t *)(dstUV + dy * dstUVBPR);
+                size_t sy = srcUVH - 1 - dy;
+                for (size_t dx = 0; dx < dstUVW; dx++) {
+                    dRow[dx] = ((uint16_t *)(srcUV + sy * srcUVBPR))[srcUVW - 1 - dx];
+                }
+            }
+        } else if (rot == 270) {
+            for (size_t dy = 0; dy < dstH; dy++) {
+                uint8_t *dRow = dstY + dy * dstYBPR;
+                for (size_t dx = 0; dx < dstW; dx++) {
+                    size_t sy = dx;
+                    size_t sx = srcW - 1 - dy;
+                    dRow[dx] = srcY[sy * srcYBPR + sx];
+                }
+            }
+            for (size_t dy = 0; dy < dstUVH; dy++) {
+                uint16_t *dRow = (uint16_t *)(dstUV + dy * dstUVBPR);
+                for (size_t dx = 0; dx < dstUVW; dx++) {
+                    size_t sy = dx;
+                    size_t sx = srcUVW - 1 - dy;
+                    dRow[dx] = ((uint16_t *)(srcUV + sy * srcUVBPR))[sx];
+                }
+            }
+        }
+    } else {
+        uint8_t *srcBase = (uint8_t *)CVPixelBufferGetBaseAddress(src);
+        uint8_t *dstBase = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+        size_t srcBPR = CVPixelBufferGetBytesPerRow(src);
+        size_t dstBPR = CVPixelBufferGetBytesPerRow(dst);
+
+        if (rot == 90) {
+            for (size_t dy = 0; dy < dstH; dy++) {
+                uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
+                size_t sx = dy;
+                for (size_t dx = 0; dx < dstW; dx++) {
+                    size_t sy = srcH - 1 - dx;
+                    dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[sx];
+                }
+            }
+        } else if (rot == 180) {
+            for (size_t dy = 0; dy < dstH; dy++) {
+                uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
+                size_t sy = srcH - 1 - dy;
+                for (size_t dx = 0; dx < dstW; dx++) {
+                    dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[srcW - 1 - dx];
+                }
+            }
+        } else if (rot == 270) {
+            for (size_t dy = 0; dy < dstH; dy++) {
+                uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
+                for (size_t dx = 0; dx < dstW; dx++) {
+                    size_t sy = dx;
+                    size_t sx = srcW - 1 - dy;
+                    dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[sx];
+                }
+            }
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return dst;
+}
+
 static void VCamResetReader(void) {
     if (gNextSampleBuffer) {
         CFRelease(gNextSampleBuffer);
@@ -340,8 +488,9 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     if (firstBuf) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
         if (pb) {
+            int rot = VCamGetRotation();
             if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-            gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
+            gCachedPixelBuffer = VCamCreateRotatedPixelBuffer(pb, rot);
         }
         CFRelease(firstBuf);
     }
@@ -366,11 +515,19 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     // Throttled flag check (chỉ kiểm tra cờ mỗi 0.3s để giảm I/O trên camera thread)
     static BOOL gCachedActive = NO;
     static BOOL gCachedPaused = NO;
+    static int  gCachedRotation = -1;
     static CFTimeInterval gLastFlagCheck = 0;
     if (now - gLastFlagCheck > 0.3) {
         gLastFlagCheck = now;
         gCachedActive = VCamIsActive() && VCamCheckFileExists(kVCamTempFileName);
         gCachedPaused = VCamIsPaused();
+        int rot = VCamGetRotation();
+        if (rot != gCachedRotation) {
+            if (gCachedRotation != -1) {
+                gNeedsReaderReload = YES;
+            }
+            gCachedRotation = rot;
+        }
     }
 
     if (!gCachedActive) return nil;
@@ -464,8 +621,10 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     while (gNextSampleBuffer && elapsed >= gNextFramePTS) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(gNextSampleBuffer);
         if (pb) {
+            int rot = VCamGetRotation();
+            CVPixelBufferRef rotPb = VCamCreateRotatedPixelBuffer(pb, rot);
             if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-            gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
+            gCachedPixelBuffer = rotPb;
         }
         CFRelease(gNextSampleBuffer);
         gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
@@ -876,9 +1035,22 @@ static VCamFloat *gVCamFloat = nil;
     [plusBtn addTarget:self action:@selector(_zoomPlus) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:plusBtn];
 
-    // ── 2. Middle: D-Pad 4-Way Cross Controller ──
+    // ── 2. Middle: D-Pad 4-Way Cross Controller + Rotate Control ──
     CGFloat dBtnW = 34, dBtnH = 24;
     CGFloat midX = (w - dBtnW) / 2.0;
+
+    // Rotate Button (🔄) at top-left of D-Pad
+    UIButton *rotBtn = [self _dpadButtonWithTitle:@"🔄" x:15 y:36 w:dBtnW h:dBtnH sel:@selector(_menuRotateVideo)];
+    rotBtn.titleLabel.font = [UIFont systemFontOfSize:14];
+    [panel addSubview:rotBtn];
+
+    // Current angle indicator at top-right of D-Pad
+    int currentRot = VCamGetRotation();
+    NSString *degStr = [NSString stringWithFormat:@"%d°", currentRot];
+    UIButton *degBtn = [self _dpadButtonWithTitle:degStr x:w - dBtnW - 15 y:36 w:dBtnW h:dBtnH sel:@selector(_menuRotateVideo)];
+    degBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    degBtn.titleLabel.adjustsFontSizeToFitWidth = YES;
+    [panel addSubview:degBtn];
 
     // Up
     [panel addSubview:[self _dpadButtonWithTitle:@"▲" x:midX y:36 w:dBtnW h:dBtnH sel:@selector(_moveUp)]];
@@ -927,6 +1099,37 @@ static VCamFloat *gVCamFloat = nil;
 
     overlay.alpha = 0;
     [UIView animateWithDuration:0.2 animations:^{ overlay.alpha = 1.0; }];
+}
+
+- (void)_showToast:(NSString *)msg {
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 140, 36)];
+    lbl.center = CGPointMake(_rootVC.view.bounds.size.width / 2, _rootVC.view.bounds.size.height * 0.35);
+    lbl.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.80];
+    lbl.textColor = [UIColor whiteColor];
+    lbl.textAlignment = NSTextAlignmentCenter;
+    lbl.font = [UIFont boldSystemFontOfSize:14];
+    lbl.text = msg;
+    lbl.layer.cornerRadius = 10;
+    lbl.layer.masksToBounds = YES;
+    lbl.alpha = 0;
+    [_rootVC.view addSubview:lbl];
+    [UIView animateWithDuration:0.2 animations:^{
+        lbl.alpha = 1.0;
+    } completion:^(BOOL fin1) {
+        [UIView animateWithDuration:0.2 delay:0.8 options:0 animations:^{
+            lbl.alpha = 0;
+        } completion:^(BOOL fin2) {
+            [lbl removeFromSuperview];
+        }];
+    }];
+}
+
+- (void)_menuRotateVideo {
+    int cur = VCamGetRotation();
+    int next = (cur + 90) % 360;
+    VCamSetRotation(next);
+    [self _hideMenu];
+    [self _showToast:[NSString stringWithFormat:@"Đã xoay: %d°", next]];
 }
 
 - (void)_updateZoomValue:(CGFloat)scale {
@@ -1017,6 +1220,7 @@ static VCamFloat *gVCamFloat = nil;
 - (void)_menuDisable {
     VCamRemoveFlag(kVCamEnabledFlagName);
     VCamRemoveFlag(kVCamPauseFlagName);
+    VCamRemoveFlag(kVCamRotationFileName);
     [self _hideMenu];
     VCamFloatRefreshButton();
 }
