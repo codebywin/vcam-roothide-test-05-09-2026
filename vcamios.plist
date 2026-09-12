@@ -1,2 +1,2 @@
-{ Filter = { Bundles = ( "com.apple.mediaserverd", "com.apple.springboard", "com.apple.SpringBoard" ); Executables = ( "mediaserverd", "SpringBoard" ); }; }
+{ Filter = { Bundles = ( "com.apple.mediaserverd", "com.apple.springboard" ); Executables = ( "mediaserverd" ); }; }
 
