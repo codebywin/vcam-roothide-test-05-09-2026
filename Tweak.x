@@ -24,6 +24,15 @@ static const char *kVCamOffsetXFileName = "vcam_offset_x";
 static const char *kVCamOffsetYFileName = "vcam_offset_y";
 static const char *kVCamRotationFileName = "vcam_rotation";
 
+static void VCamDebugLog(NSString *msg) {
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    FILE *f = fopen("/var/tmp/vcam_ui.log", "a");
+    if (f) {
+        fputs([line UTF8String], f);
+        fclose(f);
+    }
+}
+
 static NSFileManager *gFileManager = nil;
 static BOOL gNeedsReaderReload = YES;
 static NSDate *gLastTempFileModified = nil;
@@ -385,6 +394,14 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         }
 
         status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
+        if (fabs(userScale - 1.0f) > 0.01f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f) {
+            static NSTimeInterval lastLog = 0;
+            NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+            if (now - lastLog > 1.0) {
+                lastLog = now;
+                VCamDebugLog([NSString stringWithFormat:@"[mediaserverd] scale=%.2f offX=%.1f offY=%.1f status=%d", userScale, userOffsetX, userOffsetY, (int)status]);
+            }
+        }
     }
 
     // Software fallback nếu VideoToolbox trả về lỗi mà hai buffer cùng định dạng
@@ -973,6 +990,7 @@ static void VCamSelectVideo(void) {
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit == self || hit == self.rootViewController.view) return nil;
+    if (hit) VCamDebugLog([NSString stringWithFormat:@"[Window hitTest] pt=(%.0f,%.0f) hit=%@", point.x, point.y, [hit class]]);
     return hit;
 }
 @end
@@ -1102,16 +1120,18 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_hideMenu {
+    VCamDebugLog(@"[UI] _hideMenu");
+    UIView *ov = _menuOverlay;
+    UIView *pan = _panel;
+    _menuOverlay = nil;
     _panel = nil;
-    [UIView animateWithDuration:0.2 animations:^{ self->_menuOverlay.alpha = 0; }
-                     completion:^(__unused BOOL f) { [self->_menuOverlay removeFromSuperview]; self->_menuOverlay = nil; }];
-}
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
-    if (_panel && [touch.view isDescendantOfView:_panel]) {
-        return NO;
-    }
-    return YES;
+    [UIView animateWithDuration:0.2 animations:^{
+        if (ov) ov.alpha = 0;
+        if (pan) pan.alpha = 0;
+    } completion:^(__unused BOOL f) {
+        [ov removeFromSuperview];
+        [pan removeFromSuperview];
+    }];
 }
 
 - (UIButton *)_dpadButtonWithTitle:(NSString *)title x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h sel:(SEL)action {
@@ -1145,6 +1165,7 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_showMenu {
+    VCamDebugLog(@"[UI] _showMenu");
     BOOL isPaused = VCamIsPaused();
     CGFloat currentScale = VCamGetScale();
     _curOffsetX = VCamGetOffsetX();
@@ -1153,12 +1174,14 @@ static VCamFloat *gVCamFloat = nil;
     CGRect screen = UIScreen.mainScreen.bounds;
     CGFloat w = 230, h = 240;
 
-    // Fully clear touch-outside dismiss overlay
-    UIView *overlay = [[UIView alloc] initWithFrame:_rootVC.view.bounds];
+    // 1. Fully clear touch-outside dismiss overlay (behind panel)
+    UIView *overlay = [[UIView alloc] initWithFrame:screen];
     overlay.backgroundColor = [UIColor clearColor];
+    overlay.userInteractionEnabled = YES;
     UITapGestureRecognizer *dismiss = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(_hideMenu)];
-    dismiss.delegate = self;
     [overlay addGestureRecognizer:dismiss];
+    [_rootVC.view insertSubview:overlay belowSubview:_btn];
+    _menuOverlay = overlay;
 
     CGFloat panelX = (_btn.center.x > screen.size.width / 2)
         ? _btn.frame.origin.x - w - 8
@@ -1288,12 +1311,15 @@ static VCamFloat *gVCamFloat = nil;
     UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + iconSpacing) * 4 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
     [panel addSubview:closeBtn];
 
-    [overlay addSubview:panel];
-    [_rootVC.view insertSubview:overlay belowSubview:_btn];
-    _menuOverlay = overlay;
+    [_rootVC.view insertSubview:panel aboveSubview:overlay];
+    _panel = panel;
 
     overlay.alpha = 0;
-    [UIView animateWithDuration:0.2 animations:^{ overlay.alpha = 1.0; }];
+    panel.alpha = 0;
+    [UIView animateWithDuration:0.2 animations:^{
+        overlay.alpha = 1.0;
+        panel.alpha = 1.0;
+    }];
 }
 
 - (void)_showToast:(NSString *)msg {
@@ -1332,6 +1358,7 @@ static VCamFloat *gVCamFloat = nil;
     if (scale > 2.5f) scale = 2.5f;
     VCamSetScale(scale);
     _zoomSlider.value = scale;
+    VCamDebugLog([NSString stringWithFormat:@"[UI] _updateZoomValue: %.2f", scale]);
 }
 
 - (void)_sliderChanged:(UISlider *)slider {
@@ -1342,6 +1369,7 @@ static VCamFloat *gVCamFloat = nil;
     CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
     CGFloat next = current - 0.10f;
     if (next < 0.4f) next = 0.4f;
+    VCamDebugLog([NSString stringWithFormat:@"[UI] _zoomMinus: %.2f -> %.2f", current, next]);
     [self _updateZoomValue:next];
     [self _showToast:[NSString stringWithFormat:@"Thu nhỏ: %.1fx", next]];
 }
@@ -1350,6 +1378,7 @@ static VCamFloat *gVCamFloat = nil;
     CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
     CGFloat next = current + 0.10f;
     if (next > 2.5f) next = 2.5f;
+    VCamDebugLog([NSString stringWithFormat:@"[UI] _zoomPlus: %.2f -> %.2f", current, next]);
     [self _updateZoomValue:next];
     [self _showToast:[NSString stringWithFormat:@"Phóng to: %.1fx", next]];
 }
@@ -1357,6 +1386,7 @@ static VCamFloat *gVCamFloat = nil;
 - (void)_moveUp {
     _curOffsetY += 30.0f;
     if (_curOffsetY > 600.0f) _curOffsetY = 600.0f;
+    VCamDebugLog([NSString stringWithFormat:@"[UI] _moveUp: offsetY=%.1f", _curOffsetY]);
     VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"▲ Lên"];
 }
@@ -1364,6 +1394,7 @@ static VCamFloat *gVCamFloat = nil;
 - (void)_moveDown {
     _curOffsetY -= 30.0f;
     if (_curOffsetY < -600.0f) _curOffsetY = -600.0f;
+    VCamDebugLog([NSString stringWithFormat:@"[UI] _moveDown: offsetY=%.1f", _curOffsetY]);
     VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"▼ Xuống"];
 }
@@ -1371,6 +1402,7 @@ static VCamFloat *gVCamFloat = nil;
 - (void)_moveLeft {
     _curOffsetX -= 30.0f;
     if (_curOffsetX < -600.0f) _curOffsetX = -600.0f;
+    VCamDebugLog([NSString stringWithFormat:@"[UI] _moveLeft: offsetX=%.1f", _curOffsetX]);
     VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"◀ Trái"];
 }
@@ -1378,11 +1410,13 @@ static VCamFloat *gVCamFloat = nil;
 - (void)_moveRight {
     _curOffsetX += 30.0f;
     if (_curOffsetX > 600.0f) _curOffsetX = 600.0f;
+    VCamDebugLog([NSString stringWithFormat:@"[UI] _moveRight: offsetX=%.1f", _curOffsetX]);
     VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"▶ Phải"];
 }
 
 - (void)_moveReset {
+    VCamDebugLog(@"[UI] _moveReset");
     _curOffsetX = 0.0f;
     _curOffsetY = 0.0f;
     VCamSetOffsets(0.0f, 0.0f);
