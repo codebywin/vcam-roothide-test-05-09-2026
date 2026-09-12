@@ -198,6 +198,20 @@ static VTPixelTransferSessionRef gTransferSession = NULL;
 static VTPixelTransferSessionTransferImageFunc gVTPixelTransferSessionTransferImage = NULL;
 static os_unfair_lock gTransferLock = OS_UNFAIR_LOCK_INIT;
 
+static CGFloat gCachedScale = 1.0f;
+static CGFloat gCachedOffsetX = 0.0f;
+static CGFloat gCachedOffsetY = 0.0f;
+static NSTimeInterval gLastTransformReadTime = 0;
+
+static void VCamRefreshTransformCacheIfNeeded(void) {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - gLastTransformReadTime < 0.10) return;
+    gLastTransformReadTime = now;
+    gCachedScale = VCamGetScale();
+    gCachedOffsetX = VCamGetOffsetX();
+    gCachedOffsetY = VCamGetOffsetY();
+}
+
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
     if (!source || !target) return -1;
 
@@ -209,9 +223,10 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     size_t dstH = CVPixelBufferGetHeight(target);
     OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
     OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
-    CGFloat userScale = VCamGetScale();
-    CGFloat userOffsetX = VCamGetOffsetX();
-    CGFloat userOffsetY = VCamGetOffsetY();
+    VCamRefreshTransformCacheIfNeeded();
+    CGFloat userScale = gCachedScale;
+    CGFloat userOffsetX = gCachedOffsetX;
+    CGFloat userOffsetY = gCachedOffsetY;
 
     // Fast path: scale exactly 1.0, zero offset, same format & size
     if (fabs(userScale - 1.0f) < 0.001f && fabs(userOffsetX) < 0.1f && fabs(userOffsetY) < 0.1f &&
@@ -271,7 +286,7 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         if (createFunc && gVTPixelTransferSessionTransferImage) {
             OSStatus err = createFunc(kCFAllocatorDefault, &gTransferSession);
             if (err == noErr && gTransferSession && setPropFunc) {
-                setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("CropAspectRatioPreserving"));
+                setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("Normal"));
             }
         }
         gLastSrcW = srcW;
@@ -962,7 +977,7 @@ static void VCamSelectVideo(void) {
 }
 @end
 
-@interface VCamFloat : NSObject
+@interface VCamFloat : NSObject <UIGestureRecognizerDelegate>
 + (void)show;
 + (UIViewController *)presenter;
 + (void)refreshButton;
@@ -974,6 +989,7 @@ static void VCamSelectVideo(void) {
     UIViewController *_rootVC;
     UIButton *_btn;
     UIView  *_menuOverlay;
+    UIView  *_panel;
     UISlider *_zoomSlider;
     CGFloat _curOffsetX;
     CGFloat _curOffsetY;
@@ -1086,8 +1102,16 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_hideMenu {
+    _panel = nil;
     [UIView animateWithDuration:0.2 animations:^{ self->_menuOverlay.alpha = 0; }
                      completion:^(__unused BOOL f) { [self->_menuOverlay removeFromSuperview]; self->_menuOverlay = nil; }];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if (_panel && [touch.view isDescendantOfView:_panel]) {
+        return NO;
+    }
+    return YES;
 }
 
 - (UIButton *)_dpadButtonWithTitle:(NSString *)title x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h sel:(SEL)action {
@@ -1100,6 +1124,7 @@ static VCamFloat *gVCamFloat = nil;
     b.layer.cornerRadius = 9;
     b.layer.borderWidth = 1.0;
     b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.48].CGColor;
+    b.showsTouchWhenHighlighted = YES;
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -1114,6 +1139,7 @@ static VCamFloat *gVCamFloat = nil;
     b.layer.cornerRadius = 11;
     b.layer.borderWidth = 1.0;
     b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
+    b.showsTouchWhenHighlighted = YES;
     [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
@@ -1131,6 +1157,7 @@ static VCamFloat *gVCamFloat = nil;
     UIView *overlay = [[UIView alloc] initWithFrame:_rootVC.view.bounds];
     overlay.backgroundColor = [UIColor clearColor];
     UITapGestureRecognizer *dismiss = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(_hideMenu)];
+    dismiss.delegate = self;
     [overlay addGestureRecognizer:dismiss];
 
     CGFloat panelX = (_btn.center.x > screen.size.width / 2)
@@ -1146,12 +1173,14 @@ static VCamFloat *gVCamFloat = nil;
     panel.backgroundColor = [UIColor clearColor];
     panel.layer.cornerRadius = 22;
     panel.layer.masksToBounds = YES;
+    _panel = panel;
 
     UIVisualEffectView *blurView = [[UIVisualEffectView alloc] initWithEffect:
         [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
     blurView.frame = panel.bounds;
     blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     blurView.alpha = 0.25;
+    blurView.userInteractionEnabled = NO;
     [panel addSubview:blurView];
 
     UIView *tintOverlay = [[UIView alloc] initWithFrame:panel.bounds];
@@ -1160,10 +1189,8 @@ static VCamFloat *gVCamFloat = nil;
     tintOverlay.layer.borderWidth = 1.0;
     tintOverlay.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
     tintOverlay.layer.cornerRadius = 22;
+    tintOverlay.userInteractionEnabled = NO;
     [panel addSubview:tintOverlay];
-
-    UITapGestureRecognizer *noop = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
-    [panel addGestureRecognizer:noop];
 
     // ── 1. Top: Enlarged Zoom Slider with [-] and [+] ──
     CGFloat minusBtnW = 34, plusBtnW = 34, ctrlY = 10, ctrlH = 32;
@@ -1176,6 +1203,7 @@ static VCamFloat *gVCamFloat = nil;
     minusBtn.layer.cornerRadius = 8;
     minusBtn.layer.borderWidth = 0.8;
     minusBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
+    minusBtn.showsTouchWhenHighlighted = YES;
     [minusBtn addTarget:self action:@selector(_zoomMinus) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:minusBtn];
 
@@ -1198,6 +1226,7 @@ static VCamFloat *gVCamFloat = nil;
     plusBtn.layer.cornerRadius = 8;
     plusBtn.layer.borderWidth = 0.8;
     plusBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
+    plusBtn.showsTouchWhenHighlighted = YES;
     [plusBtn addTarget:self action:@selector(_zoomPlus) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:plusBtn];
 
@@ -1310,7 +1339,7 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_zoomMinus {
-    CGFloat current = VCamGetScale();
+    CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
     CGFloat next = current - 0.10f;
     if (next < 0.4f) next = 0.4f;
     [self _updateZoomValue:next];
@@ -1318,7 +1347,7 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_zoomPlus {
-    CGFloat current = VCamGetScale();
+    CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
     CGFloat next = current + 0.10f;
     if (next > 2.5f) next = 2.5f;
     [self _updateZoomValue:next];
