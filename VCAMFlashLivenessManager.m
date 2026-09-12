@@ -9,7 +9,7 @@
 
 static const char *kVCAMFlashStateFileName = "vcam_flash_state";
 
-typedef UIImage *(*UICreateScreenUIImageFunc)(void);
+typedef CFTypeRef (*UICreateScreenUIImageFunc)(void);
 
 @interface VCAMFlashLivenessManager () {
     dispatch_source_t _samplingTimer;
@@ -282,7 +282,7 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
     // Normal Auto-Detection: Sample actual screen color in real time with strict autorelease
     if (_uikitCreateScreenUIImage) {
         @autoreleasepool {
-            void *rawImg = (void *)_uikitCreateScreenUIImage();
+            CFTypeRef rawImg = _uikitCreateScreenUIImage();
             if (rawImg) {
                 // CFBridgingRelease transfers ownership to ARC, ensuring immediate deallocation
                 UIImage *screenImg = CFBridgingRelease(rawImg);
