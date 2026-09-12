@@ -1542,6 +1542,7 @@ static void VCamInitSpringBoardHooks(void) {
     });
 }
 
+%group SpringBoard
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
@@ -1551,6 +1552,7 @@ static void VCamInitSpringBoardHooks(void) {
         [VCamFloat show];
     });
 }
+%end
 %end
 
 %ctor {
