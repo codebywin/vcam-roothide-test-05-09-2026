@@ -323,7 +323,7 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
         CIColor *outerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.12f];
 
         CIFilter *radialGradient = [CIFilter filterWithName:@"CIRadialGradient"];
-        [radialGradient setValue:[CIVector vectorWithX:centerX y:centerY] forKey:@"inputCenter"];
+        [radialGradient setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
         [radialGradient setValue:@(innerRadius) forKey:@"inputRadius0"];
         [radialGradient setValue:@(outerRadius) forKey:@"inputRadius1"];
         [radialGradient setValue:centerColor forKey:@"inputColor0"];
@@ -346,3 +346,4 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
 }
 
 @end
+
