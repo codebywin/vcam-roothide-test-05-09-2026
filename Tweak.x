@@ -560,7 +560,7 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     if (firstBuf) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
         if (pb) {
-            int rot = VCamGetRotation();
+            int rot = (VCamGetRotation() + 270) % 360;
             if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
             gCachedPixelBuffer = VCamCreateRotatedPixelBuffer(pb, rot);
         }
@@ -693,7 +693,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     while (gNextSampleBuffer && elapsed >= gNextFramePTS) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(gNextSampleBuffer);
         if (pb) {
-            int rot = VCamGetRotation();
+            int rot = (VCamGetRotation() + 270) % 360;
             CVPixelBufferRef rotPb = VCamCreateRotatedPixelBuffer(pb, rot);
             if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
             gCachedPixelBuffer = rotPb;
