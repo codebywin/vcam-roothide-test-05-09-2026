@@ -9,6 +9,7 @@
 #import <substrate.h>
 #import "VCAMLicenseManager.h"
 #import "VCAMFlashLivenessManager.h"
+#import "VCAMTransformManager.h"
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -119,84 +120,31 @@ static BOOL VCamIsPaused(void) {
 }
 
 static CGFloat VCamGetScale(void) {
-    NSString *path = VCamFindExistingFilePath(kVCamScaleFileName);
-    FILE *f = fopen([path UTF8String], "r");
-    if (f) {
-        float val = 1.0f;
-        if (fscanf(f, "%f", &val) == 1) {
-            fclose(f);
-            if (val >= 0.4f && val <= 2.5f) return (CGFloat)val;
-        } else {
-            fclose(f);
-        }
-    }
-    return 1.0f;
+    return [[VCAMTransformManager sharedManager] scale];
 }
 
 static void VCamSetScale(CGFloat scale) {
-    if (scale < 0.4f) scale = 0.4f;
-    if (scale > 2.5f) scale = 2.5f;
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f", scale);
-    VCamWriteFlag(kVCamScaleFileName, buf);
+    [[VCAMTransformManager sharedManager] setScale:scale];
 }
 
 static CGFloat VCamGetOffsetX(void) {
-    NSString *path = VCamFindExistingFilePath(kVCamOffsetXFileName);
-    FILE *f = fopen([path UTF8String], "r");
-    if (f) {
-        float val = 0.0f;
-        if (fscanf(f, "%f", &val) == 1) {
-            fclose(f);
-            return (CGFloat)val;
-        }
-        fclose(f);
-    }
-    return 0.0f;
+    return [[VCAMTransformManager sharedManager] offsetX];
 }
 
 static CGFloat VCamGetOffsetY(void) {
-    NSString *path = VCamFindExistingFilePath(kVCamOffsetYFileName);
-    FILE *f = fopen([path UTF8String], "r");
-    if (f) {
-        float val = 0.0f;
-        if (fscanf(f, "%f", &val) == 1) {
-            fclose(f);
-            return (CGFloat)val;
-        }
-        fclose(f);
-    }
-    return 0.0f;
+    return [[VCAMTransformManager sharedManager] offsetY];
 }
 
 static void VCamSetOffsets(CGFloat x, CGFloat y) {
-    char bufX[32], bufY[32];
-    snprintf(bufX, sizeof(bufX), "%.1f", x);
-    snprintf(bufY, sizeof(bufY), "%.1f", y);
-    VCamWriteFlag(kVCamOffsetXFileName, bufX);
-    VCamWriteFlag(kVCamOffsetYFileName, bufY);
+    [[VCAMTransformManager sharedManager] setOffsetX:x offsetY:y];
 }
 
 static int VCamGetRotation(void) {
-    NSString *path = VCamFindExistingFilePath(kVCamRotationFileName);
-    if (path) {
-        FILE *f = fopen([path UTF8String], "r");
-        if (f) {
-            int val = 0;
-            if (fscanf(f, "%d", &val) == 1) {
-                fclose(f);
-                return ((val % 360) + 360) % 360;
-            }
-            fclose(f);
-        }
-    }
-    return 0; // Mặc định 0 độ (portrait chuẩn theo video gốc)
+    return [[VCAMTransformManager sharedManager] rotation];
 }
 
 static void VCamSetRotation(int deg) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%d", ((deg % 360) + 360) % 360);
-    VCamWriteFlag(kVCamRotationFileName, buf);
+    [[VCAMTransformManager sharedManager] setRotation:deg];
 }
 
 typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
@@ -208,19 +156,6 @@ static VTPixelTransferSessionRef gTransferSession = NULL;
 static VTPixelTransferSessionTransferImageFunc gVTPixelTransferSessionTransferImage = NULL;
 static os_unfair_lock gTransferLock = OS_UNFAIR_LOCK_INIT;
 
-static CGFloat gCachedScale = 1.0f;
-static CGFloat gCachedOffsetX = 0.0f;
-static CGFloat gCachedOffsetY = 0.0f;
-static NSTimeInterval gLastTransformReadTime = 0;
-
-static void VCamRefreshTransformCacheIfNeeded(void) {
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - gLastTransformReadTime < 0.10) return;
-    gLastTransformReadTime = now;
-    gCachedScale = VCamGetScale();
-    gCachedOffsetX = VCamGetOffsetX();
-    gCachedOffsetY = VCamGetOffsetY();
-}
 
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
     if (!source || !target) return -1;
@@ -233,13 +168,14 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     size_t dstH = CVPixelBufferGetHeight(target);
     OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
     OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
-    VCamRefreshTransformCacheIfNeeded();
-    CGFloat userScale = gCachedScale;
-    CGFloat userOffsetX = gCachedOffsetX;
-    CGFloat userOffsetY = gCachedOffsetY;
+    VCAMTransformState transformState = [VCAMTransformManager currentTransformState];
+    CGFloat userScale = transformState.scale;
+    CGFloat userOffsetX = transformState.offsetX;
+    CGFloat userOffsetY = transformState.offsetY;
 
-    // Fast path: scale exactly 1.0, zero offset, same format & size
+    // Fast path: scale exactly 1.0, zero offset, not mirror flipped, same format & size
     if (fabs(userScale - 1.0f) < 0.001f && fabs(userOffsetX) < 0.1f && fabs(userOffsetY) < 0.1f &&
+        !transformState.isFlipped &&
         gVideoExifOrientation == 1 && srcFmt == dstFmt && srcW == dstW && srcH == dstH) {
         CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
         CVPixelBufferLockBaseAddress(target, 0);
@@ -336,7 +272,7 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
 
     VCAMFlashState flashState = [VCAMFlashLivenessManager currentFlashState];
     BOOL hasFlash = (flashState.active && flashState.intensity > 0.01f);
-    BOOL hasTransform = (fabs(userScale - 1.0f) > 0.01f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f || hasFlash);
+    BOOL hasTransform = (transformState.hasTransform || hasFlash);
 
     if (hasTransform && gCIContext) {
         CGFloat scale = userScale;
@@ -369,21 +305,10 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
 
         @try {
             CIImage *img = [CIImage imageWithCVPixelBuffer:source];
-            CGFloat baseScaleX = (CGFloat)dstW / (CGFloat)srcW;
-            CGFloat baseScaleY = (CGFloat)dstH / (CGFloat)srcH;
-            CGFloat finalScaleX = baseScaleX * scale;
-            CGFloat finalScaleY = baseScaleY * scale;
-
-            // 1. Đưa tâm ảnh nguồn về (0, 0)
-            CGAffineTransform t = CGAffineTransformMakeTranslation(-(CGFloat)srcW / 2.0f, -(CGFloat)srcH / 2.0f);
-            // 2. Thu phóng theo kích thước target và tỉ lệ user zoom (0.4x đến 2.5x)
-            t = CGAffineTransformConcat(t, CGAffineTransformMakeScale(finalScaleX, finalScaleY));
-            // 3. Tịnh tiến theo trục cảm biến xoay: Lên/Xuống = trục X cảm biến, Trái/Phải = trục Y cảm biến
-            CGFloat tx = (CGFloat)dstW / 2.0f - userOffsetY;
-            CGFloat ty = (CGFloat)dstH / 2.0f + userOffsetX;
-            t = CGAffineTransformConcat(t, CGAffineTransformMakeTranslation(tx, ty));
-
-            img = [img imageByApplyingTransform:t];
+            img = [VCAMTransformManager applyTransformToImage:img
+                                                      srcSize:CGSizeMake(srcW, srcH)
+                                                      dstSize:CGSizeMake(dstW, dstH)
+                                                        state:transformState];
 
             // 4. Áp dụng hiệu ứng ánh sáng phản quang KYC Flash Liveness
             if (hasFlash) {
@@ -1272,13 +1197,15 @@ static VCamFloat *gVCamFloat = nil;
     rotBtn.titleLabel.font = [UIFont systemFontOfSize:18];
     [panel addSubview:rotBtn];
 
-    // Current angle indicator at top-right of D-Pad
-    int currentRot = VCamGetRotation();
-    NSString *degStr = [NSString stringWithFormat:@"%d°", currentRot];
-    UIButton *degBtn = [self _dpadButtonWithTitle:degStr x:w - 44 - 12 y:52 w:44 h:dBtnH sel:@selector(_menuRotateVideo)];
-    degBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    degBtn.titleLabel.adjustsFontSizeToFitWidth = YES;
-    [panel addSubview:degBtn];
+    // Mirror Flip Button (🪞) at top-right of D-Pad
+    BOOL isFlipped = [[VCAMTransformManager sharedManager] isMirrorFlipped];
+    UIButton *flipBtn = [self _dpadButtonWithTitle:@"🪞" x:w - 44 - 12 y:52 w:44 h:dBtnH sel:@selector(_toggleMirrorFlip:)];
+    flipBtn.titleLabel.font = [UIFont systemFontOfSize:18];
+    if (isFlipped) {
+        flipBtn.backgroundColor = [UIColor colorWithRed:0.3 green:0.75 blue:1.0 alpha:0.38];
+        flipBtn.layer.borderColor = [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:0.95].CGColor;
+    }
+    [panel addSubview:flipBtn];
 
     // Up
     [panel addSubview:[self _dpadButtonWithTitle:@"▲" x:midX y:52 w:dBtnW h:dBtnH sel:@selector(_moveUp)]];
@@ -1376,9 +1303,7 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_menuRotateVideo {
-    int cur = VCamGetRotation();
-    int next = (cur + 90) % 360;
-    VCamSetRotation(next);
+    int next = [[VCAMTransformManager sharedManager] rotate90];
     [self _hideMenu];
     [self _showToast:[NSString stringWithFormat:@"Đã xoay: %d°", next]];
 }
@@ -1414,35 +1339,44 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_moveUp {
-    _curOffsetY += 30.0f;
-    if (_curOffsetY > 600.0f) _curOffsetY = 600.0f;
+    [[VCAMTransformManager sharedManager] moveUp];
+    _curOffsetY = [[VCAMTransformManager sharedManager] offsetY];
     VCamDebugLog([NSString stringWithFormat:@"[UI] _moveUp: offsetY=%.1f", _curOffsetY]);
-    VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"▲ Lên"];
 }
 
 - (void)_moveDown {
-    _curOffsetY -= 30.0f;
-    if (_curOffsetY < -600.0f) _curOffsetY = -600.0f;
+    [[VCAMTransformManager sharedManager] moveDown];
+    _curOffsetY = [[VCAMTransformManager sharedManager] offsetY];
     VCamDebugLog([NSString stringWithFormat:@"[UI] _moveDown: offsetY=%.1f", _curOffsetY]);
-    VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"▼ Xuống"];
 }
 
 - (void)_moveLeft {
-    _curOffsetX -= 30.0f;
-    if (_curOffsetX < -600.0f) _curOffsetX = -600.0f;
+    [[VCAMTransformManager sharedManager] moveLeft];
+    _curOffsetX = [[VCAMTransformManager sharedManager] offsetX];
     VCamDebugLog([NSString stringWithFormat:@"[UI] _moveLeft: offsetX=%.1f", _curOffsetX]);
-    VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"◀ Trái"];
 }
 
 - (void)_moveRight {
-    _curOffsetX += 30.0f;
-    if (_curOffsetX > 600.0f) _curOffsetX = 600.0f;
+    [[VCAMTransformManager sharedManager] moveRight];
+    _curOffsetX = [[VCAMTransformManager sharedManager] offsetX];
     VCamDebugLog([NSString stringWithFormat:@"[UI] _moveRight: offsetX=%.1f", _curOffsetX]);
-    VCamSetOffsets(_curOffsetX, _curOffsetY);
     [self _showToast:@"▶ Phải"];
+}
+
+- (void)_toggleMirrorFlip:(UIButton *)sender {
+    BOOL flipped = [[VCAMTransformManager sharedManager] toggleMirrorFlip];
+    if (flipped) {
+        sender.backgroundColor = [UIColor colorWithRed:0.3 green:0.75 blue:1.0 alpha:0.38];
+        sender.layer.borderColor = [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:0.95].CGColor;
+        [self _showToast:@"🪞 Lật gương: BẬT"];
+    } else {
+        sender.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
+        sender.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.48].CGColor;
+        [self _showToast:@"🪞 Lật gương: TẮT"];
+    }
 }
 
 - (void)_toggleKYCFlash:(UIButton *)sender {
@@ -1478,9 +1412,9 @@ static VCamFloat *gVCamFloat = nil;
 
 - (void)_moveReset {
     VCamDebugLog(@"[UI] _moveReset");
+    [[VCAMTransformManager sharedManager] reset];
     _curOffsetX = 0.0f;
     _curOffsetY = 0.0f;
-    VCamSetOffsets(0.0f, 0.0f);
     [self _updateZoomValue:1.0f];
     [self _showToast:@"Đặt lại vị trí (1.0x)"];
 }
@@ -1521,7 +1455,9 @@ static VCamFloat *gVCamFloat = nil;
 - (void)_menuDisable {
     VCamRemoveFlag(kVCamEnabledFlagName);
     VCamRemoveFlag(kVCamPauseFlagName);
-    VCamRemoveFlag(kVCamRotationFileName);
+    [[VCAMTransformManager sharedManager] reset];
+    [[VCAMTransformManager sharedManager] setRotation:0];
+    [[VCAMTransformManager sharedManager] setMirrorFlipped:NO];
     [self _hideMenu];
     VCamFloatRefreshButton();
 }
