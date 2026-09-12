@@ -15,6 +15,7 @@
 #define VCamFloatWindow                 _0x9183ca
 #define VCamFloat                       _0x33b1e7
 #define VCamPickerDelegate              _0x77d20f
+#define VCAMPhotoManager                _0x11e47a
 
 // 2. Mã hóa các hàm kiểm tra bản quyền & kích hoạt
 #define isLicenseValid                  _0xa8f102
@@ -44,8 +45,13 @@
 // 3. Mã hóa các action trên menu Dock
 #define _menuShowLicense                _0x22d810
 #define _menuSelectVideo                _0x44f192
+#define _menuSelectPhoto                _0x55a82e
 #define _menuTogglePause                _0x88c12a
 #define _menuDisable                    _0x99e341
+
+// 4. Mã hóa các hàm chọn & xử lý ảnh
+#define presentPhotoPickerFromViewController _0x77c92b
+#define processSelectedImage            _0x33d19f
 
 // 4. Mã hóa các biến tĩnh và hàm C nội bộ
 #define VCAMGetServerBaseURL            _0x_gsb_2026

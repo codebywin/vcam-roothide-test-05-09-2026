@@ -11,6 +11,7 @@
 #import "VCAMFlashLivenessManager.h"
 #import "VCAMTransformManager.h"
 #import "VCAMSecurityGuard.h"
+#import "VCAMPhotoManager.h"
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -1081,9 +1082,9 @@ static VCamFloat *gVCamFloat = nil;
     b.frame = CGRectMake(x, y, w, h);
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:color forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:20];
+    b.titleLabel.font = [UIFont systemFontOfSize:18];
     b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
-    b.layer.cornerRadius = 11;
+    b.layer.cornerRadius = 10;
     b.layer.borderWidth = 1.0;
     b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
     b.showsTouchWhenHighlighted = YES;
@@ -1232,32 +1233,36 @@ static VCamFloat *gVCamFloat = nil;
     }
     [panel addSubview:testBtn];
 
-    // ── 3. Bottom: 5 Action Icon Buttons (Horizontal Row, enlarged 38x40) ──
-    CGFloat iconW = 38, iconH = 40, iconY = 184;
-    CGFloat iconSpacing = 5;
-    CGFloat totalIconsW = 5 * iconW + 4 * iconSpacing;
+    // ── 3. Bottom: 6 Action Icon Buttons (Horizontal Row, 32x38) ──
+    CGFloat iconW = 32, iconH = 38, iconY = 186;
+    CGFloat iconSpacing = 4;
+    CGFloat totalIconsW = 6 * iconW + 5 * iconSpacing;
     CGFloat startIconX = (w - totalIconsW) / 2.0;
 
     // Icon 1: Chọn video (🎬)
     UIButton *pickBtn = [self _iconButtonWithTitle:@"🎬" x:startIconX y:iconY w:iconW h:iconH color:[UIColor whiteColor] sel:@selector(_menuSelectVideo)];
     [panel addSubview:pickBtn];
 
-    // Icon 2: Tạm dừng / Tiếp tục (⏸️ / ▶️)
+    // Icon 2: Chọn ảnh tĩnh (🖼️)
+    UIButton *photoBtn = [self _iconButtonWithTitle:@"🖼️" x:startIconX + (iconW + iconSpacing) * 1 y:iconY w:iconW h:iconH color:[UIColor whiteColor] sel:@selector(_menuSelectPhoto)];
+    [panel addSubview:photoBtn];
+
+    // Icon 3: Tạm dừng / Tiếp tục (⏸️ / ▶️)
     NSString *pauseIcon = isPaused ? @"▶️" : @"⏸️";
     UIColor *pauseCol = isPaused ? [UIColor colorWithRed:0.4 green:0.95 blue:0.5 alpha:1] : [UIColor colorWithRed:1.0 green:0.85 blue:0.3 alpha:1];
-    UIButton *pauseBtn = [self _iconButtonWithTitle:pauseIcon x:startIconX + (iconW + iconSpacing) * 1 y:iconY w:iconW h:iconH color:pauseCol sel:@selector(_menuTogglePause)];
+    UIButton *pauseBtn = [self _iconButtonWithTitle:pauseIcon x:startIconX + (iconW + iconSpacing) * 2 y:iconY w:iconW h:iconH color:pauseCol sel:@selector(_menuTogglePause)];
     [panel addSubview:pauseBtn];
 
-    // Icon 3: Quản lý Key / Hạn dùng (🔑)
-    UIButton *licBtn = [self _iconButtonWithTitle:@"🔑" x:startIconX + (iconW + iconSpacing) * 2 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1] sel:@selector(_menuShowLicense)];
+    // Icon 4: Quản lý Key / Hạn dùng (🔑)
+    UIButton *licBtn = [self _iconButtonWithTitle:@"🔑" x:startIconX + (iconW + iconSpacing) * 3 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1] sel:@selector(_menuShowLicense)];
     [panel addSubview:licBtn];
 
-    // Icon 4: Xóa video (🗑️)
-    UIButton *trashBtn = [self _iconButtonWithTitle:@"🗑️" x:startIconX + (iconW + iconSpacing) * 3 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:1 green:0.45 blue:0.45 alpha:1] sel:@selector(_menuDisable)];
+    // Icon 5: Xóa video / ảnh (🗑️)
+    UIButton *trashBtn = [self _iconButtonWithTitle:@"🗑️" x:startIconX + (iconW + iconSpacing) * 4 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:1 green:0.45 blue:0.45 alpha:1] sel:@selector(_menuDisable)];
     [panel addSubview:trashBtn];
 
-    // Icon 5: Đóng (✕)
-    UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + iconSpacing) * 4 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
+    // Icon 6: Đóng (✕)
+    UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + iconSpacing) * 5 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
     [panel addSubview:closeBtn];
 
     [_rootVC.view insertSubview:panel aboveSubview:overlay];
@@ -1433,6 +1438,15 @@ static VCamFloat *gVCamFloat = nil;
         return;
     }
     VCamSelectVideo();
+}
+
+- (void)_menuSelectPhoto {
+    [self _hideMenu];
+    if (![[VCAMLicenseManager sharedManager] isLicenseValid]) {
+        [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt bản quyền để chọn ảnh!" presenter:_rootVC];
+        return;
+    }
+    [[VCAMPhotoManager sharedManager] presentPhotoPickerFromViewController:_rootVC];
 }
 
 - (void)_menuShowLicense {
