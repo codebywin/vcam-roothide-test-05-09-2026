@@ -168,9 +168,17 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
 }
 
 static int VCamGetRotation(void) {
-    char buf[16] = {0};
-    if (VCamReadFlag(kVCamRotationFileName, buf, sizeof(buf))) {
-        return atoi(buf);
+    NSString *path = VCamFindExistingFilePath(kVCamRotationFileName);
+    if (path) {
+        FILE *f = fopen([path UTF8String], "r");
+        if (f) {
+            int val = 0;
+            if (fscanf(f, "%d", &val) == 1) {
+                fclose(f);
+                return val;
+            }
+            fclose(f);
+        }
     }
     return 90; // Mặc định xoay 90 độ để video dọc hiển thị chuẩn trên camera ngang
 }
