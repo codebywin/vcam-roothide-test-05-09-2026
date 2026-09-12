@@ -165,6 +165,9 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
     VCamWriteFlag(kVCamOffsetYFileName, bufY);
 }
 
+static VTPixelTransferSessionRef gTransferSession = NULL;
+static dispatch_once_t gTransferOnce;
+
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
     if (!source || !target) return -1;
 
@@ -211,53 +214,21 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         return noErr;
     }
 
-    // High quality GPU rendering with CIImage (handles Zoom In, Zoom Out, Pan & 100% Solid Black Canvas)
-    static CIContext *ciCtx = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        ciCtx = [CIContext contextWithOptions:@{
-            kCIContextUseSoftwareRenderer: @NO,
-            kCIContextHighQualityDownsample: @YES
-        }];
+    // Hardware accelerated scaling & format conversion via VideoToolbox
+    // (100% Native, 0% Metal IOFence / GPU deadlock)
+    dispatch_once(&gTransferOnce, ^{
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
     });
-    if (!ciCtx) return -2;
 
-    CIImage *img = [CIImage imageWithCVPixelBuffer:source];
-
-    int32_t orient = gVideoExifOrientation;
-    if (orient == 1 && srcW > srcH && dstH > dstW) orient = 8;
-
-    if (orient != 1) {
-        img = [img imageByApplyingOrientation:orient];
-        CGRect ext = img.extent;
-        img = [img imageByApplyingTransform:
-               CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y)];
+    if (gTransferSession) {
+        VTSessionSetProperty(gTransferSession, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_CropAspectRatioPreserving);
+        OSStatus status = VTPixelTransferSessionTransferImage(gTransferSession, source, target);
+        if (status == noErr) {
+            return noErr;
+        }
     }
 
-    // Aspect-fill scale with user zoom factor (supports Zoom In >= 1.0 and Zoom Out < 1.0)
-    CGRect ext = img.extent;
-    CGFloat sx = (CGFloat)dstW / ext.size.width;
-    CGFloat sy = (CGFloat)dstH / ext.size.height;
-    CGFloat baseScale = MAX(sx, sy);
-    CGFloat totalScale = baseScale * userScale;
-
-    img = [img imageByApplyingTransform:CGAffineTransformMakeScale(totalScale, totalScale)];
-    ext = img.extent;
-    CGFloat tx = (dstW - ext.size.width) * 0.5 - ext.origin.x + userOffsetX;
-    CGFloat ty = (dstH - ext.size.height) * 0.5 - ext.origin.y + userOffsetY;
-    img = [img imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
-
-    // 100% Pure Solid Black Canvas covering entire camera buffer (eliminates any real camera exposure)
-    CIImage *blackCanvas = [[CIImage imageWithColor:[CIColor colorWithRed:0.0 green:0.0 blue:0.0 alpha:1.0]]
-                           imageByCroppingToRect:CGRectMake(0, 0, dstW, dstH)];
-    CIImage *finalImg = [img imageByCompositingOverImage:blackCanvas];
-
-    CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    [ciCtx render:finalImg toCVPixelBuffer:target
-           bounds:CGRectMake(0, 0, dstW, dstH)
-       colorSpace:srgb];
-    CGColorSpaceRelease(srgb);
-    return noErr;
+    return -1;
 }
 
 static AVAsset                  *gAsset = nil;
@@ -359,7 +330,21 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
 }
 
 static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuffer) {
-    if (!originSampleBuffer || !VCamIsActive() || !VCamCheckFileExists(kVCamTempFileName)) return nil;
+    if (!originSampleBuffer) return nil;
+
+    CFTimeInterval now = CACurrentMediaTime();
+
+    // Throttled flag check (chỉ kiểm tra cờ mỗi 0.3s để giảm I/O trên camera thread)
+    static BOOL gCachedActive = NO;
+    static BOOL gCachedPaused = NO;
+    static CFTimeInterval gLastFlagCheck = 0;
+    if (now - gLastFlagCheck > 0.3) {
+        gLastFlagCheck = now;
+        gCachedActive = VCamIsActive() && VCamCheckFileExists(kVCamTempFileName);
+        gCachedPaused = VCamIsPaused();
+    }
+
+    if (!gCachedActive) return nil;
 
     CMFormatDescriptionRef originFormat = CMSampleBufferGetFormatDescription(originSampleBuffer);
     if (!originFormat || CMFormatDescriptionGetMediaType(originFormat) != kCMMediaType_Video) return nil;
@@ -368,8 +353,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     CMTime originPTS = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer);
 
     // ── Xử lý tính năng Tạm dừng (Pause / Freeze Frame) ──
-    BOOL isPaused = VCamIsPaused();
-    if (isPaused && gCachedPixelBuffer) {
+    if (gCachedPaused && gCachedPixelBuffer) {
         CMSampleTimingInfo timing = {
             .duration               = CMSampleBufferGetDuration(originSampleBuffer),
             .presentationTimeStamp  = originPTS,
@@ -386,14 +370,24 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         return fakeBuffer;
     }
 
-    NSString *currentTempPath = VCamFindExistingFilePath(kVCamTempFileName);
-    NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:currentTempPath error:nil].fileModificationDate;
-    if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
-        gLastTempFileModified = modified;
-        gNeedsReaderReload = YES;
-        if (gCachedPixelBuffer) {
-            CFRelease(gCachedPixelBuffer);
-            gCachedPixelBuffer = nil;
+    // Throttled file check (quét file mới nhất mỗi 0.5s)
+    static NSString *gActiveTempPath = nil;
+    static CFTimeInterval gLastPathCheck = 0;
+    if (now - gLastPathCheck > 0.5 || !gActiveTempPath) {
+        gLastPathCheck = now;
+        NSString *found = VCamFindExistingFilePath(kVCamTempFileName);
+        if (![found isEqualToString:gActiveTempPath]) {
+            gActiveTempPath = found;
+            gNeedsReaderReload = YES;
+        }
+        NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:gActiveTempPath error:nil].fileModificationDate;
+        if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
+            gLastTempFileModified = modified;
+            gNeedsReaderReload = YES;
+            if (gCachedPixelBuffer) {
+                CFRelease(gCachedPixelBuffer);
+                gCachedPixelBuffer = nil;
+            }
         }
     }
 
@@ -401,10 +395,9 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
 
     // Khởi tạo hoặc tải lại reader nếu cần
     if (gNeedsReaderReload || !gAssetReader || gAssetReader.status != AVAssetReaderStatusReading) {
-        BOOL ok = VCamSetupReader(currentTempPath, originSubtype);
+        BOOL ok = VCamSetupReader(gActiveTempPath, originSubtype);
         if (!ok) {
             gNeedsReaderReload = YES;
-            // Nếu có cached frame, tiếp tục xuất frame cũ để không bị nháy camera thật
             if (gCachedPixelBuffer) {
                 CMSampleTimingInfo timing = {
                     .duration               = CMSampleBufferGetDuration(originSampleBuffer),
@@ -425,19 +418,17 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         }
 
         gNeedsReaderReload = NO;
-        gPlaybackStartRealTime = CACurrentMediaTime();
+        gPlaybackStartRealTime = now;
     }
 
-    CFTimeInterval now = CACurrentMediaTime();
     if (gPlaybackStartRealTime == 0) gPlaybackStartRealTime = now;
-
     CFTimeInterval elapsed = now - gPlaybackStartRealTime;
 
     // Seamless Infinite Loop: Tái sinh reader khi hết thời lượng video
     if (gCachedDuration > 0.05 && elapsed >= gCachedDuration) {
         gPlaybackStartRealTime = now;
         elapsed = 0;
-        VCamSetupReader(currentTempPath, gReaderFormat);
+        VCamSetupReader(gActiveTempPath, gReaderFormat);
     }
 
     // Tiến trình hiển thị frame theo đúng PTS thực của video
@@ -477,25 +468,27 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
 
 static void (*orig_BWNodeOutput_emitSampleBuffer)(id, SEL, CMSampleBufferRef) = NULL;
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
+    if (!sampleBuffer) {
+        if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        return;
+    }
+
+    CVPixelBufferRef targetPb = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!targetPb) {
+        if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        return;
+    }
+
     CMSampleBufferRef fakeBuffer = VCamCopyFrameMatching(sampleBuffer);
     if (fakeBuffer) {
-        VCamCopyPixelBuffer(CMSampleBufferGetImageBuffer(fakeBuffer),
-                            CMSampleBufferGetImageBuffer(sampleBuffer));
-        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        CVPixelBufferRef srcPb = CMSampleBufferGetImageBuffer(fakeBuffer);
+        if (srcPb) {
+            VCamCopyPixelBuffer(srcPb, targetPb);
+        }
         CFRelease(fakeBuffer);
-    } else {
-        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
     }
-}
 
-static void (*orig_BWPixelTransferNode_renderSampleBuffer)(id, SEL, CMSampleBufferRef, id) = NULL;
-static void hook_BWPixelTransferNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
-    orig_BWPixelTransferNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
-}
-
-static void (*orig_BWNode_renderSampleBuffer)(id, SEL, CMSampleBufferRef, id) = NULL;
-static void hook_BWNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
-    orig_BWNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
+    if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
 }
 
 static void HookIfPresent(const char *className, SEL selector, IMP replacement, IMP *original) {
@@ -512,12 +505,6 @@ static void VCamInitMediaServerHooks(void) {
     HookIfPresent("BWNodeOutput", @selector(emitSampleBuffer:),
                   (IMP)&hook_BWNodeOutput_emitSampleBuffer,
                   (IMP *)&orig_BWNodeOutput_emitSampleBuffer);
-    HookIfPresent("BWPixelTransferNode", @selector(renderSampleBuffer:forInput:),
-                  (IMP)&hook_BWPixelTransferNode_renderSampleBuffer,
-                  (IMP *)&orig_BWPixelTransferNode_renderSampleBuffer);
-    HookIfPresent("BWNode", @selector(renderSampleBuffer:forInput:),
-                  (IMP)&hook_BWNode_renderSampleBuffer,
-                  (IMP *)&orig_BWNode_renderSampleBuffer);
 
     NSLog(@"[vcamios] mediaserverd hooks loaded; source=%s", kVCamTempFileName);
 }
