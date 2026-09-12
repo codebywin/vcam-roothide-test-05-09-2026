@@ -165,7 +165,13 @@ static void VCamSetOffsets(CGFloat x, CGFloat y) {
     VCamWriteFlag(kVCamOffsetYFileName, bufY);
 }
 
+typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
+typedef OSStatus (*VTPixelTransferSessionCreateFunc)(CFAllocatorRef, VTPixelTransferSessionRef *);
+typedef OSStatus (*VTPixelTransferSessionTransferImageFunc)(VTPixelTransferSessionRef, CVPixelBufferRef, CVPixelBufferRef);
+typedef OSStatus (*VTSessionSetPropertyFunc)(CFTypeRef, CFStringRef, CFTypeRef);
+
 static VTPixelTransferSessionRef gTransferSession = NULL;
+static VTPixelTransferSessionTransferImageFunc gVTPixelTransferSessionTransferImage = NULL;
 static dispatch_once_t gTransferOnce;
 
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
@@ -217,12 +223,21 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     // Hardware accelerated scaling & format conversion via VideoToolbox
     // (100% Native, 0% Metal IOFence / GPU deadlock)
     dispatch_once(&gTransferOnce, ^{
-        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
+        dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+        VTPixelTransferSessionCreateFunc createFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
+        gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
+        VTSessionSetPropertyFunc setPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
+
+        if (createFunc && gVTPixelTransferSessionTransferImage) {
+            OSStatus err = createFunc(kCFAllocatorDefault, &gTransferSession);
+            if (err == noErr && gTransferSession && setPropFunc) {
+                setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("CropAspectRatioPreserving"));
+            }
+        }
     });
 
-    if (gTransferSession) {
-        VTSessionSetProperty(gTransferSession, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_CropAspectRatioPreserving);
-        OSStatus status = VTPixelTransferSessionTransferImage(gTransferSession, source, target);
+    if (gTransferSession && gVTPixelTransferSessionTransferImage) {
+        OSStatus status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
         if (status == noErr) {
             return noErr;
         }
