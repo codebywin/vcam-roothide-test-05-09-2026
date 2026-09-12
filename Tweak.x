@@ -265,7 +265,6 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
 
     if (!gTransferSession || srcW != gLastSrcW || srcH != gLastSrcH || dstW != gLastDstW || dstH != gLastDstH || srcFmt != gLastSrcFmt || dstFmt != gLastDstFmt) {
         if (gTransferSession) {
-            VTPixelTransferSessionInvalidate(gTransferSession);
             CFRelease(gTransferSession);
             gTransferSession = NULL;
         }
