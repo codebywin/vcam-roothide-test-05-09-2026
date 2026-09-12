@@ -95,8 +95,8 @@ static NSArray<NSString *> *PossibleTmpDirs(void) {
 static UIImage *NormalizeImageOrientation(UIImage *img) {
     if (img.imageOrientation == UIImageOrientationUp) return img;
     UIGraphicsBeginImageContextWithOptions(img.size, NO, img.scale);
-    [img drawInRect:(CGRect){0, 0, img.size}];
-    UIImage *normalized = UIGraphicsGetImageEndContext();
+    [img drawInRect:CGRectMake(0, 0, img.size.width, img.size.height)];
+    UIImage *normalized = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return normalized ?: img;
 }
