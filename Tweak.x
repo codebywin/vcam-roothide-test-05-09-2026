@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#import <os/lock.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
@@ -173,9 +174,12 @@ typedef OSStatus (*VTSessionSetPropertyFunc)(CFTypeRef, CFStringRef, CFTypeRef);
 static VTPixelTransferSessionRef gTransferSession = NULL;
 static VTPixelTransferSessionTransferImageFunc gVTPixelTransferSessionTransferImage = NULL;
 static dispatch_once_t gTransferOnce;
+static os_unfair_lock gTransferLock = OS_UNFAIR_LOCK_INIT;
 
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
     if (!source || !target) return -1;
+
+    os_unfair_lock_lock(&gTransferLock);
 
     size_t srcW = CVPixelBufferGetWidth(source);
     size_t srcH = CVPixelBufferGetHeight(source);
@@ -217,6 +221,7 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         }
         CVPixelBufferUnlockBaseAddress(target, 0);
         CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+        os_unfair_lock_unlock(&gTransferLock);
         return noErr;
     }
 
@@ -236,14 +241,23 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         }
     });
 
+    OSStatus status = -1;
     if (gTransferSession && gVTPixelTransferSessionTransferImage) {
-        OSStatus status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
-        if (status == noErr) {
-            return noErr;
+        // Ensure clean aperture attachment exists so VideoToolbox doesn't hit null dictionary
+        if (!CVBufferGetAttachment(source, kCVImageBufferCleanApertureKey, NULL)) {
+            NSDictionary *cleanAperture = @{
+                (id)kCVImageBufferCleanApertureWidthKey: @(srcW),
+                (id)kCVImageBufferCleanApertureHeightKey: @(srcH),
+                (id)kCVImageBufferCleanApertureHorizontalOffsetKey: @0,
+                (id)kCVImageBufferCleanApertureVerticalOffsetKey: @0
+            };
+            CVBufferSetAttachment(source, kCVImageBufferCleanApertureKey, (__bridge CFDictionaryRef)cleanAperture, kCVAttachmentMode_ShouldPropagate);
         }
+        status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
     }
 
-    return -1;
+    os_unfair_lock_unlock(&gTransferLock);
+    return status;
 }
 
 static AVAsset                  *gAsset = nil;
@@ -494,11 +508,21 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         return;
     }
 
+    // Do not re-process buffers that have already been swapped by VCam in an upstream node
+    static const CFStringRef kVCamProcessedKey = CFSTR("kVCamProcessedBuffer");
+    if (CVBufferGetAttachment(targetPb, kVCamProcessedKey, NULL)) {
+        if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+        return;
+    }
+
     CMSampleBufferRef fakeBuffer = VCamCopyFrameMatching(sampleBuffer);
     if (fakeBuffer) {
         CVPixelBufferRef srcPb = CMSampleBufferGetImageBuffer(fakeBuffer);
         if (srcPb) {
-            VCamCopyPixelBuffer(srcPb, targetPb);
+            OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
+            if (err == noErr) {
+                CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
+            }
         }
         CFRelease(fakeBuffer);
     }
