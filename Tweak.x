@@ -21,10 +21,7 @@
 static const char *kVCamTempFileName    = "vcam_temp.mov";
 static const char *kVCamEnabledFlagName = "vcam_enabled";
 static const char *kVCamPauseFlagName   = "vcam_paused";
-static const char *kVCamScaleFileName   = "vcam_scale";
-static const char *kVCamOffsetXFileName = "vcam_offset_x";
-static const char *kVCamOffsetYFileName = "vcam_offset_y";
-static const char *kVCamRotationFileName = "vcam_rotation";
+
 
 static void VCamDebugLog(NSString *msg) {
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
@@ -135,17 +132,13 @@ static CGFloat VCamGetOffsetY(void) {
     return [[VCAMTransformManager sharedManager] offsetY];
 }
 
-static void VCamSetOffsets(CGFloat x, CGFloat y) {
-    [[VCAMTransformManager sharedManager] setOffsetX:x offsetY:y];
-}
+
 
 static int VCamGetRotation(void) {
     return [[VCAMTransformManager sharedManager] rotation];
 }
 
-static void VCamSetRotation(int deg) {
-    [[VCAMTransformManager sharedManager] setRotation:deg];
-}
+
 
 typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
 typedef OSStatus (*VTPixelTransferSessionCreateFunc)(CFAllocatorRef, VTPixelTransferSessionRef *);
