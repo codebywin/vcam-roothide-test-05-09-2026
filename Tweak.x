@@ -307,7 +307,35 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     }
 
     OSStatus status = -1;
-    if (gTransferSession && gVTPixelTransferSessionTransferImage) {
+    static CIContext *gCIContext = nil;
+    static dispatch_once_t gCIOnce;
+    dispatch_once(&gCIOnce, ^{
+        @try {
+            gCIContext = [CIContext contextWithOptions:@{
+                kCIContextWorkingColorSpace: [NSNull null],
+                kCIContextOutputColorSpace: [NSNull null]
+            }];
+            VCamDebugLog([NSString stringWithFormat:@"[CIContext] GPU context created: %@", gCIContext]);
+        } @catch (id ex) {
+            VCamDebugLog([NSString stringWithFormat:@"[CIContext] GPU context failed: %@", ex]);
+        }
+        if (!gCIContext) {
+            @try {
+                gCIContext = [CIContext contextWithOptions:@{
+                    kCIContextUseSoftwareRenderer: @(YES),
+                    kCIContextWorkingColorSpace: [NSNull null],
+                    kCIContextOutputColorSpace: [NSNull null]
+                }];
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] CPU fallback created: %@", gCIContext]);
+            } @catch (id ex) {
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] CPU fallback failed: %@", ex]);
+            }
+        }
+    });
+
+    BOOL hasTransform = (fabs(userScale - 1.0f) > 0.01f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f);
+
+    if (hasTransform && gCIContext) {
         CGFloat scale = userScale;
         if (scale < 0.4f) scale = 0.4f;
         if (scale > 2.5f) scale = 2.5f;
@@ -336,72 +364,40 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
             CVPixelBufferUnlockBaseAddress(target, 0);
         }
 
-        if (scale >= 1.0f) {
-            // Phóng to (Zoom in) & Dịch chuyển (Pan): Cắt vùng nhỏ trên source và phóng to lên target
-            CGFloat cropW = (CGFloat)srcW / scale;
-            CGFloat cropH = (CGFloat)srcH / scale;
+        @try {
+            CIImage *img = [CIImage imageWithCVPixelBuffer:source];
+            CGFloat baseScaleX = (CGFloat)dstW / (CGFloat)srcW;
+            CGFloat baseScaleY = (CGFloat)dstH / (CGFloat)srcH;
+            CGFloat finalScaleX = baseScaleX * scale;
+            CGFloat finalScaleY = baseScaleY * scale;
 
-            CGFloat maxHOff = (srcW - cropW) / 2.0f;
-            CGFloat maxVOff = (srcH - cropH) / 2.0f;
+            // 1. Đưa tâm ảnh nguồn về (0, 0)
+            CGAffineTransform t = CGAffineTransformMakeTranslation(-(CGFloat)srcW / 2.0f, -(CGFloat)srcH / 2.0f);
+            // 2. Thu phóng theo kích thước target và tỉ lệ user zoom (0.4x đến 2.5x)
+            t = CGAffineTransformConcat(t, CGAffineTransformMakeScale(finalScaleX, finalScaleY));
+            // 3. Tịnh tiến theo trục cảm biến xoay: Lên/Xuống = trục X cảm biến, Trái/Phải = trục Y cảm biến
+            CGFloat tx = (CGFloat)dstW / 2.0f - userOffsetY;
+            CGFloat ty = (CGFloat)dstH / 2.0f + userOffsetX;
+            t = CGAffineTransformConcat(t, CGAffineTransformMakeTranslation(tx, ty));
 
-            CGFloat hOff = -userOffsetY;
-            CGFloat vOff = -userOffsetX;
-
-            if (hOff > maxHOff) hOff = maxHOff;
-            if (hOff < -maxHOff) hOff = -maxHOff;
-            if (vOff > maxVOff) vOff = maxVOff;
-            if (vOff < -maxVOff) vOff = -maxVOff;
-
-            NSDictionary *srcAperture = @{
-                (id)kCVImageBufferCleanApertureWidthKey: @((size_t)cropW),
-                (id)kCVImageBufferCleanApertureHeightKey: @((size_t)cropH),
-                (id)kCVImageBufferCleanApertureHorizontalOffsetKey: @((NSInteger)hOff),
-                (id)kCVImageBufferCleanApertureVerticalOffsetKey: @((NSInteger)vOff)
-            };
-            CVBufferSetAttachment(source, kCVImageBufferCleanApertureKey, (__bridge CFDictionaryRef)srcAperture, kCVAttachmentMode_ShouldPropagate);
-            CVBufferRemoveAttachment(target, kCVImageBufferCleanApertureKey);
-        } else {
-            // Thu nhỏ (Zoom out) & Dịch chuyển (Pan): Thu nhỏ toàn bộ source vào cửa sổ nhỏ trên target
-            NSDictionary *srcAperture = @{
-                (id)kCVImageBufferCleanApertureWidthKey: @(srcW),
-                (id)kCVImageBufferCleanApertureHeightKey: @(srcH),
-                (id)kCVImageBufferCleanApertureHorizontalOffsetKey: @0,
-                (id)kCVImageBufferCleanApertureVerticalOffsetKey: @0
-            };
-            CVBufferSetAttachment(source, kCVImageBufferCleanApertureKey, (__bridge CFDictionaryRef)srcAperture, kCVAttachmentMode_ShouldPropagate);
-
-            CGFloat destW = (CGFloat)dstW * scale;
-            CGFloat destH = (CGFloat)dstH * scale;
-
-            CGFloat maxDestHOff = (dstW - destW) / 2.0f;
-            CGFloat maxDestVOff = (dstH - destH) / 2.0f;
-
-            CGFloat hOff = -userOffsetY * scale;
-            CGFloat vOff = -userOffsetX * scale;
-
-            if (hOff > maxDestHOff) hOff = maxDestHOff;
-            if (hOff < -maxDestHOff) hOff = -maxDestHOff;
-            if (vOff > maxDestVOff) vOff = maxDestVOff;
-            if (vOff < -maxDestVOff) vOff = -maxDestVOff;
-
-            NSDictionary *dstAperture = @{
-                (id)kCVImageBufferCleanApertureWidthKey: @((size_t)destW),
-                (id)kCVImageBufferCleanApertureHeightKey: @((size_t)destH),
-                (id)kCVImageBufferCleanApertureHorizontalOffsetKey: @((NSInteger)hOff),
-                (id)kCVImageBufferCleanApertureVerticalOffsetKey: @((NSInteger)vOff)
-            };
-            CVBufferSetAttachment(target, kCVImageBufferCleanApertureKey, (__bridge CFDictionaryRef)dstAperture, kCVAttachmentMode_ShouldPropagate);
-        }
-
-        status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
-        if (fabs(userScale - 1.0f) > 0.01f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f) {
-            static NSTimeInterval lastLog = 0;
-            NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-            if (now - lastLog > 1.0) {
-                lastLog = now;
-                VCamDebugLog([NSString stringWithFormat:@"[mediaserverd] scale=%.2f offX=%.1f offY=%.1f status=%d", userScale, userOffsetX, userOffsetY, (int)status]);
+            img = [img imageByApplyingTransform:t];
+            [gCIContext render:img toCVPixelBuffer:target bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:nil];
+            status = noErr;
+        } @catch (NSException *e) {
+            VCamDebugLog([NSString stringWithFormat:@"[CIContext render error] %@", e]);
+            if (gTransferSession && gVTPixelTransferSessionTransferImage) {
+                status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
             }
         }
+
+        static NSTimeInterval lastLog = 0;
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (now - lastLog > 1.0) {
+            lastLog = now;
+            VCamDebugLog([NSString stringWithFormat:@"[CIContext render] scale=%.2f offX=%.1f offY=%.1f", scale, userOffsetX, userOffsetY]);
+        }
+    } else if (gTransferSession && gVTPixelTransferSessionTransferImage) {
+        status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
     }
 
     // Software fallback nếu VideoToolbox trả về lỗi mà hai buffer cùng định dạng
