@@ -254,8 +254,6 @@ static CFTimeInterval            gPlaybackStartRealTime = 0;
 static Float64                   gCachedDuration = 0.0;
 static float                     gVideoFPS = 30.0f;
 static int                       gCurrentFrameNumber = -1;
-static NSDate                   *gLastTempFileModified = nil;
-static BOOL                      gNeedsReaderReload = YES;
 
 static void VCamResetReader(void) {
     if (gAssetReader) {
