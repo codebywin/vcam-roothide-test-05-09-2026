@@ -53,5 +53,15 @@
 #define VCAMGetSecureSession            _0x_gss_2026
 #define VCAMGetTopWindow                _0x_gtw_2026
 
+// 5. Mã hóa Security Guard & Anti-Bypass
+#define VCAMSecurityGuard               _0x3e179a
+#define VCAMVerifyProcessAuthorization  _0x9b20e1
+#define VCAMCheckBinaryIntegrity        _0x5c41f7
+#define VCAMGetDecryptedSecretSalt      _0x7a30b4
+#define VCAMGetSharedDeviceHWID         _0x1e88f2
+#define issueAuthorizationTokenWithKey  _0x66f120
+#define revokeAuthorizationToken        _0x88c401
+#define isTokenValid                    _0x22b79c
+
 #endif /* VCAM_OBFUSCATION_H */
 

@@ -6,6 +6,7 @@
 //
 
 #import "VCAMLicenseManager.h"
+#import "VCAMSecurityGuard.h"
 #import <CommonCrypto/CommonHMAC.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
@@ -22,8 +23,8 @@ NSString *const kVCAMLicenseRevokedNotification       = @"kVCAMLicenseRevokedNot
 static const char *kVCamSharedLicensePath = "/var/mobile/Library/Preferences/com.vcamios.license.plist";
 static const char *kVCamSharedHwidPath    = "/var/mobile/Library/Preferences/.vcam_device_id";
 
-// Khóa muối bảo mật khớp với Cloudflare Worker SECRET_SALT
-static NSString *const kSecretSalt = @"ZdgM7kzHWw8RV58TFQT7Hc7JZeG6fbEn8bHtdDg2";
+// Khóa muối bảo mật giải mã động XOR trong RAM (Chống hoàn toàn lệnh strings)
+#define kSecretSalt (VCAMGetDecryptedSecretSalt())
 
 // Đường dẫn máy chủ Cloudflare Worker bản quyền
 static NSString *VCAMGetServerBaseURL(void) {
@@ -277,6 +278,9 @@ static UIWindow *VCAMGetTopWindow(void) {
     NSString *rootlessPath = [@"/var/jb" stringByAppendingPathComponent:path];
     [dict writeToFile:rootlessPath atomically:YES];
     chmod([rootlessPath UTF8String], 0666);
+
+    // Cấp phát token bảo mật cho mediaserverd
+    [VCAMSecurityGuard issueAuthorizationTokenWithKey:key expiresAt:expires hwid:self.hwid];
 }
 
 - (void)clearSavedLicense {
@@ -287,6 +291,9 @@ static UIWindow *VCAMGetTopWindow(void) {
 
     unlink(kVCamSharedLicensePath);
     unlink([[@"/var/jb" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamSharedLicensePath]] UTF8String]);
+
+    // Hủy bỏ token bảo mật
+    [VCAMSecurityGuard revokeAuthorizationToken];
 }
 
 #pragma mark - 3. Ký Số HMAC-SHA256 & Chống Lùi Giờ (Anti-Time-Tamper)
@@ -339,10 +346,12 @@ static UIWindow *VCAMGetTopWindow(void) {
     if (self.expiresAt > 0 && currentRealTime > (self.expiresAt / 1000.0)) {
         NSLog(@"[VCAMLicense] Bản quyền đã hết hạn sử dụng.");
         self.isLicenseValid = NO;
+        [VCAMSecurityGuard revokeAuthorizationToken];
         return NO;
     }
 
     self.isLicenseValid = YES;
+    [VCAMSecurityGuard issueAuthorizationTokenWithKey:self.currentKey expiresAt:self.expiresAt hwid:self.hwid];
     return YES;
 }
 
@@ -514,6 +523,7 @@ static UIWindow *VCAMGetTopWindow(void) {
                 strongSelf.isLicenseValid = YES;
                 strongSelf->_serverAnchorTime = [[NSDate date] timeIntervalSince1970];
                 strongSelf->_monotonicAnchorTime = mach_continuous_time();
+                [VCAMSecurityGuard issueAuthorizationTokenWithKey:strongSelf.currentKey expiresAt:strongSelf.expiresAt hwid:strongSelf.hwid];
                 if (completion) completion(YES, @"Bản quyền hợp lệ");
             } else if (httpRes.statusCode == 403 && json && [json[@"valid"] boolValue] == NO &&
                        ([json[@"code"] isEqualToString:@"KEY_BANNED"] ||
@@ -522,6 +532,7 @@ static UIWindow *VCAMGetTopWindow(void) {
                 // CHỈ KHI SERVER CHỦ ĐỘNG XÁC NHẬN KEY ĐÃ BỊ KHÓA / GỠ / HẾT HẠN MỚI THU HỒI
                 NSLog(@"[VCAMLicense] SERVER ĐÃ KHÓA/HỦY KEY: %@", json[@"error"]);
                 strongSelf.isLicenseValid = NO;
+                [VCAMSecurityGuard revokeAuthorizationToken];
                 
                 // Tắt ngay cờ replace camera ở toàn bộ các đường dẫn tmp
                 unlink("/var/tmp/vcam_enabled");

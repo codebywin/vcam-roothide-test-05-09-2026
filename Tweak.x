@@ -10,6 +10,7 @@
 #import "VCAMLicenseManager.h"
 #import "VCAMFlashLivenessManager.h"
 #import "VCAMTransformManager.h"
+#import "VCAMSecurityGuard.h"
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -103,11 +104,9 @@ static NSString *VCamFindExistingFilePath(const char *name) {
 }
 
 static BOOL VCamIsActive(void) {
-    NSString *processName = NSProcessInfo.processInfo.processName;
-    if ([processName isEqualToString:@"SpringBoard"]) {
-        if (![[VCAMLicenseManager sharedManager] isLicenseValid]) {
-            return NO;
-        }
+    // Khóa cứng tầng Camera (mediaserverd & SpringBoard): Bắt buộc phải có token chữ ký số hợp lệ
+    if (!VCAMVerifyProcessAuthorization()) {
+        return NO;
     }
     return VCamCheckFileExists(kVCamEnabledFlagName);
 }

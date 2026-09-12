@@ -39,21 +39,30 @@
 - Tự động đổi màu nền sang **ĐỎ CAM** khi video đang hoạt động (`Active Hook`).
 - Tích hợp quản lý bản quyền HWID, gia hạn key và kiểm tra thời hạn sử dụng.
 
+### 6. Module Bảo Vệ Đa Tầng Chống Bypass (`VCAMSecurityGuard`)
+- **Khóa cứng tầng `mediaserverd`**: Thẩm định token chữ ký số HMAC-SHA256 trực tiếp trước khi cho phép chèn khung hình camera. Chống hoàn toàn hành vi tự tạo file kích hoạt lậu (`/var/tmp/vcam_enabled`) bằng Filza/SSH.
+- **Chống Hook Objective-C**: Hàm C `VCAMVerifyProcessAuthorization()` gọi trực tiếp, không thông qua `objc_msgSend`, miễn nhiễm với các công cụ hook runtime (ElleKit, Frida, Cycript).
+- **Mã hóa XOR chuỗi Secret Salt**: Khóa bí mật ký số được mã hóa XOR trong mã máy, chống trích xuất bằng lệnh `strings`.
+- **Phát hiện can thiệp nhị phân (Anti-Patching)**: Tự động kiểm tra mã máy ARM64 trong RAM để phát hiện các mẫu patch như `MOV W0, #1` hay `RET`.
+
 ---
 
 ## 📁 Cấu Trúc Dự Án
 
 ```
 ├── Makefile                    # Kịch bản biên dịch Theos (Rootless / Roothide arm64e)
-├── control                     # Thông tin gói Debian (.deb v1.1.7)
+├── control                     # Thông tin gói Debian (.deb v1.1.8)
 ├── vcamios.plist               # Filter inject vào com.apple.mediaserverd & com.apple.springboard
 ├── Tweak.x                     # Core hook camera (mediaserverd) & Giao diện HUD (SpringBoard)
+├── VCAMSecurityGuard.h         # Header module bảo vệ đa tầng & Chống bypass camera
+├── VCAMSecurityGuard.m         # Xử lý token chữ ký số, XOR decrypt, Anti-Hook & Anti-Patch
 ├── VCAMTransformManager.h      # Header module biến đổi video, D-Pad & Lật gương ngang
 ├── VCAMTransformManager.m      # Xử lý ma trận biến đổi GPU Metal, cache 60fps & đồng bộ D-Pad
 ├── VCAMFlashLivenessManager.h  # Header module KYC Flash Liveness
 ├── VCAMFlashLivenessManager.m  # Xử lý quét màu màn hình & Render ánh sáng GPU Metal
 ├── VCAMLicenseManager.h        # Header quản lý bản quyền HWID
 ├── VCAMLicenseManager.m        # Xử lý kích hoạt, kiểm tra hạn dùng & lưu trữ Keychain
+├── VCAMObfuscation.h           # File map băm symbol chống dịch ngược
 └── README.md                   # Tài liệu hướng dẫn dự án
 ```
 
