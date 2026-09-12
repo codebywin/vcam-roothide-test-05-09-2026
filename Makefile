@@ -7,7 +7,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = vcamios
 
 vcamios_FILES      = Tweak.x VCAMLicenseManager.m VCAMFlashLivenessManager.m VCAMTransformManager.m VCAMSecurityGuard.m
-vcamios_CFLAGS     = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable -include VCAMObfuscation.h -fvisibility=hidden -Oz
+vcamios_CFLAGS     = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unused-variable -Wno-macro-redefined -include VCAMObfuscation.h -fvisibility=hidden -Oz
 vcamios_LDFLAGS    = -Wl,-dead_strip
 vcamios_FRAMEWORKS = Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage Security QuartzCore
 

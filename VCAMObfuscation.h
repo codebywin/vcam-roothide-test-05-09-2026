@@ -48,7 +48,6 @@
 #define _menuDisable                    _0x99e341
 
 // 4. Mã hóa các biến tĩnh và hàm C nội bộ
-#define kSecretSalt                     _0x_kss_2026
 #define VCAMGetServerBaseURL            _0x_gsb_2026
 #define VCAMGetSecureSession            _0x_gss_2026
 #define VCAMGetTopWindow                _0x_gtw_2026

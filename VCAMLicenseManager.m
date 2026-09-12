@@ -24,7 +24,9 @@ static const char *kVCamSharedLicensePath = "/var/mobile/Library/Preferences/com
 static const char *kVCamSharedHwidPath    = "/var/mobile/Library/Preferences/.vcam_device_id";
 
 // Khóa muối bảo mật giải mã động XOR trong RAM (Chống hoàn toàn lệnh strings)
-#define kSecretSalt (VCAMGetDecryptedSecretSalt())
+static inline NSString *VCAMSecretSalt(void) {
+    return VCAMGetDecryptedSecretSalt();
+}
 
 // Đường dẫn máy chủ Cloudflare Worker bản quyền
 static NSString *VCAMGetServerBaseURL(void) {
@@ -306,7 +308,7 @@ static UIWindow *VCAMGetTopWindow(void) {
 
     // Kiểm tra chữ ký số toán học
     NSString *payload = [NSString stringWithFormat:@"%@|%@|%.0f", self.currentKey, self.hwid, self.expiresAt];
-    const char *cKey  = [kSecretSalt cStringUsingEncoding:NSUTF8StringEncoding];
+    const char *cKey  = [VCAMSecretSalt() cStringUsingEncoding:NSUTF8StringEncoding];
     const char *cData = [payload cStringUsingEncoding:NSUTF8StringEncoding];
 
     unsigned char cHMAC[CC_SHA256_DIGEST_LENGTH];
@@ -414,7 +416,7 @@ static UIWindow *VCAMGetTopWindow(void) {
     NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
     NSString *tsStr = [NSString stringWithFormat:@"%.0f", nowTs];
     NSString *signRaw = [NSString stringWithFormat:@"%@|%@", [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding], tsStr];
-    const char *cKey  = [kSecretSalt cStringUsingEncoding:NSUTF8StringEncoding];
+    const char *cKey  = [VCAMSecretSalt() cStringUsingEncoding:NSUTF8StringEncoding];
     const char *cData = [signRaw cStringUsingEncoding:NSUTF8StringEncoding];
     unsigned char cHMAC[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, cKey, strlen(cKey), cData, strlen(cData), cHMAC);
@@ -490,7 +492,7 @@ static UIWindow *VCAMGetTopWindow(void) {
     NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
     NSString *tsStr = [NSString stringWithFormat:@"%.0f", nowTs];
     NSString *signRaw = [NSString stringWithFormat:@"%@|%@", [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding], tsStr];
-    const char *cKey  = [kSecretSalt cStringUsingEncoding:NSUTF8StringEncoding];
+    const char *cKey  = [VCAMSecretSalt() cStringUsingEncoding:NSUTF8StringEncoding];
     const char *cData = [signRaw cStringUsingEncoding:NSUTF8StringEncoding];
     unsigned char cHMAC[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, cKey, strlen(cKey), cData, strlen(cData), cHMAC);
