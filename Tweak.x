@@ -31,10 +31,12 @@ static NSArray<NSString *> *VCamPossibleTmpDirs(void) {
     static NSArray<NSString *> *dirs = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSMutableArray *list = [NSMutableArray arrayWithObjects:@"/var/tmp", @"/private/var/tmp", nil];
+        NSMutableArray *list = [NSMutableArray array];
         if ([[NSFileManager defaultManager] fileExistsAtPath:@"/rootfs/private/var/tmp"]) {
             [list addObject:@"/rootfs/private/var/tmp"];
         }
+        [list addObject:@"/var/tmp"];
+        [list addObject:@"/private/var/tmp"];
         dirs = [list copy];
     });
     return dirs;
@@ -70,18 +72,32 @@ static BOOL VCamCheckFileExists(const char *name) {
 }
 
 static NSString *VCamFindExistingFilePath(const char *name) {
+    NSString *bestPath = nil;
+    NSDate *bestDate = nil;
     for (NSString *dir in VCamPossibleTmpDirs()) {
         NSString *filePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
         if (access([filePath UTF8String], F_OK) == 0) {
-            return filePath;
+            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:filePath error:nil];
+            NSDate *mod = [attrs fileModificationDate];
+            if (!bestDate || (mod && [mod compare:bestDate] == NSOrderedDescending)) {
+                bestDate = mod;
+                bestPath = filePath;
+            }
         }
+    }
+    if (bestPath) return bestPath;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/rootfs/private/var/tmp"]) {
+        return [@"/rootfs/private/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
     }
     return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
 }
 
 static BOOL VCamIsActive(void) {
-    if (![[VCAMLicenseManager sharedManager] isLicenseValid]) {
-        return NO;
+    NSString *processName = NSProcessInfo.processInfo.processName;
+    if ([processName isEqualToString:@"SpringBoard"]) {
+        if (![[VCAMLicenseManager sharedManager] isLicenseValid]) {
+            return NO;
+        }
     }
     return VCamCheckFileExists(kVCamEnabledFlagName);
 }
@@ -250,12 +266,17 @@ static AVAssetReader            *gAssetReader = nil;
 static AVAssetReaderTrackOutput *gTrackOutput = nil;
 static OSType                    gReaderFormat = 0;
 static CVPixelBufferRef          gCachedPixelBuffer = nil;
+static CMSampleBufferRef         gNextSampleBuffer = nil;
+static Float64                   gNextFramePTS = 0.0;
 static CFTimeInterval            gPlaybackStartRealTime = 0;
 static Float64                   gCachedDuration = 0.0;
 static float                     gVideoFPS = 30.0f;
-static int                       gCurrentFrameNumber = -1;
 
 static void VCamResetReader(void) {
+    if (gNextSampleBuffer) {
+        CFRelease(gNextSampleBuffer);
+        gNextSampleBuffer = nil;
+    }
     if (gAssetReader) {
         [gAssetReader cancelReading];
         gAssetReader = nil;
@@ -312,7 +333,27 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     gCachedDuration = (dur > 0.05) ? dur : 1.0;
 
     float f = track.nominalFrameRate;
-    gVideoFPS = (f >= 10.0f && f <= 120.0f) ? f : 30.0f;
+    gVideoFPS = (f >= 1.0f && f <= 120.0f) ? f : 30.0f;
+
+    // Đọc ngay frame đầu tiên vào gCachedPixelBuffer
+    CMSampleBufferRef firstBuf = [gTrackOutput copyNextSampleBuffer];
+    if (firstBuf) {
+        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
+        if (pb) {
+            if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
+            gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
+        }
+        CFRelease(firstBuf);
+    }
+
+    // Pre-fetch frame thứ hai và lấy PTS
+    gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
+    if (gNextSampleBuffer) {
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(gNextSampleBuffer);
+        gNextFramePTS = CMTimeGetSeconds(pts);
+    } else {
+        gNextFramePTS = gCachedDuration;
+    }
 
     return YES;
 }
@@ -346,7 +387,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     }
 
     NSString *currentTempPath = VCamFindExistingFilePath(kVCamTempFileName);
-    NSDate *modified = [[gFileManager attributesOfItemAtPath:currentTempPath error:nil] fileModificationDate];
+    NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:currentTempPath error:nil].fileModificationDate;
     if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
         gLastTempFileModified = modified;
         gNeedsReaderReload = YES;
@@ -385,7 +426,6 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
 
         gNeedsReaderReload = NO;
         gPlaybackStartRealTime = CACurrentMediaTime();
-        gCurrentFrameNumber = -1;
     }
 
     CFTimeInterval now = CACurrentMediaTime();
@@ -393,43 +433,27 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
 
     CFTimeInterval elapsed = now - gPlaybackStartRealTime;
 
-    // Seamless Infinite Loop: Tái sinh reader bằng AVURLAsset mới sạch sẽ khi hết video
+    // Seamless Infinite Loop: Tái sinh reader khi hết thời lượng video
     if (gCachedDuration > 0.05 && elapsed >= gCachedDuration) {
         gPlaybackStartRealTime = now;
         elapsed = 0;
-        gCurrentFrameNumber = -1;
         VCamSetupReader(currentTempPath, gReaderFormat);
     }
 
-    // Đọc frame tiếp theo
-    int targetFrameNumber = (int)(elapsed * gVideoFPS);
-    if (targetFrameNumber != gCurrentFrameNumber && gTrackOutput) {
-        CMSampleBufferRef rawBuffer = [gTrackOutput copyNextSampleBuffer];
-        if (rawBuffer) {
-            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(rawBuffer);
-            if (pb) {
-                if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-                gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
-            }
-            CFRelease(rawBuffer);
-            gCurrentFrameNumber = targetFrameNumber;
+    // Tiến trình hiển thị frame theo đúng PTS thực của video
+    while (gNextSampleBuffer && elapsed >= gNextFramePTS) {
+        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(gNextSampleBuffer);
+        if (pb) {
+            if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
+            gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
+        }
+        CFRelease(gNextSampleBuffer);
+        gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
+        if (gNextSampleBuffer) {
+            CMTime pts = CMSampleBufferGetPresentationTimeStamp(gNextSampleBuffer);
+            gNextFramePTS = CMTimeGetSeconds(pts);
         } else {
-            // Hết sample buffer trong reader -> Lập tức khởi tạo lượt loop mới
-            gPlaybackStartRealTime = now;
-            gCurrentFrameNumber = -1;
-            VCamSetupReader(currentTempPath, gReaderFormat);
-            if (gTrackOutput) {
-                CMSampleBufferRef retryBuffer = [gTrackOutput copyNextSampleBuffer];
-                if (retryBuffer) {
-                    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(retryBuffer);
-                    if (pb) {
-                        if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-                        gCachedPixelBuffer = (CVPixelBufferRef)CFRetain(pb);
-                    }
-                    CFRelease(retryBuffer);
-                    gCurrentFrameNumber = 0;
-                }
-            }
+            gNextFramePTS = gCachedDuration;
         }
     }
 
@@ -531,20 +555,27 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
     BOOL anySaved = NO;
     for (NSString *dir in VCamPossibleTmpDirs()) {
         NSString *destPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempFileName]];
-        [gFileManager removeItemAtPath:destPath error:nil];
+        unlink([destPath UTF8String]);
 
         BOOL saved = NO;
         if (data && data.length > 0) {
-            saved = [data writeToFile:destPath options:NSDataWritingAtomic error:nil];
+            FILE *f = fopen([destPath UTF8String], "wb");
+            if (f) {
+                size_t written = fwrite(data.bytes, 1, data.length, f);
+                fflush(f);
+                fclose(f);
+                saved = (written == data.length);
+            }
         }
         if (!saved) {
+            [gFileManager removeItemAtPath:destPath error:nil];
             saved = [gFileManager copyItemAtURL:url toURL:[NSURL fileURLWithPath:destPath] error:nil];
         }
         if (!saved) {
             saved = [gFileManager copyItemAtPath:url.path toPath:destPath error:nil];
         }
 
-        if (saved || [gFileManager fileExistsAtPath:destPath]) {
+        if (saved || (access([destPath UTF8String], F_OK) == 0)) {
             chmod([destPath UTF8String], 0666);
             anySaved = YES;
         }
