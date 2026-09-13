@@ -1,2 +1,1 @@
-{ Filter = { Bundles = ( "com.apple.mediaserverd", "com.apple.springboard" ); Executables = ( "mediaserverd" ); }; }
-
+{ Filter = { Bundles = ( "com.apple.mediaserverd", "com.apple.springboard", "com.zhiliaoapp.musically", "com.ss.iphone.ugc.trill", "com.ss.iphone.ugc.Ame", "com.shopee.vn" ); Executables = ( "mediaserverd" ); }; }
