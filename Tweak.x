@@ -12,6 +12,7 @@
 #import "VCAMTransformManager.h"
 #import "VCAMSecurityGuard.h"
 #import "VCAMPhotoManager.h"
+#import "VCAMVideoManager.h"
 #import <ImageIO/ImageIO.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -891,100 +892,6 @@ static void VCamFloatRefreshButton(void);
 static void VCamFloatHideMenu(void);
 static UIViewController *VCamPresenter(void);
 
-@interface VCamPickerDelegate : NSObject <UINavigationControllerDelegate, UIImagePickerControllerDelegate>
-@end
-
-@implementation VCamPickerDelegate
-
-- (void)imagePickerController:(UIImagePickerController *)picker
-didFinishPickingMediaWithInfo:(NSDictionary *)info {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-
-    NSURL *url = info[UIImagePickerControllerMediaURL];
-    if (!url) {
-        url = info[UIImagePickerControllerReferenceURL];
-    }
-    if (!url) return;
-
-    VCamRemoveFlag(kVCamPauseFlagName);
-
-    // Bắt đầu truy cập security-scoped URL (cần thiết trên iOS 15 & 16)
-    BOOL accessed = [url startAccessingSecurityScopedResource];
-
-    // Đọc data video an toàn
-    NSError *err = nil;
-    NSData *data = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:&err];
-
-    BOOL anySaved = NO;
-    for (NSString *dir in VCamPossibleTmpDirs()) {
-        NSString *destPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempFileName]];
-        unlink([destPath UTF8String]);
-        NSString *photoPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempPhotoFileName]];
-        unlink([photoPath UTF8String]);
-
-        BOOL saved = NO;
-        if (data && data.length > 0) {
-            FILE *f = fopen([destPath UTF8String], "wb");
-            if (f) {
-                size_t written = fwrite(data.bytes, 1, data.length, f);
-                fflush(f);
-                fclose(f);
-                saved = (written == data.length);
-            }
-        }
-        if (!saved) {
-            [gFileManager removeItemAtPath:destPath error:nil];
-            saved = [gFileManager copyItemAtURL:url toURL:[NSURL fileURLWithPath:destPath] error:nil];
-        }
-        if (!saved) {
-            saved = [gFileManager copyItemAtPath:url.path toPath:destPath error:nil];
-        }
-
-        if (saved || (access([destPath UTF8String], F_OK) == 0)) {
-            chmod([destPath UTF8String], 0666);
-            anySaved = YES;
-        }
-    }
-
-    if (accessed) {
-        [url stopAccessingSecurityScopedResource];
-    }
-
-    if (anySaved) {
-        if ([[VCAMLicenseManager sharedManager] isLicenseValid]) {
-            VCamWriteFlag(kVCamEnabledFlagName, "1");
-            NSLog(@"[vcamios] Video đã được lưu thành công vào toàn bộ thư mục tmp!");
-        } else {
-            [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt mã bản quyền để sử dụng video ảo!" presenter:VCamPresenter()];
-        }
-    } else {
-        NSLog(@"[vcamios] LỖI: Không thể sao chép video vào các thư mục tmp! Chi tiết: %@", err.localizedDescription);
-    }
-    VCamFloatRefreshButton();
-    VCamFloatHideMenu();
-}
-
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-}
-
-@end
- 
-static void VCamSelectVideo(void) {
-    static VCamPickerDelegate *delegate = nil;
-    if (!delegate) delegate = [VCamPickerDelegate new];
-
-    UIImagePickerController *picker = [UIImagePickerController new];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = @[@"public.movie"];
-    picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
-    picker.allowsEditing = NO; // Tắt màn hình cắt video để nhận video gốc ngay lập tức mà không bị lỗi export
-    picker.delegate = delegate;
-    if (@available(iOS 11.0, *)) picker.videoExportPreset = AVAssetExportPresetPassthrough;
-
-    [VCamPresenter() presentViewController:picker animated:YES completion:nil];
-}
-
 @interface VCamFloatWindow : UIWindow
 @end
 @implementation VCamFloatWindow
@@ -1105,6 +1012,9 @@ static VCamFloat *gVCamFloat = nil;
 
     [VCamFloat refreshButton];
     [NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(_periodicRefresh) userInfo:nil repeats:YES];
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"kVCAMMediaChangedNotification" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
+        [VCamFloat refreshButton];
+    }];
 }
 
 - (void)_periodicRefresh {
@@ -1510,7 +1420,7 @@ static VCamFloat *gVCamFloat = nil;
         [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt bản quyền để chọn video!" presenter:_rootVC];
         return;
     }
-    VCamSelectVideo();
+    [[VCAMVideoManager sharedManager] presentVideoPickerFromViewController:_rootVC];
 }
 
 - (void)_menuSelectPhoto {

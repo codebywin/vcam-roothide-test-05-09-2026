@@ -16,6 +16,7 @@
 #define VCamFloat                       _0x33b1e7
 #define VCamPickerDelegate              _0x77d20f
 #define VCAMPhotoManager                _0x11e47a
+#define VCAMVideoManager                _0x55c391
 
 // 2. Mã hóa các hàm kiểm tra bản quyền & kích hoạt
 #define isLicenseValid                  _0xa8f102
@@ -49,8 +50,9 @@
 #define _menuTogglePause                _0x88c12a
 #define _menuDisable                    _0x99e341
 
-// 4. Mã hóa hàm mở photo picker & xử lý ảnh
+// 4. Mã hóa hàm mở photo & video picker & xử lý ảnh
 #define presentPhotoPickerFromViewController _0x77c92b
+#define presentVideoPickerFromViewController _0x61a72d
 #define createPixelBufferFromImageFile      _0x41f802
 #define createRotatedPixelBuffer            _0x87e193
 
