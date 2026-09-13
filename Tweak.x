@@ -924,10 +924,35 @@ static OSStatus hook_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlag
         }
 
         AudioStreamBasicDescription asbd;
+        memset(&asbd, 0, sizeof(asbd));
         UInt32 propSize = sizeof(asbd);
-        if (AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &asbd, &propSize) == noErr) {
-            [[VCAMAudioManager sharedManager] fillAudioBufferList:ioData numberOfFrames:inNumberFrames asbd:&asbd];
+        OSStatus propStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &asbd, &propSize);
+        if (propStatus != noErr || asbd.mFormatID != kAudioFormatLinearPCM) {
+            propSize = sizeof(asbd);
+            propStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &asbd, &propSize);
         }
+        if (propStatus != noErr || asbd.mFormatID != kAudioFormatLinearPCM) {
+            asbd.mSampleRate = 48000.0;
+            asbd.mFormatID = kAudioFormatLinearPCM;
+            asbd.mFormatFlags = kAudioFormatFlagsNativeFloatPacked | (ioData->mNumberBuffers > 1 ? kAudioFormatFlagIsNonInterleaved : 0);
+            asbd.mChannelsPerFrame = (ioData->mNumberBuffers > 1) ? ioData->mNumberBuffers : 1;
+            asbd.mBitsPerChannel = 32;
+        }
+
+        static int gAULogCount = 0;
+        if (gAULogCount++ < 15) {
+            FILE *f = fopen("/var/tmp/vcam_audio.log", "a");
+            if (f) {
+                fprintf(f, "[AU] bus=%u frames=%u bufs=%u rate=%.0f ch=%u flags=0x%x bits=%u propErr=%d\n",
+                        (unsigned int)inOutputBusNumber, (unsigned int)inNumberFrames, (unsigned int)ioData->mNumberBuffers,
+                        asbd.mSampleRate, (unsigned int)asbd.mChannelsPerFrame, (unsigned int)asbd.mFormatFlags,
+                        (unsigned int)asbd.mBitsPerChannel, (int)propStatus);
+                fclose(f);
+                chmod("/var/tmp/vcam_audio.log", 0666);
+            }
+        }
+
+        [[VCAMAudioManager sharedManager] fillAudioBufferList:ioData numberOfFrames:inNumberFrames asbd:&asbd];
     }
     return status;
 }
