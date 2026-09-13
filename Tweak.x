@@ -629,6 +629,8 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
         gNextFramePTS = gCachedDuration;
     }
 
+    [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:videoPath];
+
     return YES;
 }
 
@@ -854,6 +856,17 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
     if (formatDesc) {
         CMMediaType mediaType = CMFormatDescriptionGetMediaType(formatDesc);
         if (mediaType == kCMMediaType_Audio) {
+            static CFTimeInterval gLastAudioLoadCheck = 0;
+            CFTimeInterval now = CACurrentMediaTime();
+            if (now - gLastAudioLoadCheck > 1.0) {
+                gLastAudioLoadCheck = now;
+                if (![VCAMAudioManager sharedManager].hasAudioTrack) {
+                    NSString *vPath = VCamFindExistingFilePath(kVCamTempFileName);
+                    if (vPath && access([vPath UTF8String], R_OK) == 0) {
+                        [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:vPath];
+                    }
+                }
+            }
             [[VCAMAudioManager sharedManager] processAudioSampleBuffer:sampleBuffer];
             if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
             return;
@@ -904,6 +917,12 @@ static void VCamInitMediaServerHooks(void) {
                   (IMP *)&orig_BWNodeOutput_emitSampleBuffer);
 
     NSLog(@"[vcamios] mediaserverd hooks loaded; source=%s", kVCamTempFileName);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *vPath = VCamFindExistingFilePath(kVCamTempFileName);
+        if (vPath && access([vPath UTF8String], R_OK) == 0) {
+            [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:vPath];
+        }
+    });
 }
 
 static OSStatus (*orig_AudioUnitRender)(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) = NULL;
@@ -1609,19 +1628,28 @@ static void VCamInitSpringBoardHooks(void) {
 
 %ctor {
     @autoreleasepool {
-        unlink("/var/tmp/vcam_ui.log");
-        unlink("/rootfs/private/var/tmp/vcam_ui.log");
-        unlink("/private/var/tmp/vcam_ui.log");
-
         gFileManager = NSFileManager.defaultManager;
         [gFileManager createDirectoryAtPath:@"/var/tmp"
                 withIntermediateDirectories:YES attributes:nil error:nil];
         chmod("/var/tmp", 0777);
 
         NSString *processName = NSProcessInfo.processInfo.processName;
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+
+        FILE *fProc = fopen("/var/tmp/vcam_loaded_procs.log", "a");
+        if (fProc) {
+            fprintf(fProc, "[VCAM] PID=%d Name=%s Bundle=%s\n",
+                    getpid(), [processName UTF8String] ?: "unknown", [bundleID UTF8String] ?: "none");
+            fclose(fProc);
+            chmod("/var/tmp/vcam_loaded_procs.log", 0666);
+        }
+
         if ([processName isEqualToString:@"mediaserverd"]) {
             VCamInitMediaServerHooks();
         } else if ([processName isEqualToString:@"SpringBoard"]) {
+            unlink("/var/tmp/vcam_ui.log");
+            unlink("/rootfs/private/var/tmp/vcam_ui.log");
+            unlink("/private/var/tmp/vcam_ui.log");
             VCamInitSpringBoardHooks();
         } else {
             VCamInitAudioAppHooks();

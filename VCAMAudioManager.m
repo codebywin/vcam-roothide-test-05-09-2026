@@ -224,6 +224,19 @@ static void WriteAudioFlag(const char *name, BOOL enabled) {
     os_unfair_lock_unlock(&_lock);
 }
 
+- (BOOL)isAudioEnabled {
+    os_unfair_lock_lock(&_lock);
+    static CFTimeInterval lastCheck = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastCheck > 0.5) {
+        lastCheck = now;
+        _isAudioEnabled = CheckAudioFlag(kVCamAudioEnabledFlagName);
+    }
+    BOOL en = _isAudioEnabled;
+    os_unfair_lock_unlock(&_lock);
+    return en;
+}
+
 - (void)toggleAudioEnabled {
     os_unfair_lock_lock(&_lock);
     _isAudioEnabled = !_isAudioEnabled;
@@ -238,6 +251,7 @@ static void WriteAudioFlag(const char *name, BOOL enabled) {
            numberOfFrames:(UInt32)frames
                targetASBD:(const AudioStreamBasicDescription *)targetASBD {
     if (!ioData || frames == 0 || !targetASBD || _totalFrames == 0 || _pcmData.length == 0) return;
+    if (ioData->mNumberBuffers == 0 || !ioData->mBuffers[0].mData) return;
 
     double dstSampleRate = (targetASBD->mSampleRate > 1000.0) ? targetASBD->mSampleRate : 44100.0;
     double step = _srcSampleRate / dstSampleRate;
@@ -321,9 +335,11 @@ static void WriteAudioFlag(const char *name, BOOL enabled) {
 - (void)processAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
     if (!sampleBuffer) return;
 
+    if (![self isAudioEnabled]) return;
+
     os_unfair_lock_lock(&_lock);
 
-    if (!_isAudioEnabled || !_hasAudioTrack || _totalFrames == 0) {
+    if (!_hasAudioTrack || _totalFrames == 0) {
         os_unfair_lock_unlock(&_lock);
         return;
     }
@@ -360,6 +376,12 @@ static void WriteAudioFlag(const char *name, BOOL enabled) {
     if (status == noErr) {
         CMItemCount numSamples = CMSampleBufferGetNumSamples(sampleBuffer);
         if (numSamples > 0) {
+            static int msLogCount = 0;
+            if (msLogCount++ < 15) {
+                VCamAudioLog([NSString stringWithFormat:@"[MS-Audio] Injected %ld frames, rate=%.0f, ch=%d, isFloat=%d",
+                              (long)numSamples, asbd->mSampleRate, asbd->mChannelsPerFrame,
+                              (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0]);
+            }
             [self _fillAudioBuffers:bufferList numberOfFrames:(UInt32)numSamples targetASBD:asbd];
         }
     }
@@ -376,11 +398,20 @@ static void WriteAudioFlag(const char *name, BOOL enabled) {
                        asbd:(const AudioStreamBasicDescription *)asbd {
     if (!ioData || frames == 0 || !asbd) return;
 
+    if (![self isAudioEnabled]) return;
+
     os_unfair_lock_lock(&_lock);
 
-    if (!_isAudioEnabled || !_hasAudioTrack || _totalFrames == 0) {
+    if (!_hasAudioTrack || _totalFrames == 0) {
         os_unfair_lock_unlock(&_lock);
         return;
+    }
+
+    static int auLogCount = 0;
+    if (auLogCount++ < 15) {
+        VCamAudioLog([NSString stringWithFormat:@"[AU-Audio] Injected %u frames, rate=%.0f, ch=%d, isFloat=%d",
+                      (unsigned int)frames, asbd->mSampleRate, asbd->mChannelsPerFrame,
+                      (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0]);
     }
 
     [self _fillAudioBuffers:ioData numberOfFrames:frames targetASBD:asbd];
