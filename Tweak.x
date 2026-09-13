@@ -28,6 +28,7 @@ static const char *kVCamEnabledFlagName   = "vcam_enabled";
 static const char *kVCamPauseFlagName     = "vcam_paused";
 
 
+#ifdef VCAM_DEBUG
 static void VCamDebugLog(NSString *msg) {
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
     FILE *f = fopen("/var/tmp/vcam_ui.log", "a");
@@ -36,6 +37,9 @@ static void VCamDebugLog(NSString *msg) {
         fclose(f);
     }
 }
+#else
+static inline void VCamDebugLog(NSString *msg) {}
+#endif
 
 static NSFileManager *gFileManager = nil;
 static BOOL gNeedsReaderReload = YES;
@@ -1510,6 +1514,10 @@ static void VCamInitSpringBoardHooks(void) {
 
 %ctor {
     @autoreleasepool {
+        unlink("/var/tmp/vcam_ui.log");
+        unlink("/rootfs/private/var/tmp/vcam_ui.log");
+        unlink("/private/var/tmp/vcam_ui.log");
+
         gFileManager = NSFileManager.defaultManager;
         [gFileManager createDirectoryAtPath:@"/var/tmp"
                 withIntermediateDirectories:YES attributes:nil error:nil];

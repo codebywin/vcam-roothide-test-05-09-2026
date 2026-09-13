@@ -9,6 +9,13 @@
 #ifndef VCAM_OBFUSCATION_H
 #define VCAM_OBFUSCATION_H
 
+#import <Foundation/Foundation.h>
+
+// Triệt tiêu hoàn toàn NSLog để xóa sạch 100% dấu vết chuỗi trong binary (Silent Stealth Mode)
+#ifndef VCAM_DEBUG
+#define NSLog(...) ((void)0)
+#endif
+
 // 1. Mã hóa tên các Class
 #define VCAMLicenseManager              _0x8f192b
 #define VCAMSecuritySessionDelegate     _0x4c291a
