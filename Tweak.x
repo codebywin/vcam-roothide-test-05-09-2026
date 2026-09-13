@@ -5,6 +5,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreImage/CoreImage.h>
+#import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import "VCAMLicenseManager.h"
@@ -91,24 +92,30 @@ static BOOL VCamCheckFileExists(const char *name) {
 }
 
 static NSString *VCamFindExistingFilePath(const char *name) {
-    NSString *bestPath = nil;
-    NSDate *bestDate = nil;
+    static NSString *primaryDir = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSString *dir in VCamPossibleTmpDirs()) {
+            if (access([dir UTF8String], W_OK | R_OK) == 0) {
+                primaryDir = dir;
+                break;
+            }
+        }
+        if (!primaryDir) primaryDir = @"/var/tmp";
+    });
+
+    NSString *directPath = [primaryDir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+    if (access([directPath UTF8String], F_OK) == 0) {
+        return directPath;
+    }
+
     for (NSString *dir in VCamPossibleTmpDirs()) {
         NSString *filePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
         if (access([filePath UTF8String], F_OK) == 0) {
-            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:filePath error:nil];
-            NSDate *mod = [attrs fileModificationDate];
-            if (!bestDate || (mod && [mod compare:bestDate] == NSOrderedDescending)) {
-                bestDate = mod;
-                bestPath = filePath;
-            }
+            return filePath;
         }
     }
-    if (bestPath) return bestPath;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/rootfs/private/var/tmp"]) {
-        return [@"/rootfs/private/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
-    }
-    return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+    return directPath;
 }
 
 static BOOL VCamIsActive(void) {
@@ -166,115 +173,47 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     size_t srcH = CVPixelBufferGetHeight(source);
     size_t dstW = CVPixelBufferGetWidth(target);
     size_t dstH = CVPixelBufferGetHeight(target);
-    OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
-    OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
+
     VCAMTransformState transformState = [VCAMTransformManager currentTransformState];
     CGFloat userScale = transformState.scale;
     CGFloat userOffsetX = transformState.offsetX;
     CGFloat userOffsetY = transformState.offsetY;
 
-    // Fast path: scale exactly 1.0, zero offset, not mirror flipped, same format & size
-    if (fabs(userScale - 1.0f) < 0.001f && fabs(userOffsetX) < 0.1f && fabs(userOffsetY) < 0.1f &&
-        !transformState.isFlipped &&
-        gVideoExifOrientation == 1 && srcFmt == dstFmt && srcW == dstW && srcH == dstH) {
-        CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        CVPixelBufferLockBaseAddress(target, 0);
-        size_t planes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
-        for (size_t plane = 0; plane < planes; plane++) {
-            void *srcBase = CVPixelBufferIsPlanar(source)
-                ? CVPixelBufferGetBaseAddressOfPlane(source, plane)
-                : CVPixelBufferGetBaseAddress(source);
-            void *dstBase = CVPixelBufferIsPlanar(target)
-                ? CVPixelBufferGetBaseAddressOfPlane(target, plane)
-                : CVPixelBufferGetBaseAddress(target);
-            size_t srcBPR = CVPixelBufferIsPlanar(source)
-                ? CVPixelBufferGetBytesPerRowOfPlane(source, plane)
-                : CVPixelBufferGetBytesPerRow(source);
-            size_t dstBPR = CVPixelBufferIsPlanar(target)
-                ? CVPixelBufferGetBytesPerRowOfPlane(target, plane)
-                : CVPixelBufferGetBytesPerRow(target);
-            size_t rows = CVPixelBufferIsPlanar(source)
-                ? CVPixelBufferGetHeightOfPlane(source, plane)
-                : srcH;
-            size_t bpr = MIN(srcBPR, dstBPR);
-            for (size_t row = 0; row < rows; row++) {
-                memcpy((uint8_t *)dstBase + row * dstBPR,
-                       (uint8_t *)srcBase + row * srcBPR, bpr);
-            }
-        }
-        CVPixelBufferUnlockBaseAddress(target, 0);
-        CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        os_unfair_lock_unlock(&gTransferLock);
-        return noErr;
-    }
-
-    // Hardware accelerated scaling & format conversion via VideoToolbox
-    // Tự động tái tạo session khi kích thước khung hình hoặc định dạng thay đổi (tránh nghẽn GPU khi xoay)
-    static size_t gLastSrcW = 0, gLastSrcH = 0;
-    static size_t gLastDstW = 0, gLastDstH = 0;
-    static OSType gLastSrcFmt = 0, gLastDstFmt = 0;
-
-    static VTPixelTransferSessionCreateFunc createFunc = NULL;
-    static VTSessionSetPropertyFunc setPropFunc = NULL;
-    static dispatch_once_t gSymbolsOnce;
-    dispatch_once(&gSymbolsOnce, ^{
-        dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
-        createFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
-        gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
-        setPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
-    });
-
-    if (!gTransferSession || srcW != gLastSrcW || srcH != gLastSrcH || dstW != gLastDstW || dstH != gLastDstH || srcFmt != gLastSrcFmt || dstFmt != gLastDstFmt) {
-        if (gTransferSession) {
-            CFRelease(gTransferSession);
-            gTransferSession = NULL;
-        }
-        if (createFunc && gVTPixelTransferSessionTransferImage) {
-            OSStatus err = createFunc(kCFAllocatorDefault, &gTransferSession);
-            if (err == noErr && gTransferSession && setPropFunc) {
-                setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("Normal"));
-            }
-        }
-        gLastSrcW = srcW;
-        gLastSrcH = srcH;
-        gLastDstW = dstW;
-        gLastDstH = dstH;
-        gLastSrcFmt = srcFmt;
-        gLastDstFmt = dstFmt;
-    }
-
-    OSStatus status = -1;
+    // Khởi tạo Metal GPU CIContext một lần duy nhất
     static CIContext *gCIContext = nil;
     static dispatch_once_t gCIOnce;
     dispatch_once(&gCIOnce, ^{
         @try {
-            gCIContext = [CIContext contextWithOptions:@{
-                kCIContextWorkingColorSpace: [NSNull null],
-                kCIContextOutputColorSpace: [NSNull null]
-            }];
-            VCamDebugLog([NSString stringWithFormat:@"[CIContext] GPU context created: %@", gCIContext]);
+            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            if (device) {
+                gCIContext = [CIContext contextWithMTLDevice:device options:@{
+                    kCIContextWorkingColorSpace: [NSNull null],
+                    kCIContextOutputColorSpace: [NSNull null]
+                }];
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal GPU context created: %@", gCIContext]);
+            }
         } @catch (id ex) {
-            VCamDebugLog([NSString stringWithFormat:@"[CIContext] GPU context failed: %@", ex]);
+            VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal init failed: %@", ex]);
         }
         if (!gCIContext) {
             @try {
                 gCIContext = [CIContext contextWithOptions:@{
-                    kCIContextUseSoftwareRenderer: @(YES),
                     kCIContextWorkingColorSpace: [NSNull null],
                     kCIContextOutputColorSpace: [NSNull null]
                 }];
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext] CPU fallback created: %@", gCIContext]);
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Default GPU context created: %@", gCIContext]);
             } @catch (id ex) {
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext] CPU fallback failed: %@", ex]);
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Fallback failed: %@", ex]);
             }
         }
     });
 
     VCAMFlashState flashState = [VCAMFlashLivenessManager currentFlashState];
     BOOL hasFlash = (flashState.active && flashState.intensity > 0.01f);
-    BOOL hasTransform = (transformState.hasTransform || hasFlash);
 
-    if (hasTransform && gCIContext) {
+    OSStatus status = -1;
+
+    if (gCIContext) {
         CGFloat scale = userScale;
         if (scale < 0.4f) scale = 0.4f;
         if (scale > 2.5f) scale = 2.5f;
@@ -288,11 +227,7 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
                     void *base = CVPixelBufferGetBaseAddressOfPlane(target, p);
                     size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(target, p);
                     size_t rows = CVPixelBufferGetHeightOfPlane(target, p);
-                    if (p == 0) {
-                        memset(base, 0, bpr * rows);
-                    } else {
-                        memset(base, 128, bpr * rows);
-                    }
+                    memset(base, (p == 0) ? 0 : 128, bpr * rows);
                 }
             } else {
                 void *base = CVPixelBufferGetBaseAddress(target);
@@ -305,60 +240,75 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
 
         @try {
             CIImage *img = [CIImage imageWithCVPixelBuffer:source];
+
+            // 1. Áp dụng góc xoay bằng GPU (Metal Orientation) - Khử hoàn toàn CPU loop
+            int rot = ((transformState.rotation + 270) % 360 + 360) % 360;
+            int orientation = 1;
+            if (rot == 90)       orientation = 6; // 90 CW
+            else if (rot == 180) orientation = 3; // 180
+            else if (rot == 270) orientation = 8; // 270 CW (90 CCW)
+
+            if (orientation != 1) {
+                img = [img imageByApplyingOrientation:orientation];
+            }
+
+            // 2. Áp dụng thu phóng, lật gương và dịch chuyển D-Pad qua GPU
+            CGSize currentSize = img.extent.size;
             img = [VCAMTransformManager applyTransformToImage:img
-                                                      srcSize:CGSizeMake(srcW, srcH)
+                                                      srcSize:currentSize
                                                       dstSize:CGSizeMake(dstW, dstH)
                                                         state:transformState];
 
-            // 4. Áp dụng hiệu ứng ánh sáng phản quang KYC Flash Liveness
+            // 3. Áp dụng hiệu ứng ánh sáng phản quang KYC Flash Liveness
             if (hasFlash) {
                 img = [VCAMFlashLivenessManager applyFlashLightingToImage:img size:CGSizeMake(dstW, dstH) state:flashState];
             }
 
+            // 4. Render trực tiếp vào target CVPixelBuffer bằng GPU Metal trong 1 pass duy nhất
             [gCIContext render:img toCVPixelBuffer:target bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:nil];
             status = noErr;
         } @catch (NSException *e) {
             VCamDebugLog([NSString stringWithFormat:@"[CIContext render error] %@", e]);
-            if (gTransferSession && gVTPixelTransferSessionTransferImage) {
-                status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
-            }
         }
-
-        static NSTimeInterval lastLog = 0;
-        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-        if (now - lastLog > 1.0) {
-            lastLog = now;
-            if (hasFlash) {
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext+Flash] scale=%.2f offX=%.1f offY=%.1f RGB=(%.2f,%.2f,%.2f) inten=%.2f",
-                              scale, userOffsetX, userOffsetY, flashState.r, flashState.g, flashState.b, flashState.intensity]);
-            } else {
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext render] scale=%.2f offX=%.1f offY=%.1f", scale, userOffsetX, userOffsetY]);
-            }
-        }
-    } else if (gTransferSession && gVTPixelTransferSessionTransferImage) {
-        status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
     }
 
-    // Software fallback nếu VideoToolbox trả về lỗi mà hai buffer cùng định dạng
-    if (status != noErr && srcFmt == dstFmt) {
-        CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        CVPixelBufferLockBaseAddress(target, 0);
-        size_t planes = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetPlaneCount(source) : 1;
-        for (size_t plane = 0; plane < planes; plane++) {
-            void *srcBase = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetBaseAddressOfPlane(source, plane) : CVPixelBufferGetBaseAddress(source);
-            void *dstBase = CVPixelBufferIsPlanar(target) ? CVPixelBufferGetBaseAddressOfPlane(target, plane) : CVPixelBufferGetBaseAddress(target);
-            size_t srcBPR = CVPixelBufferIsPlanar(source) ? CVPixelBufferGetBytesPerRowOfPlane(source, plane) : CVPixelBufferGetBytesPerRow(source);
-            size_t dstBPR = CVPixelBufferIsPlanar(target) ? CVPixelBufferGetBytesPerRowOfPlane(target, plane) : CVPixelBufferGetBytesPerRow(target);
-            size_t rows = MIN(CVPixelBufferIsPlanar(source) ? CVPixelBufferGetHeightOfPlane(source, plane) : srcH,
-                              CVPixelBufferIsPlanar(target) ? CVPixelBufferGetHeightOfPlane(target, plane) : dstH);
-            size_t bpr = MIN(srcBPR, dstBPR);
-            for (size_t r = 0; r < rows; r++) {
-                memcpy((uint8_t *)dstBase + r * dstBPR, (uint8_t *)srcBase + r * srcBPR, bpr);
+    // Fallback VideoToolbox nếu GPU context không sẵn sàng
+    if (status != noErr) {
+        static VTPixelTransferSessionCreateFunc createFunc = NULL;
+        static VTSessionSetPropertyFunc setPropFunc = NULL;
+        static dispatch_once_t gSymbolsOnce;
+        dispatch_once(&gSymbolsOnce, ^{
+            dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+            createFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
+            gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
+            setPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
+        });
+
+        static size_t gLastSrcW = 0, gLastSrcH = 0;
+        static size_t gLastDstW = 0, gLastDstH = 0;
+        OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
+        OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
+        static OSType gLastSrcFmt = 0, gLastDstFmt = 0;
+
+        if (!gTransferSession || srcW != gLastSrcW || srcH != gLastSrcH || dstW != gLastDstW || dstH != gLastDstH || srcFmt != gLastSrcFmt || dstFmt != gLastDstFmt) {
+            if (gTransferSession) {
+                CFRelease(gTransferSession);
+                gTransferSession = NULL;
             }
+            if (createFunc && gVTPixelTransferSessionTransferImage) {
+                OSStatus err = createFunc(kCFAllocatorDefault, &gTransferSession);
+                if (err == noErr && gTransferSession && setPropFunc) {
+                    setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("Normal"));
+                }
+            }
+            gLastSrcW = srcW; gLastSrcH = srcH;
+            gLastDstW = dstW; gLastDstH = dstH;
+            gLastSrcFmt = srcFmt; gLastDstFmt = dstFmt;
         }
-        CVPixelBufferUnlockBaseAddress(target, 0);
-        CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
-        status = noErr;
+
+        if (gTransferSession && gVTPixelTransferSessionTransferImage) {
+            status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
+        }
     }
 
     os_unfair_lock_unlock(&gTransferLock);
@@ -377,163 +327,13 @@ static CFTimeInterval            gPlaybackStartRealTime = 0;
 static Float64                   gCachedDuration = 0.0;
 static float                     gVideoFPS = 30.0f;
 
-static CVPixelBufferRef VCamCreateRotatedPixelBuffer(CVPixelBufferRef src, int rotation) {
-    if (!src) return NULL;
-    int rot = ((rotation % 360) + 360) % 360;
-
-    size_t srcW = CVPixelBufferGetWidth(src);
-    size_t srcH = CVPixelBufferGetHeight(src);
-    size_t dstW = (rot == 90 || rot == 270) ? srcH : srcW;
-    size_t dstH = (rot == 90 || rot == 270) ? srcW : srcH;
-    OSType fmt = CVPixelBufferGetPixelFormatType(src);
-
-    NSDictionary *options = @{
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
-    };
-    CVPixelBufferRef dst = NULL;
-    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, fmt,
-                                          (__bridge CFDictionaryRef)options, &dst);
-    if (status != kCVReturnSuccess || !dst) {
-        CFRetain(src);
-        return src;
-    }
-
-    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-    CVPixelBufferLockBaseAddress(dst, 0);
-
-    if (rot == 0) {
-        // Sao chép trực tiếp từng plane sang IOSurface buffer độc lập (tránh phụ thuộc buffer pool của AVAssetReader)
-        size_t planes = CVPixelBufferIsPlanar(src) ? CVPixelBufferGetPlaneCount(src) : 1;
-        for (size_t plane = 0; plane < planes; plane++) {
-            void *srcBase = CVPixelBufferIsPlanar(src)
-                ? CVPixelBufferGetBaseAddressOfPlane(src, plane)
-                : CVPixelBufferGetBaseAddress(src);
-            void *dstBase = CVPixelBufferIsPlanar(dst)
-                ? CVPixelBufferGetBaseAddressOfPlane(dst, plane)
-                : CVPixelBufferGetBaseAddress(dst);
-            size_t srcBPR = CVPixelBufferIsPlanar(src)
-                ? CVPixelBufferGetBytesPerRowOfPlane(src, plane)
-                : CVPixelBufferGetBytesPerRow(src);
-            size_t dstBPR = CVPixelBufferIsPlanar(dst)
-                ? CVPixelBufferGetBytesPerRowOfPlane(dst, plane)
-                : CVPixelBufferGetBytesPerRow(dst);
-            size_t rows = CVPixelBufferIsPlanar(src)
-                ? CVPixelBufferGetHeightOfPlane(src, plane)
-                : srcH;
-            size_t bpr = MIN(srcBPR, dstBPR);
-            for (size_t row = 0; row < rows; row++) {
-                memcpy((uint8_t *)dstBase + row * dstBPR,
-                       (uint8_t *)srcBase + row * srcBPR, bpr);
-            }
-        }
-    } else if (CVPixelBufferIsPlanar(src) && CVPixelBufferGetPlaneCount(src) >= 2) {
-        uint8_t *srcY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 0);
-        uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0);
-        size_t srcYBPR = CVPixelBufferGetBytesPerRowOfPlane(src, 0);
-        size_t dstYBPR = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
-
-        uint8_t *srcUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1);
-        uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
-        size_t srcUVBPR = CVPixelBufferGetBytesPerRowOfPlane(src, 1);
-        size_t dstUVBPR = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
-        size_t srcUVW = srcW / 2;
-        size_t srcUVH = srcH / 2;
-        size_t dstUVW = dstW / 2;
-        size_t dstUVH = dstH / 2;
-
-        if (rot == 90) {
-            for (size_t dy = 0; dy < dstH; dy++) {
-                uint8_t *dRow = dstY + dy * dstYBPR;
-                size_t sx = dy;
-                for (size_t dx = 0; dx < dstW; dx++) {
-                    size_t sy = srcH - 1 - dx;
-                    dRow[dx] = srcY[sy * srcYBPR + sx];
-                }
-            }
-            for (size_t dy = 0; dy < dstUVH; dy++) {
-                uint16_t *dRow = (uint16_t *)(dstUV + dy * dstUVBPR);
-                size_t sx = dy;
-                for (size_t dx = 0; dx < dstUVW; dx++) {
-                    size_t sy = srcUVH - 1 - dx;
-                    dRow[dx] = ((uint16_t *)(srcUV + sy * srcUVBPR))[sx];
-                }
-            }
-        } else if (rot == 180) {
-            for (size_t dy = 0; dy < dstH; dy++) {
-                uint8_t *dRow = dstY + dy * dstYBPR;
-                size_t sy = srcH - 1 - dy;
-                for (size_t dx = 0; dx < dstW; dx++) {
-                    dRow[dx] = srcY[sy * srcYBPR + (srcW - 1 - dx)];
-                }
-            }
-            for (size_t dy = 0; dy < dstUVH; dy++) {
-                uint16_t *dRow = (uint16_t *)(dstUV + dy * dstUVBPR);
-                size_t sy = srcUVH - 1 - dy;
-                for (size_t dx = 0; dx < dstUVW; dx++) {
-                    dRow[dx] = ((uint16_t *)(srcUV + sy * srcUVBPR))[srcUVW - 1 - dx];
-                }
-            }
-        } else if (rot == 270) {
-            for (size_t dy = 0; dy < dstH; dy++) {
-                uint8_t *dRow = dstY + dy * dstYBPR;
-                for (size_t dx = 0; dx < dstW; dx++) {
-                    size_t sy = dx;
-                    size_t sx = srcW - 1 - dy;
-                    dRow[dx] = srcY[sy * srcYBPR + sx];
-                }
-            }
-            for (size_t dy = 0; dy < dstUVH; dy++) {
-                uint16_t *dRow = (uint16_t *)(dstUV + dy * dstUVBPR);
-                for (size_t dx = 0; dx < dstUVW; dx++) {
-                    size_t sy = dx;
-                    size_t sx = srcUVW - 1 - dy;
-                    dRow[dx] = ((uint16_t *)(srcUV + sy * srcUVBPR))[sx];
-                }
-            }
-        }
-    } else {
-        uint8_t *srcBase = (uint8_t *)CVPixelBufferGetBaseAddress(src);
-        uint8_t *dstBase = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
-        size_t srcBPR = CVPixelBufferGetBytesPerRow(src);
-        size_t dstBPR = CVPixelBufferGetBytesPerRow(dst);
-
-        if (rot == 90) {
-            for (size_t dy = 0; dy < dstH; dy++) {
-                uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
-                size_t sx = dy;
-                for (size_t dx = 0; dx < dstW; dx++) {
-                    size_t sy = srcH - 1 - dx;
-                    dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[sx];
-                }
-            }
-        } else if (rot == 180) {
-            for (size_t dy = 0; dy < dstH; dy++) {
-                uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
-                size_t sy = srcH - 1 - dy;
-                for (size_t dx = 0; dx < dstW; dx++) {
-                    dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[srcW - 1 - dx];
-                }
-            }
-        } else if (rot == 270) {
-            for (size_t dy = 0; dy < dstH; dy++) {
-                uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
-                for (size_t dx = 0; dx < dstW; dx++) {
-                    size_t sy = dx;
-                    size_t sx = srcW - 1 - dy;
-                    dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[sx];
-                }
-            }
-        }
-    }
-
-    CVPixelBufferUnlockBaseAddress(dst, 0);
-    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-    return dst;
-}
-
 static CVPixelBufferRef gRawPhotoBuffer = NULL;
 
 static void VCamResetReader(void) {
+    if (gCachedPixelBuffer) {
+        CFRelease(gCachedPixelBuffer);
+        gCachedPixelBuffer = NULL;
+    }
     if (gRawPhotoBuffer) {
         CFRelease(gRawPhotoBuffer);
         gRawPhotoBuffer = NULL;
@@ -603,14 +403,14 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     float f = track.nominalFrameRate;
     gVideoFPS = (f >= 1.0f && f <= 120.0f) ? f : 30.0f;
 
-    // Đọc ngay frame đầu tiên vào gCachedPixelBuffer
+    // Đọc ngay frame đầu tiên vào gCachedPixelBuffer (Zero-copy retain)
     CMSampleBufferRef firstBuf = [gTrackOutput copyNextSampleBuffer];
     if (firstBuf) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
         if (pb) {
-            int rot = (VCamGetRotation() + 270) % 360;
+            CFRetain(pb);
             if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-            gCachedPixelBuffer = VCamCreateRotatedPixelBuffer(pb, rot);
+            gCachedPixelBuffer = pb;
         }
         CFRelease(firstBuf);
     }
@@ -627,8 +427,8 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     return YES;
 }
 
-static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuffer) {
-    if (!originSampleBuffer) return nil;
+static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampleBuffer) {
+    if (!originSampleBuffer) return NULL;
 
     CFTimeInterval now = CACurrentMediaTime();
 
@@ -650,30 +450,16 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         }
     }
 
-    if (!gCachedActive) return nil;
+    if (!gCachedActive) return NULL;
 
     CMFormatDescriptionRef originFormat = CMSampleBufferGetFormatDescription(originSampleBuffer);
-    if (!originFormat || CMFormatDescriptionGetMediaType(originFormat) != kCMMediaType_Video) return nil;
+    if (!originFormat || CMFormatDescriptionGetMediaType(originFormat) != kCMMediaType_Video) return NULL;
 
     OSType originSubtype = CMFormatDescriptionGetMediaSubType(originFormat);
-    CMTime originPTS = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer);
 
     // ── Xử lý tính năng Tạm dừng (Pause / Freeze Frame) ──
     if (gCachedPaused && gCachedPixelBuffer) {
-        CMSampleTimingInfo timing = {
-            .duration               = CMSampleBufferGetDuration(originSampleBuffer),
-            .presentationTimeStamp  = originPTS,
-            .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
-        };
-        CMVideoFormatDescriptionRef fakeFormat = nil;
-        CMSampleBufferRef fakeBuffer = nil;
-        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, &fakeFormat);
-        if (fakeFormat) {
-            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, true,
-                                               nil, nil, fakeFormat, &timing, &fakeBuffer);
-            CFRelease(fakeFormat);
-        }
-        return fakeBuffer;
+        return gCachedPixelBuffer;
     }
 
     // Throttled file check (quét file mới nhất mỗi 0.5s)
@@ -738,28 +524,13 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
                 gCachedPixelBuffer = NULL;
             }
             if (gRawPhotoBuffer) {
-                int rot = (VCamGetRotation() + 270) % 360;
-                gCachedPixelBuffer = [VCAMPhotoManager createRotatedPixelBuffer:gRawPhotoBuffer rotation:rot];
+                CFRetain(gRawPhotoBuffer);
+                gCachedPixelBuffer = gRawPhotoBuffer;
             }
             gNeedsReaderReload = NO;
         }
 
-        if (!gCachedPixelBuffer) return nil;
-
-        CMSampleTimingInfo timing = {
-            .duration               = CMSampleBufferGetDuration(originSampleBuffer),
-            .presentationTimeStamp  = originPTS,
-            .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
-        };
-        CMVideoFormatDescriptionRef fakeFormat = nil;
-        CMSampleBufferRef fakeBuffer = nil;
-        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, &fakeFormat);
-        if (fakeFormat) {
-            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, true,
-                                               nil, nil, fakeFormat, &timing, &fakeBuffer);
-            CFRelease(fakeFormat);
-        }
-        return fakeBuffer;
+        return gCachedPixelBuffer;
     }
 
     // Khởi tạo hoặc tải lại reader nếu cần
@@ -767,23 +538,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         BOOL ok = VCamSetupReader(gActiveTempPath, originSubtype);
         if (!ok) {
             gNeedsReaderReload = YES;
-            if (gCachedPixelBuffer) {
-                CMSampleTimingInfo timing = {
-                    .duration               = CMSampleBufferGetDuration(originSampleBuffer),
-                    .presentationTimeStamp  = originPTS,
-                    .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
-                };
-                CMVideoFormatDescriptionRef fakeFormat = nil;
-                CMSampleBufferRef fakeBuffer = nil;
-                CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, &fakeFormat);
-                if (fakeFormat) {
-                    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, true,
-                                                       nil, nil, fakeFormat, &timing, &fakeBuffer);
-                    CFRelease(fakeFormat);
-                }
-                return fakeBuffer;
-            }
-            return nil;
+            return gCachedPixelBuffer;
         }
 
         gNeedsReaderReload = NO;
@@ -800,14 +555,13 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         VCamSetupReader(gActiveTempPath, gReaderFormat);
     }
 
-    // Tiến trình hiển thị frame theo đúng PTS thực của video
+    // Tiến trình hiển thị frame theo đúng PTS thực của video (Zero-copy retain)
     while (gNextSampleBuffer && elapsed >= gNextFramePTS) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(gNextSampleBuffer);
         if (pb) {
-            int rot = (VCamGetRotation() + 270) % 360;
-            CVPixelBufferRef rotPb = VCamCreateRotatedPixelBuffer(pb, rot);
+            CFRetain(pb);
             if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-            gCachedPixelBuffer = rotPb;
+            gCachedPixelBuffer = pb;
         }
         CFRelease(gNextSampleBuffer);
         gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
@@ -819,22 +573,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         }
     }
 
-    if (!gCachedPixelBuffer) return nil;
-
-    CMSampleTimingInfo timing = {
-        .duration               = CMSampleBufferGetDuration(originSampleBuffer),
-        .presentationTimeStamp  = originPTS,
-        .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
-    };
-    CMVideoFormatDescriptionRef fakeFormat = nil;
-    CMSampleBufferRef fakeBuffer = nil;
-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, &fakeFormat);
-    if (fakeFormat) {
-        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, true,
-                                           nil, nil, fakeFormat, &timing, &fakeBuffer);
-        CFRelease(fakeFormat);
-    }
-    return fakeBuffer;
+    return gCachedPixelBuffer;
 }
 
 static void (*orig_BWNodeOutput_emitSampleBuffer)(id, SEL, CMSampleBufferRef) = NULL;
@@ -857,16 +596,12 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         return;
     }
 
-    CMSampleBufferRef fakeBuffer = VCamCopyFrameMatching(sampleBuffer);
-    if (fakeBuffer) {
-        CVPixelBufferRef srcPb = CMSampleBufferGetImageBuffer(fakeBuffer);
-        if (srcPb) {
-            OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
-            if (err == noErr) {
-                CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
-            }
+    CVPixelBufferRef srcPb = VCamGetPixelBufferMatching(sampleBuffer);
+    if (srcPb) {
+        OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
+        if (err == noErr) {
+            CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
         }
-        CFRelease(fakeBuffer);
     }
 
     if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);

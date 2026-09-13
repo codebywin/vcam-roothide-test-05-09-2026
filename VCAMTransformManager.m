@@ -76,24 +76,30 @@ static BOOL CheckTmpFlagExists(const char *name) {
 }
 
 static NSString *FindTmpFilePath(const char *name) {
-    NSString *bestPath = nil;
-    NSDate *bestDate = nil;
+    static NSString *primaryDir = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSString *dir in PossibleTmpDirs()) {
+            if (access([dir UTF8String], W_OK | R_OK) == 0) {
+                primaryDir = dir;
+                break;
+            }
+        }
+        if (!primaryDir) primaryDir = @"/var/tmp";
+    });
+
+    NSString *directPath = [primaryDir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+    if (access([directPath UTF8String], F_OK) == 0) {
+        return directPath;
+    }
+
     for (NSString *dir in PossibleTmpDirs()) {
         NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
         if (access([path UTF8String], F_OK) == 0) {
-            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-            NSDate *mod = [attrs fileModificationDate];
-            if (!bestDate || (mod && [mod compare:bestDate] == NSOrderedDescending)) {
-                bestDate = mod;
-                bestPath = path;
-            }
+            return path;
         }
     }
-    if (bestPath) return bestPath;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/rootfs/private/var/tmp"]) {
-        return [@"/rootfs/private/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
-    }
-    return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
+    return directPath;
 }
 
 #pragma mark - Scale / Zoom
@@ -259,7 +265,7 @@ static NSString *FindTmpFilePath(const char *name) {
     static VCAMTransformState cachedState = {1.0f, 0.0f, 0.0f, 0, NO, NO};
     static NSTimeInterval lastRead = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - lastRead < 0.06) { // Cache 60ms de giam I/O trong render loop mediaserverd
+    if (now - lastRead < 0.15) { // Cache 150ms để giảm tải I/O trong render loop mediaserverd
         return cachedState;
     }
     lastRead = now;
