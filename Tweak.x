@@ -526,7 +526,13 @@ static CVPixelBufferRef VCamCreateRotatedPixelBuffer(CVPixelBufferRef src, int r
     return dst;
 }
 
+static CVPixelBufferRef gRawPhotoBuffer = NULL;
+
 static void VCamResetReader(void) {
+    if (gRawPhotoBuffer) {
+        CFRelease(gRawPhotoBuffer);
+        gRawPhotoBuffer = NULL;
+    }
     if (gNextSampleBuffer) {
         CFRelease(gNextSampleBuffer);
         gNextSampleBuffer = nil;
@@ -538,60 +544,6 @@ static void VCamResetReader(void) {
     gTrackOutput = nil;
     gVideoTrack = nil;
     gAsset = nil;
-}
-
-static CVPixelBufferRef VCamCreatePixelBufferFromImageFile(NSString *path) {
-    if (!path || access([path UTF8String], R_OK) != 0) return NULL;
-
-    NSURL *url = [NSURL fileURLWithPath:path];
-    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
-    if (!src) return NULL;
-
-    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-    CFRelease(src);
-    if (!cgImage) return NULL;
-
-    size_t width = CGImageGetWidth(cgImage);
-    size_t height = CGImageGetHeight(cgImage);
-    if (width == 0 || height == 0) {
-        CGImageRelease(cgImage);
-        return NULL;
-    }
-
-    if (width % 2 != 0) width--;
-    if (height % 2 != 0) height--;
-
-    NSDictionary *options = @{
-        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
-    };
-    CVPixelBufferRef pxbuffer = NULL;
-    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                          kCVPixelFormatType_32BGRA,
-                                          (__bridge CFDictionaryRef)options,
-                                          &pxbuffer);
-    if (status != kCVReturnSuccess || !pxbuffer) {
-        CGImageRelease(cgImage);
-        return NULL;
-    }
-
-    CVPixelBufferLockBaseAddress(pxbuffer, 0);
-    void *pxdata = CVPixelBufferGetBaseAddress(pxbuffer);
-    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
-    CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef context = CGBitmapContextCreate(pxdata, width, height, 8, bytesPerRow,
-                                                 rgbColorSpace,
-                                                 kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
-    CGColorSpaceRelease(rgbColorSpace);
-
-    if (context) {
-        CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
-        CGContextRelease(context);
-    }
-    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
-    CGImageRelease(cgImage);
-    return pxbuffer;
 }
 
 static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
@@ -742,15 +694,27 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
             gActiveTempPath = found;
             gIsPhotoMode = isPhoto;
             gNeedsReaderReload = YES;
+            if (gRawPhotoBuffer) {
+                CFRelease(gRawPhotoBuffer);
+                gRawPhotoBuffer = NULL;
+            }
+            if (gCachedPixelBuffer) {
+                CFRelease(gCachedPixelBuffer);
+                gCachedPixelBuffer = NULL;
+            }
         }
         if (gActiveTempPath) {
             NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:gActiveTempPath error:nil].fileModificationDate;
             if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
                 gLastTempFileModified = modified;
                 gNeedsReaderReload = YES;
+                if (gRawPhotoBuffer) {
+                    CFRelease(gRawPhotoBuffer);
+                    gRawPhotoBuffer = NULL;
+                }
                 if (gCachedPixelBuffer) {
                     CFRelease(gCachedPixelBuffer);
-                    gCachedPixelBuffer = nil;
+                    gCachedPixelBuffer = NULL;
                 }
             }
         }
@@ -761,11 +725,17 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     // ── NẠP ẢNH TĨNH (PHOTO MODE) ──
     if (gIsPhotoMode) {
         if (gNeedsReaderReload || !gCachedPixelBuffer) {
+            if (!gRawPhotoBuffer && gActiveTempPath) {
+                gRawPhotoBuffer = [VCAMPhotoManager createPixelBufferFromImageFile:gActiveTempPath];
+            }
             if (gCachedPixelBuffer) {
                 CFRelease(gCachedPixelBuffer);
-                gCachedPixelBuffer = nil;
+                gCachedPixelBuffer = NULL;
             }
-            gCachedPixelBuffer = VCamCreatePixelBufferFromImageFile(gActiveTempPath);
+            if (gRawPhotoBuffer) {
+                int rot = (VCamGetRotation() + 270) % 360;
+                gCachedPixelBuffer = [VCAMPhotoManager createRotatedPixelBuffer:gRawPhotoBuffer rotation:rot];
+            }
             gNeedsReaderReload = NO;
         }
 

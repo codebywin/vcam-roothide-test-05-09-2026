@@ -49,8 +49,10 @@
 #define _menuTogglePause                _0x88c12a
 #define _menuDisable                    _0x99e341
 
-// 4. Mã hóa hàm mở photo picker
+// 4. Mã hóa hàm mở photo picker & xử lý ảnh
 #define presentPhotoPickerFromViewController _0x77c92b
+#define createPixelBufferFromImageFile      _0x41f802
+#define createRotatedPixelBuffer            _0x87e193
 
 // 4. Mã hóa các biến tĩnh và hàm C nội bộ
 #define VCAMGetServerBaseURL            _0x_gsb_2026

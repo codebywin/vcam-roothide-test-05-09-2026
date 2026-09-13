@@ -5,6 +5,8 @@
 
 #import "VCAMPhotoManager.h"
 #import "VCAMLicenseManager.h"
+#import "VCAMTransformManager.h"
+#import <ImageIO/ImageIO.h>
 #import <sys/stat.h>
 #import <unistd.h>
 
@@ -102,14 +104,18 @@ static UIImage *NormalizeImageOrientation(UIImage *img) {
         return;
     }
 
-    // Lưu vào toàn bộ các thư mục tmp
+    // 1. Reset góc xoay về 0° mặc định và lật gương về NO theo yêu cầu của user
+    [[VCAMTransformManager sharedManager] setRotation:0];
+    [[VCAMTransformManager sharedManager] setMirrorFlipped:NO];
+
+    // 2. Lưu vào toàn bộ các thư mục tmp
     BOOL savedAny = NO;
     for (NSString *dir in PossibleTmpDirs()) {
-        // 1. Xóa video cũ để ưu tiên ảnh tĩnh
+        // Xóa video cũ để ưu tiên ảnh tĩnh
         NSString *movPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempFileName]];
         unlink([movPath UTF8String]);
 
-        // 2. Ghi file ảnh tĩnh
+        // Ghi file ảnh tĩnh
         NSString *photoPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempPhotoFileName]];
         unlink([photoPath UTF8String]);
         BOOL ok = [jpegData writeToFile:photoPath atomically:YES];
@@ -118,19 +124,19 @@ static UIImage *NormalizeImageOrientation(UIImage *img) {
             savedAny = YES;
         }
 
-        // 3. Bật cờ enabled
+        // Bật cờ enabled
         NSString *enPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamEnabledFlagName]];
         [@"1" writeToFile:enPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         chmod([enPath UTF8String], 0666);
 
-        // 4. Tắt cờ paused
+        // Tắt cờ paused
         NSString *pausePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamPauseFlagName]];
         unlink([pausePath UTF8String]);
     }
 
     if (savedAny) {
-        NSLog(@"[VCAMPhoto] Đã lưu ảnh thành công vào tmp (size: %lu bytes)", (unsigned long)jpegData.length);
-        [self _showToast:@"🖼️ Đã chọn ảnh thành công!" inView:_currentPresenter.view];
+        NSLog(@"[VCAMPhoto] Đã lưu ảnh thành công vào tmp (size: %lu bytes), rotation reset về 0°", (unsigned long)jpegData.length);
+        [self _showToast:@"🖼️ Đã chọn ảnh (0° dọc)!" inView:_currentPresenter.view];
         [[NSNotificationCenter defaultCenter] postNotificationName:@"kVCAMMediaChangedNotification" object:nil];
     } else {
         [self _showToast:@"❌ Lỗi ghi file ảnh vào tmp!" inView:_currentPresenter.view];
@@ -141,10 +147,137 @@ static UIImage *NormalizeImageOrientation(UIImage *img) {
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
 
+#pragma mark - Pixel Buffer & Rotation Engine
+
++ (CVPixelBufferRef)createPixelBufferFromImageFile:(NSString *)path {
+    if (!path || access([path UTF8String], R_OK) != 0) return NULL;
+
+    NSURL *url = [NSURL fileURLWithPath:path];
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (!src) return NULL;
+
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!cgImage) return NULL;
+
+    size_t width = CGImageGetWidth(cgImage);
+    size_t height = CGImageGetHeight(cgImage);
+    if (width == 0 || height == 0) {
+        CGImageRelease(cgImage);
+        return NULL;
+    }
+
+    if (width % 2 != 0) width--;
+    if (height % 2 != 0) height--;
+
+    NSDictionary *options = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVPixelBufferRef pxbuffer = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                          kCVPixelFormatType_32BGRA,
+                                          (__bridge CFDictionaryRef)options,
+                                          &pxbuffer);
+    if (status != kCVReturnSuccess || !pxbuffer) {
+        CGImageRelease(cgImage);
+        return NULL;
+    }
+
+    CVPixelBufferLockBaseAddress(pxbuffer, 0);
+    void *pxdata = CVPixelBufferGetBaseAddress(pxbuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
+    CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pxdata, width, height, 8, bytesPerRow,
+                                                 rgbColorSpace,
+                                                 kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(rgbColorSpace);
+
+    if (context) {
+        CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
+        CGContextRelease(context);
+    }
+    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
+    CGImageRelease(cgImage);
+    return pxbuffer;
+}
+
++ (CVPixelBufferRef)createRotatedPixelBuffer:(CVPixelBufferRef)src rotation:(int)rotation {
+    if (!src) return NULL;
+    int rot = ((rotation % 360) + 360) % 360;
+
+    size_t srcW = CVPixelBufferGetWidth(src);
+    size_t srcH = CVPixelBufferGetHeight(src);
+    size_t dstW = (rot == 90 || rot == 270) ? srcH : srcW;
+    size_t dstH = (rot == 90 || rot == 270) ? srcW : srcH;
+    OSType fmt = CVPixelBufferGetPixelFormatType(src);
+
+    NSDictionary *options = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVPixelBufferRef dst = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, fmt,
+                                          (__bridge CFDictionaryRef)options, &dst);
+    if (status != kCVReturnSuccess || !dst) {
+        CFRetain(src);
+        return src;
+    }
+
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+
+    uint8_t *srcBase = (uint8_t *)CVPixelBufferGetBaseAddress(src);
+    uint8_t *dstBase = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+    size_t srcBPR = CVPixelBufferGetBytesPerRow(src);
+    size_t dstBPR = CVPixelBufferGetBytesPerRow(dst);
+
+    if (rot == 0) {
+        size_t bpr = MIN(srcBPR, dstBPR);
+        for (size_t y = 0; y < srcH; y++) {
+            memcpy(dstBase + y * dstBPR, srcBase + y * srcBPR, bpr);
+        }
+    } else if (rot == 90) {
+        for (size_t dy = 0; dy < dstH; dy++) {
+            uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
+            size_t sx = dy;
+            for (size_t dx = 0; dx < dstW; dx++) {
+                size_t sy = srcH - 1 - dx;
+                dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[sx];
+            }
+        }
+    } else if (rot == 180) {
+        for (size_t dy = 0; dy < dstH; dy++) {
+            uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
+            size_t sy = srcH - 1 - dy;
+            for (size_t dx = 0; dx < dstW; dx++) {
+                dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[srcW - 1 - dx];
+            }
+        }
+    } else if (rot == 270) {
+        for (size_t dy = 0; dy < dstH; dy++) {
+            uint32_t *dRow = (uint32_t *)(dstBase + dy * dstBPR);
+            for (size_t dx = 0; dx < dstW; dx++) {
+                size_t sy = dx;
+                size_t sx = srcW - 1 - dy;
+                dRow[dx] = ((uint32_t *)(srcBase + sy * srcBPR))[sx];
+            }
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return dst;
+}
+
+#pragma mark - Toast
+
 - (void)_showToast:(NSString *)msg inView:(UIView *)view {
     if (!view) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 190, 40)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 200, 40)];
         lbl.center = CGPointMake(view.bounds.size.width / 2, view.bounds.size.height * 0.35);
         lbl.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.85];
         lbl.textColor = [UIColor whiteColor];
