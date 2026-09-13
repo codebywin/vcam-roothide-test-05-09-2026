@@ -5,6 +5,8 @@
 
 #import "VCAMAudioManager.h"
 #import <os/lock.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static const char *kVCamAudioEnabledFlagName = "vcam_audio_enabled";
 
@@ -378,7 +380,7 @@ static OSStatus VCAMAudioConverterInputDataProc(AudioConverterRef inAudioConvert
         sizeof(bufferList),
         kCFAllocatorDefault,
         kCFAllocatorDefault,
-        kCMSampleBufferFlag_AudioBufferList_AssureCrossBufferContiguity,
+        0,
         &blockBuffer
     );
 
@@ -414,3 +416,4 @@ static OSStatus VCAMAudioConverterInputDataProc(AudioConverterRef inAudioConvert
 }
 
 @end
+
