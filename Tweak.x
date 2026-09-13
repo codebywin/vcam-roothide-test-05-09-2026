@@ -534,7 +534,6 @@ static CVPixelBufferRef VCamCreateRotatedPixelBuffer(CVPixelBufferRef src, int r
 static CVPixelBufferRef gRawPhotoBuffer = NULL;
 
 static void VCamResetReader(void) {
-    [[VCAMAudioManager sharedManager] reset];
     if (gRawPhotoBuffer) {
         CFRelease(gRawPhotoBuffer);
         gRawPhotoBuffer = NULL;
@@ -556,8 +555,6 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     VCamResetReader();
 
     if (!videoPath || access([videoPath UTF8String], F_OK) != 0) return NO;
-
-    [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:videoPath];
 
     NSURL *url = [NSURL fileURLWithPath:videoPath];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
