@@ -1,0 +1,51 @@
+name: Build HideDeveloperMode (com.hid.dev)
+
+on:
+  push:
+    paths:
+      - 'com.hid.dev/**'
+      - '.github/workflows/build-hide-dev.yml'
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install ldid dpkg
+
+      - name: Setup RootHide Theos & iOS SDKs
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git $HOME/theos
+          curl -fsSL https://github.com/theos/sdks/archive/master.zip -o sdks.zip
+          unzip -q sdks.zip
+          mv sdks-master/*.sdk $HOME/theos/sdks/
+          rm -rf sdks.zip sdks-master
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Build Roothide deb
+        working-directory: com.hid.dev
+        run: |
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+
+      - name: Build Rootless deb
+        working-directory: com.hid.dev
+        run: |
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hide-dev-packages
+          path: com.hid.dev/packages/*.deb
+          if-no-files-found: error
