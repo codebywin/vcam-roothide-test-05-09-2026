@@ -13,8 +13,6 @@
 #import "VCAMSecurityGuard.h"
 #import "VCAMPhotoManager.h"
 #import "VCAMVideoManager.h"
-#import "VCAMAudioManager.h"
-#import <AudioToolbox/AudioToolbox.h>
 #import <ImageIO/ImageIO.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -629,8 +627,6 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
         gNextFramePTS = gCachedDuration;
     }
 
-    [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:videoPath];
-
     return YES;
 }
 
@@ -805,7 +801,6 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
         gPlaybackStartRealTime = now;
         elapsed = 0;
         VCamSetupReader(gActiveTempPath, gReaderFormat);
-        [[VCAMAudioManager sharedManager] resetPlayback];
     }
 
     // Tiến trình hiển thị frame theo đúng PTS thực của video
@@ -852,27 +847,6 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         return;
     }
 
-    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
-    if (formatDesc) {
-        CMMediaType mediaType = CMFormatDescriptionGetMediaType(formatDesc);
-        if (mediaType == kCMMediaType_Audio) {
-            static CFTimeInterval gLastAudioLoadCheck = 0;
-            CFTimeInterval now = CACurrentMediaTime();
-            if (now - gLastAudioLoadCheck > 1.0) {
-                gLastAudioLoadCheck = now;
-                if (![VCAMAudioManager sharedManager].hasAudioTrack) {
-                    NSString *vPath = VCamFindExistingFilePath(kVCamTempFileName);
-                    if (vPath && access([vPath UTF8String], R_OK) == 0) {
-                        [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:vPath];
-                    }
-                }
-            }
-            [[VCAMAudioManager sharedManager] processAudioSampleBuffer:sampleBuffer];
-            if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-            return;
-        }
-    }
-
     CVPixelBufferRef targetPb = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!targetPb) {
         if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
@@ -917,76 +891,6 @@ static void VCamInitMediaServerHooks(void) {
                   (IMP *)&orig_BWNodeOutput_emitSampleBuffer);
 
     NSLog(@"[vcamios] mediaserverd hooks loaded; source=%s", kVCamTempFileName);
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *vPath = VCamFindExistingFilePath(kVCamTempFileName);
-        if (vPath && access([vPath UTF8String], R_OK) == 0) {
-            [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:vPath];
-        }
-    });
-}
-
-static OSStatus (*orig_AudioUnitRender)(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) = NULL;
-
-static OSStatus hook_AudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
-    OSStatus status = orig_AudioUnitRender ? orig_AudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData) : noErr;
-    if (status == noErr && ioData && inOutputBusNumber == 1) {
-        static CFTimeInterval gLastAudioCheck = 0;
-        CFTimeInterval now = CACurrentMediaTime();
-        if (now - gLastAudioCheck > 1.0) {
-            gLastAudioCheck = now;
-            NSString *vPath = VCamFindExistingFilePath(kVCamTempFileName);
-            if (vPath && access([vPath UTF8String], R_OK) == 0) {
-                [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:vPath];
-            } else {
-                [[VCAMAudioManager sharedManager] reset];
-            }
-        }
-
-        AudioStreamBasicDescription asbd;
-        memset(&asbd, 0, sizeof(asbd));
-        UInt32 propSize = sizeof(asbd);
-        OSStatus propStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &asbd, &propSize);
-        if (propStatus != noErr || asbd.mFormatID != kAudioFormatLinearPCM) {
-            propSize = sizeof(asbd);
-            propStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &asbd, &propSize);
-        }
-        if (propStatus != noErr || asbd.mFormatID != kAudioFormatLinearPCM) {
-            asbd.mSampleRate = 48000.0;
-            asbd.mFormatID = kAudioFormatLinearPCM;
-            asbd.mFormatFlags = kAudioFormatFlagsNativeFloatPacked | (ioData->mNumberBuffers > 1 ? kAudioFormatFlagIsNonInterleaved : 0);
-            asbd.mChannelsPerFrame = (ioData->mNumberBuffers > 1) ? ioData->mNumberBuffers : 1;
-            asbd.mBitsPerChannel = 32;
-        }
-
-        static int gAULogCount = 0;
-        if (gAULogCount++ < 15) {
-            FILE *f = fopen("/var/tmp/vcam_audio.log", "a");
-            if (f) {
-                fprintf(f, "[AU] bus=%u frames=%u bufs=%u rate=%.0f ch=%u flags=0x%x bits=%u propErr=%d\n",
-                        (unsigned int)inOutputBusNumber, (unsigned int)inNumberFrames, (unsigned int)ioData->mNumberBuffers,
-                        asbd.mSampleRate, (unsigned int)asbd.mChannelsPerFrame, (unsigned int)asbd.mFormatFlags,
-                        (unsigned int)asbd.mBitsPerChannel, (int)propStatus);
-                fclose(f);
-                chmod("/var/tmp/vcam_audio.log", 0666);
-            }
-        }
-
-        [[VCAMAudioManager sharedManager] fillAudioBufferList:ioData numberOfFrames:inNumberFrames asbd:&asbd];
-    }
-    return status;
-}
-
-static void VCamInitAudioAppHooks(void) {
-    void *symAudioUnitRender = dlsym(RTLD_DEFAULT, "AudioUnitRender");
-    if (symAudioUnitRender) {
-        MSHookFunction(symAudioUnitRender, (void *)&hook_AudioUnitRender, (void **)&orig_AudioUnitRender);
-    }
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSString *vPath = VCamFindExistingFilePath(kVCamTempFileName);
-        if (vPath && access([vPath UTF8String], R_OK) == 0) {
-            [[VCAMAudioManager sharedManager] loadAudioFromVideoPath:vPath];
-        }
-    });
 }
 
 // ─── SpringBoard UI (Compact Square HUD Layout ~175x175) ───────────────────
@@ -1319,10 +1223,10 @@ static VCamFloat *gVCamFloat = nil;
     }
     [panel addSubview:testBtn];
 
-    // ── 3. Bottom: 7 Action Icon Buttons (Horizontal Row, 27x38) ──
-    CGFloat iconW = 27, iconH = 38, iconY = 186;
-    CGFloat iconSpacing = 3;
-    CGFloat totalIconsW = 7 * iconW + 6 * iconSpacing;
+    // ── 3. Bottom: 6 Action Icon Buttons (Horizontal Row, 32x38) ──
+    CGFloat iconW = 32, iconH = 38, iconY = 186;
+    CGFloat iconSpacing = 4;
+    CGFloat totalIconsW = 6 * iconW + 5 * iconSpacing;
     CGFloat startIconX = (w - totalIconsW) / 2.0;
 
     // Icon 1: Chọn video (🎬)
@@ -1339,23 +1243,16 @@ static VCamFloat *gVCamFloat = nil;
     UIButton *pauseBtn = [self _iconButtonWithTitle:pauseIcon x:startIconX + (iconW + iconSpacing) * 2 y:iconY w:iconW h:iconH color:pauseCol sel:@selector(_menuTogglePause)];
     [panel addSubview:pauseBtn];
 
-    // Icon 4: Âm thanh video (🔊 / 🔇)
-    BOOL isAudioOn = [[VCAMAudioManager sharedManager] isAudioEnabled];
-    NSString *audioIcon = isAudioOn ? @"🔊" : @"🔇";
-    UIColor *audioCol = isAudioOn ? [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1] : [UIColor colorWithWhite:0.6 alpha:1];
-    UIButton *audioBtn = [self _iconButtonWithTitle:audioIcon x:startIconX + (iconW + iconSpacing) * 3 y:iconY w:iconW h:iconH color:audioCol sel:@selector(_toggleAudio)];
-    [panel addSubview:audioBtn];
-
-    // Icon 5: Quản lý Key / Hạn dùng (🔑)
-    UIButton *licBtn = [self _iconButtonWithTitle:@"🔑" x:startIconX + (iconW + iconSpacing) * 4 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1] sel:@selector(_menuShowLicense)];
+    // Icon 4: Quản lý Key / Hạn dùng (🔑)
+    UIButton *licBtn = [self _iconButtonWithTitle:@"🔑" x:startIconX + (iconW + iconSpacing) * 3 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1] sel:@selector(_menuShowLicense)];
     [panel addSubview:licBtn];
 
-    // Icon 6: Xóa video / ảnh (🗑️)
-    UIButton *trashBtn = [self _iconButtonWithTitle:@"🗑️" x:startIconX + (iconW + iconSpacing) * 5 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:1 green:0.45 blue:0.45 alpha:1] sel:@selector(_menuDisable)];
+    // Icon 5: Xóa video / ảnh (🗑️)
+    UIButton *trashBtn = [self _iconButtonWithTitle:@"🗑️" x:startIconX + (iconW + iconSpacing) * 4 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:1 green:0.45 blue:0.45 alpha:1] sel:@selector(_menuDisable)];
     [panel addSubview:trashBtn];
 
-    // Icon 7: Đóng (✕)
-    UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + iconSpacing) * 6 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
+    // Icon 6: Đóng (✕)
+    UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + iconSpacing) * 5 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
     [panel addSubview:closeBtn];
 
     [_rootVC.view insertSubview:panel aboveSubview:overlay];
@@ -1524,14 +1421,6 @@ static VCamFloat *gVCamFloat = nil;
     VCamFloatRefreshButton();
 }
 
-- (void)_toggleAudio {
-    [[VCAMAudioManager sharedManager] toggleAudioEnabled];
-    BOOL isEnabled = [VCAMAudioManager sharedManager].isAudioEnabled;
-    [self _hideMenu];
-    [self _showToast:isEnabled ? @"🔊 Đã bật âm thanh video" : @"🔇 Đã tắt âm thanh (dùng mic thật)"];
-    VCamFloatRefreshButton();
-}
-
 - (void)_menuSelectVideo {
     [self _hideMenu];
     if (![[VCAMLicenseManager sharedManager] isLicenseValid]) {
@@ -1628,31 +1517,20 @@ static void VCamInitSpringBoardHooks(void) {
 
 %ctor {
     @autoreleasepool {
+        unlink("/var/tmp/vcam_ui.log");
+        unlink("/rootfs/private/var/tmp/vcam_ui.log");
+        unlink("/private/var/tmp/vcam_ui.log");
+
         gFileManager = NSFileManager.defaultManager;
         [gFileManager createDirectoryAtPath:@"/var/tmp"
                 withIntermediateDirectories:YES attributes:nil error:nil];
         chmod("/var/tmp", 0777);
 
         NSString *processName = NSProcessInfo.processInfo.processName;
-        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-
-        FILE *fProc = fopen("/var/tmp/vcam_loaded_procs.log", "a");
-        if (fProc) {
-            fprintf(fProc, "[VCAM] PID=%d Name=%s Bundle=%s\n",
-                    getpid(), [processName UTF8String] ?: "unknown", [bundleID UTF8String] ?: "none");
-            fclose(fProc);
-            chmod("/var/tmp/vcam_loaded_procs.log", 0666);
-        }
-
         if ([processName isEqualToString:@"mediaserverd"]) {
             VCamInitMediaServerHooks();
         } else if ([processName isEqualToString:@"SpringBoard"]) {
-            unlink("/var/tmp/vcam_ui.log");
-            unlink("/rootfs/private/var/tmp/vcam_ui.log");
-            unlink("/private/var/tmp/vcam_ui.log");
             VCamInitSpringBoardHooks();
-        } else {
-            VCamInitAudioAppHooks();
         }
     }
 }

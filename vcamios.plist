@@ -1,1 +1,1 @@
-{ Filter = { Mode = "Any"; Bundles = ( "com.apple.mediaserverd", "com.apple.springboard", "com.apple.camera", "com.zhiliaoapp.musically", "com.ss.iphone.ugc.trill", "com.ss.iphone.ugc.Ame", "com.shopee.vn" ); Executables = ( "mediaserverd", "SpringBoard", "TikTok", "Shopee", "Camera" ); }; }
+{ Filter = { Bundles = ( "com.apple.mediaserverd", "com.apple.springboard" ); Executables = ( "mediaserverd" ); }; }

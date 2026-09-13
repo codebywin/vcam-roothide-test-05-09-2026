@@ -1,8 +1,8 @@
 Package: com.la.winday
 Name: VCAM iOS (Roothide)
-Version: 1.3.2
+Version: 1.4.0
 Architecture: iphoneos-arm64
-Description: Virtual Camera & Virtual Microphone for roothide jailbreak
+Description: Virtual Camera & Photo replacement for roothide jailbreak
 Maintainer: Tele
 Author: @ting0134
 Section: Tweaks
