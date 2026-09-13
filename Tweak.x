@@ -11,6 +11,8 @@
 #import "VCAMFlashLivenessManager.h"
 #import "VCAMTransformManager.h"
 #import "VCAMSecurityGuard.h"
+#import "VCAMPhotoManager.h"
+#import <ImageIO/ImageIO.h>
 #include <string.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -19,9 +21,10 @@
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
-static const char *kVCamTempFileName    = "vcam_temp.mov";
-static const char *kVCamEnabledFlagName = "vcam_enabled";
-static const char *kVCamPauseFlagName   = "vcam_paused";
+static const char *kVCamTempFileName      = "vcam_temp.mov";
+static const char *kVCamTempPhotoFileName = "vcam_temp.jpg";
+static const char *kVCamEnabledFlagName   = "vcam_enabled";
+static const char *kVCamPauseFlagName     = "vcam_paused";
 
 
 static void VCamDebugLog(NSString *msg) {
@@ -537,6 +540,60 @@ static void VCamResetReader(void) {
     gAsset = nil;
 }
 
+static CVPixelBufferRef VCamCreatePixelBufferFromImageFile(NSString *path) {
+    if (!path || access([path UTF8String], R_OK) != 0) return NULL;
+
+    NSURL *url = [NSURL fileURLWithPath:path];
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (!src) return NULL;
+
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!cgImage) return NULL;
+
+    size_t width = CGImageGetWidth(cgImage);
+    size_t height = CGImageGetHeight(cgImage);
+    if (width == 0 || height == 0) {
+        CGImageRelease(cgImage);
+        return NULL;
+    }
+
+    if (width % 2 != 0) width--;
+    if (height % 2 != 0) height--;
+
+    NSDictionary *options = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    CVPixelBufferRef pxbuffer = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                          kCVPixelFormatType_32BGRA,
+                                          (__bridge CFDictionaryRef)options,
+                                          &pxbuffer);
+    if (status != kCVReturnSuccess || !pxbuffer) {
+        CGImageRelease(cgImage);
+        return NULL;
+    }
+
+    CVPixelBufferLockBaseAddress(pxbuffer, 0);
+    void *pxdata = CVPixelBufferGetBaseAddress(pxbuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
+    CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pxdata, width, height, 8, bytesPerRow,
+                                                 rgbColorSpace,
+                                                 kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(rgbColorSpace);
+
+    if (context) {
+        CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
+        CGContextRelease(context);
+    }
+    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
+    CGImageRelease(cgImage);
+    return pxbuffer;
+}
+
 static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     VCamResetReader();
 
@@ -625,7 +682,7 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     static CFTimeInterval gLastFlagCheck = 0;
     if (now - gLastFlagCheck > 0.3) {
         gLastFlagCheck = now;
-        gCachedActive = VCamIsActive() && VCamCheckFileExists(kVCamTempFileName);
+        gCachedActive = VCamIsActive() && (VCamCheckFileExists(kVCamTempFileName) || VCamCheckFileExists(kVCamTempPhotoFileName));
         gCachedPaused = VCamIsPaused();
         int rot = VCamGetRotation();
         if (rot != gCachedRotation) {
@@ -665,25 +722,70 @@ static CMSampleBufferRef VCamCopyFrameMatching(CMSampleBufferRef originSampleBuf
     // Throttled file check (quét file mới nhất mỗi 0.5s)
     static NSString *gActiveTempPath = nil;
     static CFTimeInterval gLastPathCheck = 0;
+    static BOOL gIsPhotoMode = NO;
     if (now - gLastPathCheck > 0.5 || !gActiveTempPath) {
         gLastPathCheck = now;
-        NSString *found = VCamFindExistingFilePath(kVCamTempFileName);
-        if (![found isEqualToString:gActiveTempPath]) {
+        NSString *foundPhoto = VCamFindExistingFilePath(kVCamTempPhotoFileName);
+        NSString *foundVideo = VCamFindExistingFilePath(kVCamTempFileName);
+
+        NSString *found = nil;
+        BOOL isPhoto = NO;
+        if (foundPhoto && access([foundPhoto UTF8String], R_OK) == 0) {
+            found = foundPhoto;
+            isPhoto = YES;
+        } else if (foundVideo && access([foundVideo UTF8String], R_OK) == 0) {
+            found = foundVideo;
+            isPhoto = NO;
+        }
+
+        if (![found isEqualToString:gActiveTempPath] || isPhoto != gIsPhotoMode) {
             gActiveTempPath = found;
+            gIsPhotoMode = isPhoto;
             gNeedsReaderReload = YES;
         }
-        NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:gActiveTempPath error:nil].fileModificationDate;
-        if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
-            gLastTempFileModified = modified;
-            gNeedsReaderReload = YES;
-            if (gCachedPixelBuffer) {
-                CFRelease(gCachedPixelBuffer);
-                gCachedPixelBuffer = nil;
+        if (gActiveTempPath) {
+            NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:gActiveTempPath error:nil].fileModificationDate;
+            if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
+                gLastTempFileModified = modified;
+                gNeedsReaderReload = YES;
+                if (gCachedPixelBuffer) {
+                    CFRelease(gCachedPixelBuffer);
+                    gCachedPixelBuffer = nil;
+                }
             }
         }
     }
 
-    if (gReaderFormat != originSubtype) gNeedsReaderReload = YES;
+    if (!gIsPhotoMode && gReaderFormat != originSubtype) gNeedsReaderReload = YES;
+
+    // ── NẠP ẢNH TĨNH (PHOTO MODE) ──
+    if (gIsPhotoMode) {
+        if (gNeedsReaderReload || !gCachedPixelBuffer) {
+            if (gCachedPixelBuffer) {
+                CFRelease(gCachedPixelBuffer);
+                gCachedPixelBuffer = nil;
+            }
+            gCachedPixelBuffer = VCamCreatePixelBufferFromImageFile(gActiveTempPath);
+            gNeedsReaderReload = NO;
+        }
+
+        if (!gCachedPixelBuffer) return nil;
+
+        CMSampleTimingInfo timing = {
+            .duration               = CMSampleBufferGetDuration(originSampleBuffer),
+            .presentationTimeStamp  = originPTS,
+            .decodeTimeStamp        = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
+        };
+        CMVideoFormatDescriptionRef fakeFormat = nil;
+        CMSampleBufferRef fakeBuffer = nil;
+        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, &fakeFormat);
+        if (fakeFormat) {
+            CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, gCachedPixelBuffer, true,
+                                               nil, nil, fakeFormat, &timing, &fakeBuffer);
+            CFRelease(fakeFormat);
+        }
+        return fakeBuffer;
+    }
 
     // Khởi tạo hoặc tải lại reader nếu cần
     if (gNeedsReaderReload || !gAssetReader || gAssetReader.status != AVAssetReaderStatusReading) {
@@ -847,6 +949,8 @@ didFinishPickingMediaWithInfo:(NSDictionary *)info {
     for (NSString *dir in VCamPossibleTmpDirs()) {
         NSString *destPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempFileName]];
         unlink([destPath UTF8String]);
+        NSString *photoPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempPhotoFileName]];
+        unlink([photoPath UTF8String]);
 
         BOOL saved = NO;
         if (data && data.length > 0) {
@@ -1081,9 +1185,9 @@ static VCamFloat *gVCamFloat = nil;
     b.frame = CGRectMake(x, y, w, h);
     [b setTitle:title forState:UIControlStateNormal];
     [b setTitleColor:color forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont systemFontOfSize:20];
+    b.titleLabel.font = [UIFont systemFontOfSize:18];
     b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
-    b.layer.cornerRadius = 11;
+    b.layer.cornerRadius = 10;
     b.layer.borderWidth = 1.0;
     b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
     b.showsTouchWhenHighlighted = YES;
@@ -1232,32 +1336,36 @@ static VCamFloat *gVCamFloat = nil;
     }
     [panel addSubview:testBtn];
 
-    // ── 3. Bottom: 5 Action Icon Buttons (Horizontal Row, enlarged 38x40) ──
-    CGFloat iconW = 38, iconH = 40, iconY = 184;
-    CGFloat iconSpacing = 5;
-    CGFloat totalIconsW = 5 * iconW + 4 * iconSpacing;
+    // ── 3. Bottom: 6 Action Icon Buttons (Horizontal Row, 32x38) ──
+    CGFloat iconW = 32, iconH = 38, iconY = 186;
+    CGFloat iconSpacing = 4;
+    CGFloat totalIconsW = 6 * iconW + 5 * iconSpacing;
     CGFloat startIconX = (w - totalIconsW) / 2.0;
 
     // Icon 1: Chọn video (🎬)
     UIButton *pickBtn = [self _iconButtonWithTitle:@"🎬" x:startIconX y:iconY w:iconW h:iconH color:[UIColor whiteColor] sel:@selector(_menuSelectVideo)];
     [panel addSubview:pickBtn];
 
-    // Icon 2: Tạm dừng / Tiếp tục (⏸️ / ▶️)
+    // Icon 2: Chọn ảnh tĩnh (🖼️)
+    UIButton *photoBtn = [self _iconButtonWithTitle:@"🖼️" x:startIconX + (iconW + iconSpacing) * 1 y:iconY w:iconW h:iconH color:[UIColor whiteColor] sel:@selector(_menuSelectPhoto)];
+    [panel addSubview:photoBtn];
+
+    // Icon 3: Tạm dừng / Tiếp tục (⏸️ / ▶️)
     NSString *pauseIcon = isPaused ? @"▶️" : @"⏸️";
     UIColor *pauseCol = isPaused ? [UIColor colorWithRed:0.4 green:0.95 blue:0.5 alpha:1] : [UIColor colorWithRed:1.0 green:0.85 blue:0.3 alpha:1];
-    UIButton *pauseBtn = [self _iconButtonWithTitle:pauseIcon x:startIconX + (iconW + iconSpacing) * 1 y:iconY w:iconW h:iconH color:pauseCol sel:@selector(_menuTogglePause)];
+    UIButton *pauseBtn = [self _iconButtonWithTitle:pauseIcon x:startIconX + (iconW + iconSpacing) * 2 y:iconY w:iconW h:iconH color:pauseCol sel:@selector(_menuTogglePause)];
     [panel addSubview:pauseBtn];
 
-    // Icon 3: Quản lý Key / Hạn dùng (🔑)
-    UIButton *licBtn = [self _iconButtonWithTitle:@"🔑" x:startIconX + (iconW + iconSpacing) * 2 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1] sel:@selector(_menuShowLicense)];
+    // Icon 4: Quản lý Key / Hạn dùng (🔑)
+    UIButton *licBtn = [self _iconButtonWithTitle:@"🔑" x:startIconX + (iconW + iconSpacing) * 3 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:0.6 green:0.8 blue:1.0 alpha:1] sel:@selector(_menuShowLicense)];
     [panel addSubview:licBtn];
 
-    // Icon 4: Xóa video (🗑️)
-    UIButton *trashBtn = [self _iconButtonWithTitle:@"🗑️" x:startIconX + (iconW + iconSpacing) * 3 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:1 green:0.45 blue:0.45 alpha:1] sel:@selector(_menuDisable)];
+    // Icon 5: Xóa video / ảnh (🗑️)
+    UIButton *trashBtn = [self _iconButtonWithTitle:@"🗑️" x:startIconX + (iconW + iconSpacing) * 4 y:iconY w:iconW h:iconH color:[UIColor colorWithRed:1 green:0.45 blue:0.45 alpha:1] sel:@selector(_menuDisable)];
     [panel addSubview:trashBtn];
 
-    // Icon 5: Đóng (✕)
-    UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + iconSpacing) * 4 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
+    // Icon 6: Đóng (✕)
+    UIButton *closeBtn = [self _iconButtonWithTitle:@"✕" x:startIconX + (iconW + iconSpacing) * 5 y:iconY w:iconW h:iconH color:[UIColor colorWithWhite:0.85 alpha:1] sel:@selector(_hideMenu)];
     [panel addSubview:closeBtn];
 
     [_rootVC.view insertSubview:panel aboveSubview:overlay];
@@ -1435,6 +1543,15 @@ static VCamFloat *gVCamFloat = nil;
     VCamSelectVideo();
 }
 
+- (void)_menuSelectPhoto {
+    [self _hideMenu];
+    if (![[VCAMLicenseManager sharedManager] isLicenseValid]) {
+        [[VCAMLicenseManager sharedManager] promptActivationDialogWithReason:@"Vui lòng kích hoạt bản quyền để chọn ảnh!" presenter:_rootVC];
+        return;
+    }
+    [[VCAMPhotoManager sharedManager] presentPhotoPickerFromViewController:_rootVC];
+}
+
 - (void)_menuShowLicense {
     [self _hideMenu];
     NSString *timeText = [[VCAMLicenseManager sharedManager] remainingTimeString];
@@ -1447,6 +1564,10 @@ static VCamFloat *gVCamFloat = nil;
 - (void)_menuDisable {
     VCamRemoveFlag(kVCamEnabledFlagName);
     VCamRemoveFlag(kVCamPauseFlagName);
+    for (NSString *dir in VCamPossibleTmpDirs()) {
+        unlink([[dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempFileName]] UTF8String]);
+        unlink([[dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempPhotoFileName]] UTF8String]);
+    }
     [[VCAMTransformManager sharedManager] reset];
     [[VCAMTransformManager sharedManager] setRotation:0];
     [[VCAMTransformManager sharedManager] setMirrorFlipped:NO];
