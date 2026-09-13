@@ -618,68 +618,95 @@ static UIWindow *VCAMGetTopWindow(void) {
         }
         if (!targetVC) return;
 
+        // Tránh trình chiếu đè lên alert đang hiển thị
+        if ([targetVC.presentedViewController isKindOfClass:[UIAlertController class]]) {
+            return;
+        }
+
         NSString *title = @"🔐 Kích Hoạt VCAM iOS";
-        NSString *msg = reason ?: [NSString stringWithFormat:@"Mã máy (HWID):\n%@\n\nVui lòng nhập mã key để tiếp tục sử dụng:", [self.hwid substringToIndex:MIN(16, self.hwid.length)]];
+        NSString *hwidShort = (self.hwid.length >= 16) ? [self.hwid substringToIndex:16] : (self.hwid ?: @"Unknown");
+        NSString *msg = reason ?: [NSString stringWithFormat:@"Mã máy (HWID):\n%@\n\nVui lòng nhập mã key để tiếp tục sử dụng:", hwidShort];
 
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
 
+        // Tự động kiểm tra Clipboard: Nếu đã copy key (chứa "VCAM" hoặc có dấu gạch ngang), tự động điền sẵn vào ô nhập
+        NSString *initialKey = self.currentKey ?: @"";
+        @try {
+            NSString *pasteStr = [UIPasteboard generalPasteboard].string;
+            if (pasteStr.length > 0) {
+                pasteStr = [pasteStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (pasteStr.length >= 8 && ([pasteStr containsString:@"VCAM"] || [pasteStr containsString:@"-"])) {
+                    initialKey = pasteStr;
+                }
+            }
+        } @catch (id ex) {}
+
         [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
             textField.placeholder = @"VCAM-XXXX-XXXX-XXXX";
             textField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
             textField.autocorrectionType = UITextAutocorrectionTypeNo;
-            textField.text = self.currentKey ?: @"";
+            textField.text = initialKey;
+            textField.clearButtonMode = UITextFieldViewModeWhileEditing;
         }];
 
-        // Nút Dán từ clipboard
-        [alert addAction:[UIAlertAction actionWithTitle:@"📋 Dán mã" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            NSString *pasteStr = [UIPasteboard generalPasteboard].string;
-            if (pasteStr.length > 0) {
-                [self promptActivationDialogWithKeyPrefilled:pasteStr presenter:targetVC];
+        __weak typeof(self) weakSelf = self;
+
+        // Nút 1: Dán từ clipboard và Kích hoạt ngay (Không bao giờ mở lại alert gây treo máy)
+        [alert addAction:[UIAlertAction actionWithTitle:@"📋 Dán mã & Kích hoạt" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            NSString *pasteStr = nil;
+            @try {
+                pasteStr = [UIPasteboard generalPasteboard].string;
+            } @catch (id ex) {}
+
+            UITextField *tf = alert.textFields.firstObject;
+            NSString *keyToUse = (pasteStr.length >= 6) ? pasteStr : tf.text;
+            keyToUse = [keyToUse stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+            if (keyToUse.length == 0) {
+                return;
             }
+
+            [weakSelf activateWithKey:keyToUse completion:^(BOOL success, NSString *message) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIAlertController *resultAlert = [UIAlertController alertControllerWithTitle:success ? @"🎉 Thành Công" : @"❌ Thất Bại"
+                                                                                         message:message
+                                                                                  preferredStyle:UIAlertControllerStyleAlert];
+                    [resultAlert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+                    [targetVC presentViewController:resultAlert animated:YES completion:nil];
+                });
+            }];
         }]];
 
-        // Nút Kích hoạt
-        __weak typeof(self) weakSelf = self;
+        // Nút 2: Kích hoạt (Dùng nội dung trong textfield)
         [alert addAction:[UIAlertAction actionWithTitle:@"⚡ Kích Hoạt" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             UITextField *tf = alert.textFields.firstObject;
-            NSString *key = tf.text;
+            NSString *key = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (key.length == 0) return;
+
             [weakSelf activateWithKey:key completion:^(BOOL success, NSString *message) {
-                UIAlertController *resultAlert = [UIAlertController alertControllerWithTitle:success ? @"🎉 Thành Công" : @"❌ Thất Bại"
-                                                                                     message:message
-                                                                              preferredStyle:UIAlertControllerStyleAlert];
-                [resultAlert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-                [targetVC presentViewController:resultAlert animated:YES completion:nil];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIAlertController *resultAlert = [UIAlertController alertControllerWithTitle:success ? @"🎉 Thành Công" : @"❌ Thất Bại"
+                                                                                         message:message
+                                                                                  preferredStyle:UIAlertControllerStyleAlert];
+                    [resultAlert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+                    [targetVC presentViewController:resultAlert animated:YES completion:nil];
+                });
             }];
+        }]];
+
+        // Nút 3: Sao chép HWID (hỗ trợ user copy gửi admin)
+        [alert addAction:[UIAlertAction actionWithTitle:@"📋 Sao chép HWID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            @try {
+                [UIPasteboard generalPasteboard].string = weakSelf.hwid ?: @"";
+            } @catch (id ex) {}
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
 
         [targetVC presentViewController:alert animated:YES completion:nil];
     });
-}
-
-- (void)promptActivationDialogWithKeyPrefilled:(NSString *)prefilledKey presenter:(UIViewController *)presenter {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"🔐 Kích Hoạt VCAM iOS"
-                                                                   message:@"Mã đã được dán từ bộ nhớ tạm:"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-        textField.text = prefilledKey;
-    }];
-    __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"⚡ Kích Hoạt Ngay" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        UITextField *tf = alert.textFields.firstObject;
-        [weakSelf activateWithKey:tf.text completion:^(BOOL success, NSString *message) {
-            UIAlertController *res = [UIAlertController alertControllerWithTitle:success ? @"🎉 Thành Công" : @"❌ Thất Bại"
-                                                                         message:message
-                                                                  preferredStyle:UIAlertControllerStyleAlert];
-            [res addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-            [presenter presentViewController:res animated:YES completion:nil];
-        }];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
-    [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 @end
