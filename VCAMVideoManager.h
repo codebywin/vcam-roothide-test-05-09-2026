@@ -12,7 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)sharedManager;
 
-/// Mở thư viện chọn video trực tiếp (không cắt video)
+/// Mở thư viện video với giao diện cắt video mặc định của iOS (allowsEditing = YES)
 - (void)presentVideoPickerFromViewController:(UIViewController *)presenter;
 
 @end
