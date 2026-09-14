@@ -4,6 +4,7 @@
 //
 
 #import "VCAMFlashBurstManager.h"
+#import "VCAMFlashLivenessManager.h"
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -116,8 +117,13 @@ static NSString *FindExistingBurstPath(void) {
 + (CIImage *)applyFlashBurstToImage:(CIImage *)image size:(CGSize)size {
     if (!image || size.width <= 0 || size.height <= 0) return image;
 
-    float intensity = [self currentBurstIntensity];
-    if (intensity <= 0.015f) return image;
+    float baseIntensity = [self currentBurstIntensity];
+    if (baseIntensity <= 0.015f) return image;
+
+    VCAMFlashState flashState = [VCAMFlashLivenessManager currentFlashState];
+    float userMultiplier = (flashState.intensity > 0.05f) ? (flashState.intensity / 0.35f) : 1.0f;
+    float intensity = baseIntensity * userMultiplier;
+    if (intensity > 1.0f) intensity = 1.0f;
 
     @try {
         // 1. Tọa độ tâm hội tụ ánh sáng (Catchlight tập trung vào vùng chữ T khuôn mặt hoặc thẻ căn cước)
@@ -178,3 +184,4 @@ static NSString *FindExistingBurstPath(void) {
 }
 
 @end
+

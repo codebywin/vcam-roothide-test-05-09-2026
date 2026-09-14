@@ -332,11 +332,12 @@ static Float64                   gNextFramePTS = 0.0;
 static CFTimeInterval            gPlaybackStartRealTime = 0;
 static Float64                   gCachedDuration = 0.0;
 static float                     gVideoFPS = 30.0f;
+static NSString                 *gLoadedVideoPath = nil;
 
 static CVPixelBufferRef gRawPhotoBuffer = NULL;
 
-static void VCamResetReader(void) {
-    if (gCachedPixelBuffer) {
+static void VCamResetReader(BOOL clearCachedFrame) {
+    if (clearCachedFrame && gCachedPixelBuffer) {
         CFRelease(gCachedPixelBuffer);
         gCachedPixelBuffer = NULL;
     }
@@ -353,31 +354,53 @@ static void VCamResetReader(void) {
         gAssetReader = nil;
     }
     gTrackOutput = nil;
-    gVideoTrack = nil;
-    gAsset = nil;
+    if (clearCachedFrame) {
+        gVideoTrack = nil;
+        gAsset = nil;
+        gLoadedVideoPath = nil;
+    }
 }
 
-static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
-    VCamResetReader();
+static BOOL VCamSetupReader(NSString *videoPath, OSType subtype, BOOL isLooping) {
+    if (!videoPath || access([videoPath UTF8String], F_OK) != 0) {
+        VCamResetReader(YES);
+        return NO;
+    }
 
-    if (!videoPath || access([videoPath UTF8String], F_OK) != 0) return NO;
-
-    NSURL *url = [NSURL fileURLWithPath:videoPath];
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
-    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-    if (!track) return NO;
-
-    double angle = atan2(track.preferredTransform.b, track.preferredTransform.a);
-    if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
-    else if (fabs(angle + M_PI_2) < 0.05)     gVideoExifOrientation = 8;
-    else if (fabs(fabs(angle) - M_PI) < 0.05) gVideoExifOrientation = 3;
-    else                                       gVideoExifOrientation = 1;
+    // Khi lặp lại video: Không hủy frame cũ để tránh chớp đen (Seamless Double-Buffering)
+    VCamResetReader(!isLooping);
 
     OSType outputFormat = subtype;
     if (outputFormat != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
         outputFormat != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
         outputFormat != kCVPixelFormatType_32BGRA) {
         outputFormat = kCVPixelFormatType_32BGRA;
+    }
+
+    AVAsset *asset = gAsset;
+    AVAssetTrack *track = gVideoTrack;
+
+    if (!asset || !track || ![videoPath isEqualToString:gLoadedVideoPath]) {
+        NSURL *url = [NSURL fileURLWithPath:videoPath];
+        asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+        track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (!track) return NO;
+
+        gAsset = asset;
+        gVideoTrack = track;
+        gLoadedVideoPath = [videoPath copy];
+
+        double angle = atan2(track.preferredTransform.b, track.preferredTransform.a);
+        if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
+        else if (fabs(angle + M_PI_2) < 0.05)     gVideoExifOrientation = 8;
+        else if (fabs(fabs(angle) - M_PI) < 0.05) gVideoExifOrientation = 3;
+        else                                       gVideoExifOrientation = 1;
+
+        Float64 dur = CMTimeGetSeconds(asset.duration);
+        gCachedDuration = (dur > 0.05) ? dur : 1.0;
+
+        float f = track.nominalFrameRate;
+        gVideoFPS = (f >= 1.0f && f <= 120.0f) ? f : 30.0f;
     }
 
     NSError *err = nil;
@@ -397,19 +420,11 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
         return NO;
     }
 
-    gAsset = asset;
-    gVideoTrack = track;
     gAssetReader = r;
     gTrackOutput = outp;
     gReaderFormat = outputFormat;
 
-    Float64 dur = CMTimeGetSeconds(asset.duration);
-    gCachedDuration = (dur > 0.05) ? dur : 1.0;
-
-    float f = track.nominalFrameRate;
-    gVideoFPS = (f >= 1.0f && f <= 120.0f) ? f : 30.0f;
-
-    // Đọc ngay frame đầu tiên vào gCachedPixelBuffer (Zero-copy retain)
+    // Đọc ngay frame đầu tiên vào gCachedPixelBuffer (Chỉ giải phóng frame cũ sau khi frame mới đã sẵn sàng)
     CMSampleBufferRef firstBuf = [gTrackOutput copyNextSampleBuffer];
     if (firstBuf) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
@@ -541,7 +556,7 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
 
     // Khởi tạo hoặc tải lại reader nếu cần
     if (gNeedsReaderReload || !gAssetReader || gAssetReader.status != AVAssetReaderStatusReading) {
-        BOOL ok = VCamSetupReader(gActiveTempPath, originSubtype);
+        BOOL ok = VCamSetupReader(gActiveTempPath, originSubtype, NO);
         if (!ok) {
             gNeedsReaderReload = YES;
             return gCachedPixelBuffer;
@@ -554,11 +569,12 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
     if (gPlaybackStartRealTime == 0) gPlaybackStartRealTime = now;
     CFTimeInterval elapsed = now - gPlaybackStartRealTime;
 
-    // Seamless Infinite Loop: Tái sinh reader khi hết thời lượng video
-    if (gCachedDuration > 0.05 && elapsed >= gCachedDuration) {
+    // Seamless Infinite Loop: Tái sinh reader ngay khi hết frame hoặc hết thời lượng video (Double-buffering)
+    BOOL trackEnded = (gNextSampleBuffer == nil && elapsed > 0.05);
+    if ((gCachedDuration > 0.05 && elapsed >= gCachedDuration) || trackEnded) {
         gPlaybackStartRealTime = now;
         elapsed = 0;
-        VCamSetupReader(gActiveTempPath, gReaderFormat);
+        VCamSetupReader(gActiveTempPath, gReaderFormat, YES);
     }
 
     // Tiến trình hiển thị frame theo đúng PTS thực của video (Zero-copy retain)
@@ -595,18 +611,48 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         return;
     }
 
-    // Do not re-process buffers that have already been swapped by VCam in an upstream node
-    static const CFStringRef kVCamProcessedKey = CFSTR("kVCamProcessedBuffer");
-    if (CVBufferGetAttachment(targetPb, kVCamProcessedKey, NULL)) {
+    // Tàng hình KYC tuyệt đối: Dùng tên cờ chuẩn nội bộ của Apple (FigCaptureStreamBufferProcessed)
+    static const CFStringRef kInternalBufferTag = CFSTR("FigCaptureStreamBufferProcessed");
+    if (CVBufferGetAttachment(targetPb, kInternalBufferTag, NULL)) {
         if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
         return;
     }
 
     CVPixelBufferRef srcPb = VCamGetPixelBufferMatching(sampleBuffer);
+
+    // Hardware Blackout Shield: Khi reader đang nối vòng lặp, giữ lại frame gần nhất để không bao giờ lộ camera đen
+    static CVPixelBufferRef gLastEmittedPixelBuffer = NULL;
+    static os_unfair_lock gShieldLock = OS_UNFAIR_LOCK_INIT;
+
+    if (!srcPb && VCamIsActive()) {
+        os_unfair_lock_lock(&gShieldLock);
+        if (gLastEmittedPixelBuffer) {
+            srcPb = (CVPixelBufferRef)CFRetain(gLastEmittedPixelBuffer);
+        }
+        os_unfair_lock_unlock(&gShieldLock);
+
+        if (srcPb) {
+            OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
+            CFRelease(srcPb);
+            if (err == noErr) {
+                // kCVAttachmentMode_ShouldNotPropagate: Cấm thuộc tính lan truyền sang app KYC/ngân hàng
+                CVBufferSetAttachment(targetPb, kInternalBufferTag, kCFBooleanTrue, kCVAttachmentMode_ShouldNotPropagate);
+            }
+            if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+            return;
+        }
+    }
+
     if (srcPb) {
         OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
         if (err == noErr) {
-            CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
+            os_unfair_lock_lock(&gShieldLock);
+            if (gLastEmittedPixelBuffer) CFRelease(gLastEmittedPixelBuffer);
+            gLastEmittedPixelBuffer = (CVPixelBufferRef)CFRetain(srcPb);
+            os_unfair_lock_unlock(&gShieldLock);
+
+            // kCVAttachmentMode_ShouldNotPropagate: Cấm thuộc tính lan truyền sang app KYC/ngân hàng
+            CVBufferSetAttachment(targetPb, kInternalBufferTag, kCFBooleanTrue, kCVAttachmentMode_ShouldNotPropagate);
         }
     }
 
@@ -662,6 +708,8 @@ static UIViewController *VCamPresenter(void);
     UIView  *_menuOverlay;
     UIView  *_panel;
     UISlider *_zoomSlider;
+    UISegmentedControl *_modeControl;
+    BOOL _isFlashSliderMode;
     CGFloat _curOffsetX;
     CGFloat _curOffsetY;
 }
@@ -828,7 +876,7 @@ static VCamFloat *gVCamFloat = nil;
     _curOffsetY = VCamGetOffsetY();
 
     CGRect screen = UIScreen.mainScreen.bounds;
-    CGFloat w = 230, h = 240;
+    CGFloat w = 230, h = 262;
 
     // 1. Fully clear touch-outside dismiss overlay (behind panel)
     UIView *overlay = [[UIView alloc] initWithFrame:screen];
@@ -847,7 +895,7 @@ static VCamFloat *gVCamFloat = nil;
                          screen.size.height - h - 15);
     panelY = MAX(15, panelY);
 
-    // Enlarged Rounded Square Panel (230x240)
+    // Enlarged Rounded Square Panel (230x262)
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(panelX, panelY, w, h)];
     panel.backgroundColor = [UIColor clearColor];
     panel.layer.cornerRadius = 22;
@@ -871,41 +919,61 @@ static VCamFloat *gVCamFloat = nil;
     tintOverlay.userInteractionEnabled = NO;
     [panel addSubview:tintOverlay];
 
-    // ── 1. Top: Enlarged Zoom Slider with [-] and [+] ──
-    CGFloat minusBtnW = 34, plusBtnW = 34, ctrlY = 10, ctrlH = 32;
+    // ── 0. Top Mode Selector: [ 🔍 Zoom ] vs [ ⚡ Flash ] ──
+    UISegmentedControl *modeCtrl = [[UISegmentedControl alloc] initWithItems:@[@"🔍 Zoom", @"⚡ Flash"]];
+    modeCtrl.frame = CGRectMake((w - 170) / 2.0, 8, 170, 26);
+    modeCtrl.selectedSegmentIndex = _isFlashSliderMode ? 1 : 0;
+    if (@available(iOS 13.0, *)) {
+        modeCtrl.selectedSegmentTintColor = [UIColor colorWithWhite:1.0 alpha:0.25];
+        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor], NSFontAttributeName: [UIFont boldSystemFontOfSize:12]} forState:UIControlStateNormal];
+        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0], NSFontAttributeName: [UIFont boldSystemFontOfSize:12]} forState:UIControlStateSelected];
+    }
+    [modeCtrl addTarget:self action:@selector(_sliderModeChanged:) forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:modeCtrl];
+    _modeControl = modeCtrl;
+
+    // ── 1. Top: Slider with [-] and [+] ──
+    CGFloat minusBtnW = 32, plusBtnW = 32, ctrlY = 38, ctrlH = 30;
     UIButton *minusBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     minusBtn.frame = CGRectMake(10, ctrlY, minusBtnW, ctrlH);
-    [minusBtn setTitle:@"−" forState:UIControlStateNormal];
-    [minusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    minusBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
     minusBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
     minusBtn.layer.cornerRadius = 8;
     minusBtn.layer.borderWidth = 0.8;
     minusBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
     minusBtn.showsTouchWhenHighlighted = YES;
+    [minusBtn setTitle:@"−" forState:UIControlStateNormal];
+    [minusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    minusBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
     [minusBtn addTarget:self action:@selector(_zoomMinus) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:minusBtn];
 
-    CGFloat sliderX = CGRectGetMaxX(minusBtn.frame) + 8;
-    CGFloat sliderW = w - sliderX - plusBtnW - 10 - 8;
+    CGFloat sliderX = CGRectGetMaxX(minusBtn.frame) + 6;
+    CGFloat sliderW = w - sliderX - plusBtnW - 10 - 6;
     _zoomSlider = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, ctrlY, sliderW, ctrlH)];
-    _zoomSlider.minimumValue = 0.4f;
-    _zoomSlider.maximumValue = 2.5f;
-    _zoomSlider.value = currentScale;
-    _zoomSlider.tintColor = [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0];
+    if (_isFlashSliderMode) {
+        _zoomSlider.minimumValue = 0.10f;
+        _zoomSlider.maximumValue = 0.90f;
+        _zoomSlider.value = [[VCAMFlashLivenessManager sharedManager] flashIntensity];
+        _zoomSlider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.18 alpha:1.0];
+    } else {
+        _zoomSlider.minimumValue = 0.4f;
+        _zoomSlider.maximumValue = 2.5f;
+        _zoomSlider.value = currentScale;
+        _zoomSlider.tintColor = [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0];
+    }
     [_zoomSlider addTarget:self action:@selector(_sliderChanged:) forControlEvents:UIControlEventValueChanged];
     [panel addSubview:_zoomSlider];
 
     UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     plusBtn.frame = CGRectMake(w - plusBtnW - 10, ctrlY, plusBtnW, ctrlH);
-    [plusBtn setTitle:@"+" forState:UIControlStateNormal];
-    [plusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    plusBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
     plusBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
     plusBtn.layer.cornerRadius = 8;
     plusBtn.layer.borderWidth = 0.8;
     plusBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.40].CGColor;
     plusBtn.showsTouchWhenHighlighted = YES;
+    [plusBtn setTitle:@"+" forState:UIControlStateNormal];
+    [plusBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    plusBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
     [plusBtn addTarget:self action:@selector(_zoomPlus) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:plusBtn];
 
@@ -914,13 +982,13 @@ static VCamFloat *gVCamFloat = nil;
     CGFloat midX = (w - dBtnW) / 2.0;
 
     // Rotate Button (🔄) at top-left of D-Pad
-    UIButton *rotBtn = [self _dpadButtonWithTitle:@"🔄" x:12 y:52 w:44 h:dBtnH sel:@selector(_menuRotateVideo)];
+    UIButton *rotBtn = [self _dpadButtonWithTitle:@"🔄" x:12 y:74 w:44 h:dBtnH sel:@selector(_menuRotateVideo)];
     rotBtn.titleLabel.font = [UIFont systemFontOfSize:18];
     [panel addSubview:rotBtn];
 
     // Mirror Flip Button (🪞) at top-right of D-Pad
     BOOL isFlipped = [[VCAMTransformManager sharedManager] isMirrorFlipped];
-    UIButton *flipBtn = [self _dpadButtonWithTitle:@"🪞" x:w - 44 - 12 y:52 w:44 h:dBtnH sel:@selector(_toggleMirrorFlip:)];
+    UIButton *flipBtn = [self _dpadButtonWithTitle:@"🪞" x:w - 44 - 12 y:74 w:44 h:dBtnH sel:@selector(_toggleMirrorFlip:)];
     flipBtn.titleLabel.font = [UIFont systemFontOfSize:18];
     if (isFlipped) {
         flipBtn.backgroundColor = [UIColor colorWithRed:0.3 green:0.75 blue:1.0 alpha:0.38];
@@ -929,10 +997,10 @@ static VCamFloat *gVCamFloat = nil;
     [panel addSubview:flipBtn];
 
     // Up
-    [panel addSubview:[self _dpadButtonWithTitle:@"▲" x:midX y:52 w:dBtnW h:dBtnH sel:@selector(_moveUp)]];
+    [panel addSubview:[self _dpadButtonWithTitle:@"▲" x:midX y:74 w:dBtnW h:dBtnH sel:@selector(_moveUp)]];
 
     // Left | Center | Right
-    CGFloat row2Y = 52 + dBtnH + 4;
+    CGFloat row2Y = 74 + dBtnH + 4;
     [panel addSubview:[self _dpadButtonWithTitle:@"◀" x:midX - dBtnW - 6 y:row2Y w:dBtnW h:dBtnH sel:@selector(_moveLeft)]];
     [panel addSubview:[self _dpadButtonWithTitle:@"●" x:midX y:row2Y w:dBtnW h:dBtnH sel:@selector(_moveReset)]];
     [panel addSubview:[self _dpadButtonWithTitle:@"▶" x:midX + dBtnW + 6 y:row2Y w:dBtnW h:dBtnH sel:@selector(_moveRight)]];
@@ -957,7 +1025,7 @@ static VCamFloat *gVCamFloat = nil;
     [panel addSubview:burstBtn];
 
     // ── 3. Bottom: 6 Action Icon Buttons (Horizontal Row, 32x38) ──
-    CGFloat iconW = 32, iconH = 38, iconY = 186;
+    CGFloat iconW = 32, iconH = 38, iconY = 208;
     CGFloat iconSpacing = 4;
     CGFloat totalIconsW = 6 * iconW + 5 * iconSpacing;
     CGFloat startIconX = (w - totalIconsW) / 2.0;
@@ -1028,6 +1096,28 @@ static VCamFloat *gVCamFloat = nil;
     [self _showToast:[NSString stringWithFormat:@"Đã xoay: %d°", next]];
 }
 
+- (void)_sliderModeChanged:(UISegmentedControl *)sender {
+    _isFlashSliderMode = (sender.selectedSegmentIndex == 1);
+    if (_isFlashSliderMode) {
+        if (![[VCAMFlashLivenessManager sharedManager] isLivenessEnabled]) {
+            [[VCAMFlashLivenessManager sharedManager] setLivenessEnabled:YES];
+        }
+        CGFloat curIntensity = [[VCAMFlashLivenessManager sharedManager] flashIntensity];
+        _zoomSlider.minimumValue = 0.10f;
+        _zoomSlider.maximumValue = 0.90f;
+        _zoomSlider.value = curIntensity;
+        _zoomSlider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.18 alpha:1.0];
+        [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", curIntensity * 100.0f]];
+    } else {
+        CGFloat curScale = VCamGetScale();
+        _zoomSlider.minimumValue = 0.4f;
+        _zoomSlider.maximumValue = 2.5f;
+        _zoomSlider.value = curScale;
+        _zoomSlider.tintColor = [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0];
+        [self _showToast:[NSString stringWithFormat:@"🔍 Thu phóng: %.1fx", curScale]];
+    }
+}
+
 - (void)_updateZoomValue:(CGFloat)scale {
     if (scale < 0.4f) scale = 0.4f;
     if (scale > 2.5f) scale = 2.5f;
@@ -1037,25 +1127,49 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_sliderChanged:(UISlider *)slider {
-    [self _updateZoomValue:slider.value];
+    if (_isFlashSliderMode) {
+        CGFloat val = slider.value;
+        if (val < 0.10f) val = 0.10f;
+        if (val > 0.90f) val = 0.90f;
+        [[VCAMFlashLivenessManager sharedManager] setFlashIntensity:val];
+        [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", val * 100.0f]];
+    } else {
+        [self _updateZoomValue:slider.value];
+    }
 }
 
 - (void)_zoomMinus {
-    CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
-    CGFloat next = current - 0.10f;
-    if (next < 0.4f) next = 0.4f;
-    VCamDebugLog([NSString stringWithFormat:@"[UI] _zoomMinus: %.2f -> %.2f", current, next]);
-    [self _updateZoomValue:next];
-    [self _showToast:[NSString stringWithFormat:@"Thu nhỏ: %.1fx", next]];
+    if (_isFlashSliderMode) {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMFlashLivenessManager sharedManager] flashIntensity];
+        CGFloat next = current - 0.05f;
+        if (next < 0.10f) next = 0.10f;
+        if (_zoomSlider) _zoomSlider.value = next;
+        [[VCAMFlashLivenessManager sharedManager] setFlashIntensity:next];
+        [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", next * 100.0f]];
+    } else {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
+        CGFloat next = current - 0.10f;
+        if (next < 0.4f) next = 0.4f;
+        [self _updateZoomValue:next];
+        [self _showToast:[NSString stringWithFormat:@"Thu nhỏ: %.1fx", next]];
+    }
 }
 
 - (void)_zoomPlus {
-    CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
-    CGFloat next = current + 0.10f;
-    if (next > 2.5f) next = 2.5f;
-    VCamDebugLog([NSString stringWithFormat:@"[UI] _zoomPlus: %.2f -> %.2f", current, next]);
-    [self _updateZoomValue:next];
-    [self _showToast:[NSString stringWithFormat:@"Phóng to: %.1fx", next]];
+    if (_isFlashSliderMode) {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMFlashLivenessManager sharedManager] flashIntensity];
+        CGFloat next = current + 0.05f;
+        if (next > 0.90f) next = 0.90f;
+        if (_zoomSlider) _zoomSlider.value = next;
+        [[VCAMFlashLivenessManager sharedManager] setFlashIntensity:next];
+        [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", next * 100.0f]];
+    } else {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
+        CGFloat next = current + 0.10f;
+        if (next > 2.5f) next = 2.5f;
+        [self _updateZoomValue:next];
+        [self _showToast:[NSString stringWithFormat:@"Phóng to: %.1fx", next]];
+    }
 }
 
 - (void)_moveUp {
@@ -1105,10 +1219,18 @@ static VCamFloat *gVCamFloat = nil;
     if (next) {
         sender.backgroundColor = [UIColor colorWithRed:1.0 green:0.80 blue:0.1 alpha:0.35];
         sender.layer.borderColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:0.9].CGColor;
+        if (_modeControl) {
+            _modeControl.selectedSegmentIndex = 1;
+            [self _sliderModeChanged:_modeControl];
+        }
         [self _showToast:@"⚡ KYC Flash: ĐÃ BẬT"];
     } else {
         sender.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
         sender.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.48].CGColor;
+        if (_modeControl) {
+            _modeControl.selectedSegmentIndex = 0;
+            [self _sliderModeChanged:_modeControl];
+        }
         [self _showToast:@"⚡ KYC Flash: ĐÃ TẮT"];
     }
 }
