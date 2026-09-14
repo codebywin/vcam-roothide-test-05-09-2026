@@ -714,22 +714,39 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_setup {
-    if (_win) return;
+    if (_win) {
+        _win.hidden = NO;
+        return;
+    }
     CGFloat sz = 58;
     CGRect screen = UIScreen.mainScreen.bounds;
 
+    UIWindowScene *targetScene = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]]) {
-                _win = [[VCamFloatWindow alloc] initWithWindowScene:(UIWindowScene *)s];
+            if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) {
+                targetScene = (UIWindowScene *)s;
                 break;
             }
         }
+        if (!targetScene) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) {
+                    targetScene = (UIWindowScene *)s;
+                    break;
+                }
+            }
+        }
     }
-    if (!_win) _win = [[VCamFloatWindow alloc] initWithFrame:screen];
+
+    if (targetScene) {
+        _win = [[VCamFloatWindow alloc] initWithWindowScene:targetScene];
+    } else {
+        _win = [[VCamFloatWindow alloc] initWithFrame:screen];
+    }
 
     _win.frame = screen;
-    _win.windowLevel = UIWindowLevelAlert + 300;
+    _win.windowLevel = 10000001.0;
     _win.backgroundColor = [UIColor clearColor];
 
     _rootVC = [UIViewController new];
@@ -763,6 +780,15 @@ static VCamFloat *gVCamFloat = nil;
     [[NSNotificationCenter defaultCenter] addObserverForName:@"kVCAMMediaChangedNotification" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
         [VCamFloat refreshButton];
     }];
+
+    if (@available(iOS 13.0, *)) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:UISceneDidActivateNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
+            if ([note.object isKindOfClass:[UIWindowScene class]]) {
+                self->_win.windowScene = (UIWindowScene *)note.object;
+                self->_win.hidden = NO;
+            }
+        }];
+    }
 }
 
 - (void)_periodicRefresh {
@@ -1293,26 +1319,36 @@ static void VCamFloatRefreshButton(void)     { [VCamFloat refreshButton]; }
 static void VCamFloatHideMenu(void)          { [VCamFloat hideMenu]; }
 
 static void VCamInitSpringBoardHooks(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [[VCAMLicenseManager sharedManager] startHeartbeat];
-        [[NSNotificationCenter defaultCenter] addObserverForName:kVCAMLicenseRevokedNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
-            VCamRemoveFlag(kVCamEnabledFlagName);
-            VCamRemoveFlag(kVCamPauseFlagName);
-            VCamFloatHideMenu();
-            VCamFloatRefreshButton();
-        }];
-        [[NSNotificationCenter defaultCenter] addObserverForName:kVCAMLicenseStatusChangedNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
-            VCamFloatRefreshButton();
-        }];
-        [VCamFloat show];
-    });
+    void (^startUI)(void) = ^{
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            [[VCAMLicenseManager sharedManager] startHeartbeat];
+            [[NSNotificationCenter defaultCenter] addObserverForName:kVCAMLicenseRevokedNotification
+                                                              object:nil
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:^(NSNotification * _Nonnull note) {
+                VCamRemoveFlag(kVCamEnabledFlagName);
+                VCamRemoveFlag(kVCamPauseFlagName);
+                VCamFloatHideMenu();
+                VCamFloatRefreshButton();
+            }];
+            [[NSNotificationCenter defaultCenter] addObserverForName:kVCAMLicenseStatusChangedNotification
+                                                              object:nil
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:^(NSNotification * _Nonnull note) {
+                VCamFloatRefreshButton();
+            }];
+            [VCamFloat show];
+        });
+    };
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), startUI);
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull note) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), startUI);
+    }];
 }
 
 %ctor {
