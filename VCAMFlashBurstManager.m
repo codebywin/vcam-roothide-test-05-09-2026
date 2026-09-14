@@ -7,7 +7,8 @@
 #import <sys/stat.h>
 #import <unistd.h>
 
-static const char *kVCAMFlashBurstFileName = "vcam_flash_burst";
+static const char *kVCAMFlashBurstFileName     = "vcam_flash_burst";
+static const char *kVCAMFlashBurstModeFileName = "vcam_flash_burst_mode";
 static const NSTimeInterval kVCAMBurstDuration = 0.45; // 450ms flash cycle
 
 @implementation VCAMFlashBurstManager
@@ -53,9 +54,69 @@ static NSString *FindExistingBurstPath(void) {
     return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashBurstFileName]];
 }
 
+static NSString *FindExistingModePath(void) {
+    for (NSString *dir in PossibleTmpDirs()) {
+        NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashBurstModeFileName]];
+        if (access([p UTF8String], F_OK) == 0) {
+            return p;
+        }
+    }
+    for (NSString *dir in PossibleTmpDirs()) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+            return [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashBurstModeFileName]];
+        }
+    }
+    return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashBurstModeFileName]];
+}
+
+#pragma mark - 3-Mode Management (OFF / MANUAL / AUTO)
+
++ (VCAMFlashBurstMode)currentBurstMode {
+    static VCAMFlashBurstMode sCachedMode = VCAMFlashBurstModeAuto; // Mặc định là Tự động
+    static NSTimeInterval sLastModeCheck = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+
+    if (now - sLastModeCheck < 0.10) {
+        return sCachedMode;
+    }
+    sLastModeCheck = now;
+
+    NSString *path = FindExistingModePath();
+    FILE *f = fopen([path UTF8String], "r");
+    if (f) {
+        int m = 2;
+        if (fscanf(f, "%d", &m) == 1) {
+            if (m >= 0 && m <= 2) {
+                sCachedMode = (VCAMFlashBurstMode)m;
+            }
+        }
+        fclose(f);
+    }
+    return sCachedMode;
+}
+
++ (void)setBurstMode:(VCAMFlashBurstMode)mode {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d\n", (int)mode);
+
+    for (NSString *dir in PossibleTmpDirs()) {
+        NSString *filePath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashBurstModeFileName]];
+        FILE *f = fopen([filePath UTF8String], "w");
+        if (f) {
+            fputs(buf, f);
+            fclose(f);
+            chmod([filePath UTF8String], 0666);
+        }
+    }
+}
+
 #pragma mark - Flash Burst Trigger (IPC)
 
 + (void)triggerFlashBurst {
+    if ([self currentBurstMode] == VCAMFlashBurstModeOff) {
+        return;
+    }
+
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     char buf[64];
     snprintf(buf, sizeof(buf), "%.4f\n", now);
@@ -95,6 +156,10 @@ static NSString *FindExistingBurstPath(void) {
 }
 
 + (BOOL)isFlashBurstActive {
+    if ([self currentBurstMode] == VCAMFlashBurstModeOff) {
+        return NO;
+    }
+
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     NSTimeInterval start = [self _getBurstStartTime];
     NSTimeInterval elapsed = now - start;
@@ -102,6 +167,10 @@ static NSString *FindExistingBurstPath(void) {
 }
 
 + (float)currentBurstIntensity {
+    if ([self currentBurstMode] == VCAMFlashBurstModeOff) {
+        return 0.0f;
+    }
+
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     NSTimeInterval start = [self _getBurstStartTime];
     NSTimeInterval elapsed = now - start;
@@ -110,17 +179,22 @@ static NSString *FindExistingBurstPath(void) {
         return 0.0f;
     }
 
-    // ── Đường cong quang học chớp Flash chân thực (Optical Flash Curve) ──
-    // Giai đoạn 1: Lóe sáng bùng nổ cực nhanh (Attack: 0 -> 100ms)
-    if (elapsed <= 0.10) {
-        float progress = (float)(elapsed / 0.10);
-        return progress * 0.82f; // Bừng sáng cực đại 82%
+    // ── Đường cong quang học chớp Flash chân thực (450ms cycle) ──
+    // Giai đoạn 1: Attack nhanh bừng sáng (0 -> 70ms: vọt lên 100%)
+    if (elapsed <= 0.07) {
+        return (float)(elapsed / 0.07);
     }
 
-    // Giai đoạn 2: Tự động dịu dần mềm mại (Decay Ease-Out: 100ms -> 450ms)
-    float decayProgress = (float)((elapsed - 0.10) / (kVCAMBurstDuration - 0.10));
-    float factor = 1.0f - (decayProgress * decayProgress); // Quadratic ease-out
-    return 0.82f * MAX(0.0f, factor);
+    // Giai đoạn 2: Giữ đỉnh sáng rực rỡ (70ms -> 160ms: từ 1.0 -> 0.85)
+    if (elapsed <= 0.16) {
+        float peakProgress = (float)((elapsed - 0.07) / 0.09);
+        return 1.0f - (peakProgress * 0.15f);
+    }
+
+    // Giai đoạn 3: Suy hao dịu dần mềm mại (Decay: 160ms -> 450ms)
+    float decayProgress = (float)((elapsed - 0.16) / (kVCAMBurstDuration - 0.16));
+    float factor = 1.0f - decayProgress;
+    return 0.85f * (factor * factor); // Quadratic decay
 }
 
 #pragma mark - Metal GPU Flash & Specular Catchlight Shader
@@ -129,18 +203,28 @@ static NSString *FindExistingBurstPath(void) {
     if (!image || size.width <= 0 || size.height <= 0) return image;
 
     float intensity = [self currentBurstIntensity];
-    if (intensity <= 0.015f) return image;
+    if (intensity <= 0.02f) return image;
 
     @try {
-        // 1. Tọa độ tâm hội tụ ánh sáng (Catchlight tập trung vào vùng chữ T khuôn mặt)
+        CIImage *result = image;
+
+        // 1. Tăng phơi sáng tổng thể rõ rệt (Camera Flash EV Surge): +0.0 -> +1.35 EV
+        // Giúp toàn bộ khung hình bừng sáng chân thực như đèn flash camera iPhone thật
+        CIFilter *exposureFilter = [CIFilter filterWithName:@"CIExposureAdjust"];
+        [exposureFilter setValue:result forKey:kCIInputImageKey];
+        [exposureFilter setValue:@(intensity * 1.35f) forKey:@"inputEV"];
+        CIImage *exposed = exposureFilter.outputImage;
+        if (exposed) result = exposed;
+
+        // 2. Điểm phản quang Catchlight & quầng sáng hội tụ ở vùng khuôn mặt
         CGFloat centerX = size.width * 0.50f;
         CGFloat centerY = size.height * 0.55f;
-        CGFloat innerRadius = MIN(size.width, size.height) * 0.16f; // Vùng phản quang trán, mắt, sống mũi
-        CGFloat outerRadius = MAX(size.width, size.height) * 0.68f; // Vùng tỏa sáng mềm toàn khuôn hình
+        CGFloat innerRadius = MIN(size.width, size.height) * 0.18f; // Vùng phản quang trán, mắt, sống mũi
+        CGFloat outerRadius = MAX(size.width, size.height) * 0.70f; // Vùng tỏa sáng mềm toàn khuôn hình
 
-        // Màu trắng ấm đặc trưng của màn hình Retina Flash iPhone
-        CIColor *centerColor = [CIColor colorWithRed:1.0f green:0.98f blue:0.95f alpha:intensity];
-        CIColor *outerColor  = [CIColor colorWithRed:1.0f green:0.97f blue:0.92f alpha:intensity * 0.15f];
+        // Màu trắng ánh vàng nhẹ đặc trưng của Retina Flash
+        CIColor *centerColor = [CIColor colorWithRed:1.0f green:0.98f blue:0.94f alpha:intensity * 0.75f];
+        CIColor *outerColor  = [CIColor colorWithRed:1.0f green:0.97f blue:0.90f alpha:0.0f];
 
         CIFilter *radialGradient = [CIFilter filterWithName:@"CIRadialGradient"];
         [radialGradient setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
@@ -150,24 +234,16 @@ static NSString *FindExistingBurstPath(void) {
         [radialGradient setValue:outerColor forKey:@"inputColor1"];
 
         CIImage *lightGradient = [radialGradient.outputImage imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
-        if (!lightGradient) return image;
-
-        // 2. Pha trộn phản quang tự nhiên lên khuôn mặt bằng CISoftLightBlendMode
-        CIFilter *blendFilter = [CIFilter filterWithName:@"CISoftLightBlendMode"];
-        [blendFilter setValue:lightGradient forKey:kCIInputImageKey];
-        [blendFilter setValue:image forKey:kCIInputBackgroundImageKey];
-        CIImage *blended = blendFilter.outputImage ?: image;
-
-        // 3. Tăng phơi sáng tổng thể nhẹ (Auto-Exposure Surge) trong khoảnh khắc lóe sáng cực đại
-        if (intensity > 0.40f) {
-            CIFilter *exposureFilter = [CIFilter filterWithName:@"CIExposureAdjust"];
-            [exposureFilter setValue:blended forKey:kCIInputImageKey];
-            [exposureFilter setValue:@(intensity * 0.55f) forKey:@"inputEV"];
-            CIImage *exposed = exposureFilter.outputImage;
-            if (exposed) return exposed;
+        if (lightGradient) {
+            // Hòa trộn quang học bằng CIScreenBlendMode tạo độ phản quang tự nhiên tuyệt đẹp
+            CIFilter *blendFilter = [CIFilter filterWithName:@"CIScreenBlendMode"];
+            [blendFilter setValue:lightGradient forKey:kCIInputImageKey];
+            [blendFilter setValue:result forKey:kCIInputBackgroundImageKey];
+            CIImage *blended = blendFilter.outputImage;
+            if (blended) result = blended;
         }
 
-        return blended;
+        return result;
     } @catch (NSException *ex) {
         return image;
     }
@@ -176,23 +252,30 @@ static NSString *FindExistingBurstPath(void) {
 #pragma mark - Auto Screen Flash Detection
 
 + (void)checkAndAutoTriggerWithScreenRGB:(float)r g:(float)g b:(float)b {
+    // Chỉ hoạt động khi đang ở chế độ TỰ ĐỘNG (Auto)
+    if ([self currentBurstMode] != VCAMFlashBurstModeAuto) {
+        return;
+    }
+
     static NSTimeInterval lastTriggerTime = 0;
     static float lastBrightness = 0.5f;
 
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     float currentBrightness = (r + g + b) / 3.0f;
+    float delta = currentBrightness - lastBrightness;
 
-    // Điều kiện chớp tự động: Màn hình sáng trắng (> 78%) và tăng vọt > 18% so với nhịp trước
-    if (currentBrightness > 0.78f && (currentBrightness - lastBrightness) > 0.18f) {
-        // Cooldown 2.5 giây để chống kích hoạt trùng lặp
-        if (now - lastTriggerTime > 2.5) {
+    // Điều kiện chớp tự động nhạy và chính xác cho KYC:
+    // 1. Màn hình lóe sáng đột biến (tăng vọt > 10% và độ sáng hiện tại > 48%)
+    // 2. Hoặc màn hình cực sáng trắng (> 70%)
+    if ((delta > 0.10f && currentBrightness > 0.48f) || currentBrightness > 0.70f) {
+        if (now - lastTriggerTime > 2.0) { // Cooldown 2 giây chống lặp
             lastTriggerTime = now;
             [self triggerFlashBurst];
         }
     }
 
-    lastBrightness = currentBrightness;
+    // Làm mượt độ sáng theo dõi
+    lastBrightness = lastBrightness * 0.40f + currentBrightness * 0.60f;
 }
 
 @end
-

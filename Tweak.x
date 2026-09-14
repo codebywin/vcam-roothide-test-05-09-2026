@@ -335,7 +335,7 @@ static float                     gVideoFPS = 30.0f;
 
 static CVPixelBufferRef gRawPhotoBuffer = NULL;
 
-static void VCamResetReader(void) {
+static void VCamFullResetReader(void) {
     if (gCachedPixelBuffer) {
         CFRelease(gCachedPixelBuffer);
         gCachedPixelBuffer = NULL;
@@ -357,8 +357,76 @@ static void VCamResetReader(void) {
     gAsset = nil;
 }
 
+static BOOL VCamRewindReader(void) {
+    if (!gAsset || !gVideoTrack) return NO;
+
+    if (gNextSampleBuffer) {
+        CFRelease(gNextSampleBuffer);
+        gNextSampleBuffer = nil;
+    }
+    if (gAssetReader) {
+        [gAssetReader cancelReading];
+        gAssetReader = nil;
+    }
+    gTrackOutput = nil;
+
+    NSError *err = nil;
+    AVAssetReader *r = [AVAssetReader assetReaderWithAsset:gAsset error:&err];
+    if (!r) return NO;
+
+    AVAssetReaderTrackOutput *outp = [[AVAssetReaderTrackOutput alloc]
+        initWithTrack:gVideoTrack
+        outputSettings:@{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(gReaderFormat),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }];
+    outp.alwaysCopiesSampleData = NO;
+    [r addOutput:outp];
+
+    if (![r startReading]) {
+        return NO;
+    }
+
+    gAssetReader = r;
+    gTrackOutput = outp;
+
+    // Đọc frame đầu tiên của vòng lặp mới: CHỈ hoán đổi khi frame mới hợp lệ (Seamless Handover)
+    CMSampleBufferRef firstBuf = [gTrackOutput copyNextSampleBuffer];
+    if (firstBuf) {
+        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
+        if (pb) {
+            CFRetain(pb);
+            if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
+            gCachedPixelBuffer = pb; // Giao nhận êm đẹp, không bao giờ rơi vào NULL!
+        }
+        CFRelease(firstBuf);
+    }
+
+    // Pre-fetch frame thứ hai và lấy PTS
+    gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
+    if (gNextSampleBuffer) {
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(gNextSampleBuffer);
+        gNextFramePTS = CMTimeGetSeconds(pts);
+    } else {
+        gNextFramePTS = gCachedDuration;
+    }
+
+    return YES;
+}
+
 static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
-    VCamResetReader();
+    // Chỉ giải phóng tài nguyên reader, GIỮ NGUYÊN gCachedPixelBuffer nếu đã có để chống chớp đen
+    if (gNextSampleBuffer) {
+        CFRelease(gNextSampleBuffer);
+        gNextSampleBuffer = nil;
+    }
+    if (gAssetReader) {
+        [gAssetReader cancelReading];
+        gAssetReader = nil;
+    }
+    gTrackOutput = nil;
+    gVideoTrack = nil;
+    gAsset = nil;
 
     if (!videoPath || access([videoPath UTF8String], F_OK) != 0) return NO;
 
@@ -403,13 +471,15 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     gTrackOutput = outp;
     gReaderFormat = outputFormat;
 
-    Float64 dur = CMTimeGetSeconds(asset.duration);
-    gCachedDuration = (dur > 0.05) ? dur : 1.0;
+    // Ưu tiên thời lượng chính xác của Video Track để lặp liền mạch từng frame
+    Float64 trackDur = CMTimeGetSeconds(track.timeRange.duration);
+    Float64 assetDur = CMTimeGetSeconds(asset.duration);
+    gCachedDuration = (trackDur > 0.05) ? trackDur : ((assetDur > 0.05) ? assetDur : 1.0);
 
     float f = track.nominalFrameRate;
     gVideoFPS = (f >= 1.0f && f <= 120.0f) ? f : 30.0f;
 
-    // Đọc ngay frame đầu tiên vào gCachedPixelBuffer (Zero-copy retain)
+    // Đọc ngay frame đầu tiên vào gCachedPixelBuffer (Chỉ hoán đổi khi có frame mới hợp lệ)
     CMSampleBufferRef firstBuf = [gTrackOutput copyNextSampleBuffer];
     if (firstBuf) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
@@ -491,28 +561,14 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
             gActiveTempPath = found;
             gIsPhotoMode = isPhoto;
             gNeedsReaderReload = YES;
-            if (gRawPhotoBuffer) {
-                CFRelease(gRawPhotoBuffer);
-                gRawPhotoBuffer = NULL;
-            }
-            if (gCachedPixelBuffer) {
-                CFRelease(gCachedPixelBuffer);
-                gCachedPixelBuffer = NULL;
-            }
+            VCamFullResetReader();
         }
         if (gActiveTempPath) {
             NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:gActiveTempPath error:nil].fileModificationDate;
             if (modified && ![modified isEqualToDate:gLastTempFileModified]) {
                 gLastTempFileModified = modified;
                 gNeedsReaderReload = YES;
-                if (gRawPhotoBuffer) {
-                    CFRelease(gRawPhotoBuffer);
-                    gRawPhotoBuffer = NULL;
-                }
-                if (gCachedPixelBuffer) {
-                    CFRelease(gCachedPixelBuffer);
-                    gCachedPixelBuffer = NULL;
-                }
+                VCamFullResetReader();
             }
         }
     }
@@ -539,8 +595,8 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
         return gCachedPixelBuffer;
     }
 
-    // Khởi tạo hoặc tải lại reader nếu cần
-    if (gNeedsReaderReload || !gAssetReader || gAssetReader.status != AVAssetReaderStatusReading) {
+    // Khởi tạo reader ban đầu hoặc khi có yêu cầu tải lại
+    if (gNeedsReaderReload || !gAssetReader) {
         BOOL ok = VCamSetupReader(gActiveTempPath, originSubtype);
         if (!ok) {
             gNeedsReaderReload = YES;
@@ -554,11 +610,16 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
     if (gPlaybackStartRealTime == 0) gPlaybackStartRealTime = now;
     CFTimeInterval elapsed = now - gPlaybackStartRealTime;
 
-    // Seamless Infinite Loop: Tái sinh reader khi hết thời lượng video
-    if (gCachedDuration > 0.05 && elapsed >= gCachedDuration) {
+    // Seamless Infinite Loop: Tua lại reader ngay khi hết thời lượng video hoặc hết sample buffer
+    BOOL isAtEnd = (gCachedDuration > 0.05 && elapsed >= gCachedDuration);
+    BOOL readerDone = (!gNextSampleBuffer && gAssetReader && gAssetReader.status != AVAssetReaderStatusReading);
+
+    if (isAtEnd || readerDone) {
         gPlaybackStartRealTime = now;
         elapsed = 0;
-        VCamSetupReader(gActiveTempPath, gReaderFormat);
+        if (!VCamRewindReader()) {
+            VCamSetupReader(gActiveTempPath, gReaderFormat);
+        }
     }
 
     // Tiến trình hiển thị frame theo đúng PTS thực của video (Zero-copy retain)
@@ -952,9 +1013,16 @@ static VCamFloat *gVCamFloat = nil;
     }
     [panel addSubview:flashBtn];
 
-    // Chớp Sáng Flash Burst 1 chạm (📸) tại góc dưới bên phải D-Pad
-    UIButton *burstBtn = [self _dpadButtonWithTitle:@"📸" x:w - 44 - 12 y:row3Y w:44 h:dBtnH sel:@selector(_triggerFlashBurst)];
+    // Chớp Sáng Flash Burst (📸) tại góc dưới bên phải D-Pad: Hỗ trợ 3 Chế Độ (Auto / Manual / Off)
+    VCAMFlashBurstMode burstMode = [VCAMFlashBurstManager currentBurstMode];
+    UIButton *burstBtn = [self _dpadButtonWithTitle:@"📸" x:w - 44 - 12 y:row3Y w:44 h:dBtnH sel:@selector(_triggerFlashBurst:)];
     burstBtn.titleLabel.font = [UIFont systemFontOfSize:18];
+    [self _updateBurstButtonAppearance:burstBtn mode:burstMode];
+
+    UILongPressGestureRecognizer *burstLongPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(_onBurstBtnLongPress:)];
+    burstLongPress.minimumPressDuration = 0.55;
+    [burstBtn addGestureRecognizer:burstLongPress];
+
     [panel addSubview:burstBtn];
 
     // ── 3. Bottom: 6 Action Icon Buttons (Horizontal Row, 32x38) ──
@@ -1114,9 +1182,57 @@ static VCamFloat *gVCamFloat = nil;
     }
 }
 
-- (void)_triggerFlashBurst {
+- (void)_updateBurstButtonAppearance:(UIButton *)btn mode:(VCAMFlashBurstMode)mode {
+    if (!btn) return;
+    if (mode == VCAMFlashBurstModeAuto) {
+        btn.backgroundColor = [UIColor colorWithRed:0.15 green:0.75 blue:0.40 alpha:0.35];
+        btn.layer.borderColor = [UIColor colorWithRed:0.18 green:0.90 blue:0.44 alpha:0.95].CGColor;
+        [btn setTitle:@"📸" forState:UIControlStateNormal];
+        btn.alpha = 1.0f;
+    } else if (mode == VCAMFlashBurstModeManual) {
+        btn.backgroundColor = [UIColor colorWithRed:0.15 green:0.55 blue:0.95 alpha:0.35];
+        btn.layer.borderColor = [UIColor colorWithRed:0.25 green:0.70 blue:1.00 alpha:0.90].CGColor;
+        [btn setTitle:@"📸" forState:UIControlStateNormal];
+        btn.alpha = 1.0f;
+    } else { // VCAMFlashBurstModeOff
+        btn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.30];
+        btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
+        [btn setTitle:@"📷" forState:UIControlStateNormal];
+        btn.alpha = 0.50f;
+    }
+}
+
+- (void)_triggerFlashBurst:(UIButton *)sender {
+    VCAMFlashBurstMode mode = [VCAMFlashBurstManager currentBurstMode];
+    if (mode == VCAMFlashBurstModeOff) {
+        [self _showToast:@"⚠️ Flash đang TẮT\n(Giữ nút 📸 để Bật)"];
+        return;
+    }
     [VCAMFlashBurstManager triggerFlashBurst];
-    [self _showToast:@"📸 Chớp Flash (0.4s)"];
+    [self _showToast:@"📸 Chớp Flash (0.45s)"];
+}
+
+- (void)_onBurstBtnLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        VCAMFlashBurstMode curMode = [VCAMFlashBurstManager currentBurstMode];
+        VCAMFlashBurstMode nextMode = (curMode == VCAMFlashBurstModeAuto) ? VCAMFlashBurstModeManual :
+                                      ((curMode == VCAMFlashBurstModeManual) ? VCAMFlashBurstModeOff : VCAMFlashBurstModeAuto);
+        [VCAMFlashBurstManager setBurstMode:nextMode];
+
+        UIButton *btn = (UIButton *)gesture.view;
+        [self _updateBurstButtonAppearance:btn mode:nextMode];
+
+        UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+        [feedback impactOccurred];
+
+        if (nextMode == VCAMFlashBurstModeAuto) {
+            [self _showToast:@"🟢 Flash: TỰ ĐỘNG (Auto)"];
+        } else if (nextMode == VCAMFlashBurstModeManual) {
+            [self _showToast:@"🔵 Flash: THỦ CÔNG (Manual)"];
+        } else {
+            [self _showToast:@"⚪ Flash: ĐÃ TẮT (Off)"];
+        }
+    }
 }
 
 - (void)_moveReset {
