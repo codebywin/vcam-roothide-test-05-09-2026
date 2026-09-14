@@ -321,21 +321,37 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     return status;
 }
 
+// ── Quản lý Trạng thái Video Reader Chính (Active Reader) ──
 static AVAsset                  *gAsset = nil;
 static AVAssetTrack             *gVideoTrack = nil;
 static AVAssetReader            *gAssetReader = nil;
 static AVAssetReaderTrackOutput *gTrackOutput = nil;
 static OSType                    gReaderFormat = 0;
-static CVPixelBufferRef          gCachedPixelBuffer = nil;
-static CMSampleBufferRef         gNextSampleBuffer = nil;
+static CVPixelBufferRef          gCachedPixelBuffer = NULL;
+static CMSampleBufferRef         gNextSampleBuffer = NULL;
 static Float64                   gNextFramePTS = 0.0;
 static CFTimeInterval            gPlaybackStartRealTime = 0;
 static Float64                   gCachedDuration = 0.0;
 static float                     gVideoFPS = 30.0f;
+static CVPixelBufferRef          gRawPhotoBuffer = NULL;
 
-static CVPixelBufferRef gRawPhotoBuffer = NULL;
+// ── Standby Reader Dự Phòng Cho Vòng Lặp Liền Mạch 0.000ms (Zero-Gap Ping-Pong) ──
+static AVAsset                  *gStandbyAsset = nil;
+static AVAssetTrack             *gStandbyTrack = nil;
+static AVAssetReader            *gStandbyReader = nil;
+static AVAssetReaderTrackOutput *gStandbyOutput = nil;
+static CMSampleBufferRef         gStandbyFirstSample = NULL;
+static CMSampleBufferRef         gStandbySecondSample = NULL;
+static Float64                   gStandbySecondPTS = 0.0;
+
+// ── Tấm Chắn Chống Lộ Camera Thật (Hardware Blackout Shield) ──
+static CVPixelBufferRef          gLastEmittedPixelBuffer = NULL;
 
 static void VCamFullResetReader(void) {
+    if (gLastEmittedPixelBuffer) {
+        CFRelease(gLastEmittedPixelBuffer);
+        gLastEmittedPixelBuffer = NULL;
+    }
     if (gCachedPixelBuffer) {
         CFRelease(gCachedPixelBuffer);
         gCachedPixelBuffer = NULL;
@@ -346,8 +362,24 @@ static void VCamFullResetReader(void) {
     }
     if (gNextSampleBuffer) {
         CFRelease(gNextSampleBuffer);
-        gNextSampleBuffer = nil;
+        gNextSampleBuffer = NULL;
     }
+    if (gStandbyFirstSample) {
+        CFRelease(gStandbyFirstSample);
+        gStandbyFirstSample = NULL;
+    }
+    if (gStandbySecondSample) {
+        CFRelease(gStandbySecondSample);
+        gStandbySecondSample = NULL;
+    }
+    if (gStandbyReader) {
+        [gStandbyReader cancelReading];
+        gStandbyReader = nil;
+    }
+    gStandbyOutput = nil;
+    gStandbyTrack = nil;
+    gStandbyAsset = nil;
+
     if (gAssetReader) {
         [gAssetReader cancelReading];
         gAssetReader = nil;
@@ -357,83 +389,13 @@ static void VCamFullResetReader(void) {
     gAsset = nil;
 }
 
-static BOOL VCamRewindReader(void) {
-    if (!gAsset || !gVideoTrack) return NO;
-
-    if (gNextSampleBuffer) {
-        CFRelease(gNextSampleBuffer);
-        gNextSampleBuffer = nil;
-    }
-    if (gAssetReader) {
-        [gAssetReader cancelReading];
-        gAssetReader = nil;
-    }
-    gTrackOutput = nil;
-
-    NSError *err = nil;
-    AVAssetReader *r = [AVAssetReader assetReaderWithAsset:gAsset error:&err];
-    if (!r) return NO;
-
-    AVAssetReaderTrackOutput *outp = [[AVAssetReaderTrackOutput alloc]
-        initWithTrack:gVideoTrack
-        outputSettings:@{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(gReaderFormat),
-            (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
-        }];
-    outp.alwaysCopiesSampleData = NO;
-    [r addOutput:outp];
-
-    if (![r startReading]) {
-        return NO;
-    }
-
-    gAssetReader = r;
-    gTrackOutput = outp;
-
-    // Đọc frame đầu tiên của vòng lặp mới: CHỈ hoán đổi khi frame mới hợp lệ (Seamless Handover)
-    CMSampleBufferRef firstBuf = [gTrackOutput copyNextSampleBuffer];
-    if (firstBuf) {
-        CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
-        if (pb) {
-            CFRetain(pb);
-            if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
-            gCachedPixelBuffer = pb; // Giao nhận êm đẹp, không bao giờ rơi vào NULL!
-        }
-        CFRelease(firstBuf);
-    }
-
-    // Pre-fetch frame thứ hai và lấy PTS
-    gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
-    if (gNextSampleBuffer) {
-        CMTime pts = CMSampleBufferGetPresentationTimeStamp(gNextSampleBuffer);
-        gNextFramePTS = CMTimeGetSeconds(pts);
-    } else {
-        gNextFramePTS = gCachedDuration;
-    }
-
-    return YES;
-}
-
-static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
-    // Chỉ giải phóng tài nguyên reader, GIỮ NGUYÊN gCachedPixelBuffer nếu đã có để chống chớp đen
-    if (gNextSampleBuffer) {
-        CFRelease(gNextSampleBuffer);
-        gNextSampleBuffer = nil;
-    }
-    if (gAssetReader) {
-        [gAssetReader cancelReading];
-        gAssetReader = nil;
-    }
-    gTrackOutput = nil;
-    gVideoTrack = nil;
-    gAsset = nil;
-
-    if (!videoPath || access([videoPath UTF8String], F_OK) != 0) return NO;
+static AVAssetReader *VCamCreateReaderForPath(NSString *videoPath, OSType subtype, AVAsset **outAsset, AVAssetTrack **outTrack, AVAssetReaderTrackOutput **outOutput) {
+    if (!videoPath || access([videoPath UTF8String], F_OK) != 0) return nil;
 
     NSURL *url = [NSURL fileURLWithPath:videoPath];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
     AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-    if (!track) return NO;
+    if (!track) return nil;
 
     double angle = atan2(track.preferredTransform.b, track.preferredTransform.a);
     if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
@@ -450,7 +412,7 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
 
     NSError *err = nil;
     AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
-    if (!r) return NO;
+    if (!r) return nil;
 
     AVAssetReaderTrackOutput *outp = [[AVAssetReaderTrackOutput alloc]
         initWithTrack:track
@@ -462,16 +424,89 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     [r addOutput:outp];
 
     if (![r startReading]) {
+        return nil;
+    }
+
+    if (outAsset) *outAsset = asset;
+    if (outTrack) *outTrack = track;
+    if (outOutput) *outOutput = outp;
+    return r;
+}
+
+static BOOL VCamRewindReader(NSString *videoPath, OSType subtype) {
+    if (!videoPath) return NO;
+
+    AVAsset *asset = nil;
+    AVAssetTrack *track = nil;
+    AVAssetReaderTrackOutput *outp = nil;
+    AVAssetReader *r = VCamCreateReaderForPath(videoPath, subtype, &asset, &track, &outp);
+    if (!r) return NO;
+
+    CMSampleBufferRef firstBuf = [outp copyNextSampleBuffer];
+    if (!firstBuf) {
+        [r cancelReading];
         return NO;
+    }
+
+    // Reader mới đã sẵn sàng: Giờ mới hủy reader cũ một cách an toàn
+    if (gNextSampleBuffer) {
+        CFRelease(gNextSampleBuffer);
+        gNextSampleBuffer = NULL;
+    }
+    if (gAssetReader) {
+        [gAssetReader cancelReading];
+        gAssetReader = nil;
     }
 
     gAsset = asset;
     gVideoTrack = track;
     gAssetReader = r;
     gTrackOutput = outp;
-    gReaderFormat = outputFormat;
 
-    // Ưu tiên thời lượng chính xác của Video Track để lặp liền mạch từng frame
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
+    if (pb) {
+        CFRetain(pb);
+        if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
+        gCachedPixelBuffer = pb;
+    }
+    CFRelease(firstBuf);
+
+    gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
+    if (gNextSampleBuffer) {
+        gNextFramePTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(gNextSampleBuffer));
+    } else {
+        gNextFramePTS = gCachedDuration;
+    }
+
+    return YES;
+}
+
+static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
+    // Thu hồi reader đang chạy (nếu có)
+    if (gNextSampleBuffer) {
+        CFRelease(gNextSampleBuffer);
+        gNextSampleBuffer = NULL;
+    }
+    if (gAssetReader) {
+        [gAssetReader cancelReading];
+        gAssetReader = nil;
+    }
+    gTrackOutput = nil;
+    gVideoTrack = nil;
+    gAsset = nil;
+
+    AVAsset *asset = nil;
+    AVAssetTrack *track = nil;
+    AVAssetReaderTrackOutput *outp = nil;
+    AVAssetReader *r = VCamCreateReaderForPath(videoPath, subtype, &asset, &track, &outp);
+    if (!r) return NO;
+
+    gAsset = asset;
+    gVideoTrack = track;
+    gAssetReader = r;
+    gTrackOutput = outp;
+    gReaderFormat = ((NSNumber *)[outp.outputSettings objectForKey:(id)kCVPixelBufferPixelFormatTypeKey]).unsignedIntValue;
+
     Float64 trackDur = CMTimeGetSeconds(track.timeRange.duration);
     Float64 assetDur = CMTimeGetSeconds(asset.duration);
     gCachedDuration = (trackDur > 0.05) ? trackDur : ((assetDur > 0.05) ? assetDur : 1.0);
@@ -610,15 +645,83 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
     if (gPlaybackStartRealTime == 0) gPlaybackStartRealTime = now;
     CFTimeInterval elapsed = now - gPlaybackStartRealTime;
 
-    // Seamless Infinite Loop: Tua lại reader ngay khi hết thời lượng video hoặc hết sample buffer
+    // ── PRE-ROLL STANDBY READER: Khởi tạo sẵn Reader dự phòng ở 70% thời lượng video ──
+    // Đảm bảo đến cuối video là có sẵn Frame 0 và Frame 1 trong RAM, chuyển giao 0.000ms!
+    if (!gStandbyReader && gCachedDuration > 0.8 && elapsed >= (gCachedDuration * 0.70)) {
+        AVAsset *sbAsset = nil;
+        AVAssetTrack *sbTrack = nil;
+        AVAssetReaderTrackOutput *sbOutput = nil;
+        AVAssetReader *sbReader = VCamCreateReaderForPath(gActiveTempPath, gReaderFormat, &sbAsset, &sbTrack, &sbOutput);
+        if (sbReader) {
+            CMSampleBufferRef sFirst = [sbOutput copyNextSampleBuffer];
+            CMSampleBufferRef sSecond = [sbOutput copyNextSampleBuffer];
+            if (sFirst) {
+                gStandbyAsset = sbAsset;
+                gStandbyTrack = sbTrack;
+                gStandbyOutput = sbOutput;
+                gStandbyReader = sbReader;
+                gStandbyFirstSample = sFirst;
+                gStandbySecondSample = sSecond;
+                if (sSecond) {
+                    gStandbySecondPTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sSecond));
+                } else {
+                    gStandbySecondPTS = gCachedDuration;
+                }
+            } else {
+                [sbReader cancelReading];
+            }
+        }
+    }
+
+    // ── Seamless Infinite Loop: Lặp vô tận liền mạch 100% không chớp đen ──
     BOOL isAtEnd = (gCachedDuration > 0.05 && elapsed >= gCachedDuration);
     BOOL readerDone = (!gNextSampleBuffer && gAssetReader && gAssetReader.status != AVAssetReaderStatusReading);
 
     if (isAtEnd || readerDone) {
         gPlaybackStartRealTime = now;
         elapsed = 0;
-        if (!VCamRewindReader()) {
-            VCamSetupReader(gActiveTempPath, gReaderFormat);
+
+        if (gStandbyReader && gStandbyFirstSample) {
+            // Chuyển giao tức thì (0.000ms) từ Standby sang Active
+            if (gNextSampleBuffer) {
+                CFRelease(gNextSampleBuffer);
+                gNextSampleBuffer = NULL;
+            }
+            if (gAssetReader) {
+                [gAssetReader cancelReading];
+                gAssetReader = nil;
+            }
+            gTrackOutput = nil;
+            gVideoTrack = nil;
+            gAsset = nil;
+
+            gAsset = gStandbyAsset;
+            gVideoTrack = gStandbyTrack;
+            gAssetReader = gStandbyReader;
+            gTrackOutput = gStandbyOutput;
+
+            gStandbyAsset = nil;
+            gStandbyTrack = nil;
+            gStandbyReader = nil;
+            gStandbyOutput = nil;
+
+            CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(gStandbyFirstSample);
+            if (pb) {
+                CFRetain(pb);
+                if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
+                gCachedPixelBuffer = pb;
+            }
+            CFRelease(gStandbyFirstSample);
+            gStandbyFirstSample = NULL;
+
+            gNextSampleBuffer = gStandbySecondSample;
+            gStandbySecondSample = NULL;
+            gNextFramePTS = gStandbySecondPTS;
+        } else {
+            // Fallback an toàn nếu Standby chưa kịp nạp
+            if (!VCamRewindReader(gActiveTempPath, gReaderFormat)) {
+                VCamSetupReader(gActiveTempPath, gReaderFormat);
+            }
         }
     }
 
@@ -665,10 +768,20 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
     }
 
     CVPixelBufferRef srcPb = VCamGetPixelBufferMatching(sampleBuffer);
+    if (!srcPb && VCamIsActive() && gLastEmittedPixelBuffer) {
+        // TẤM CHẮN CHỐNG ĐEN CAMERA: Tuyệt đối không cho phép lộ hình ảnh camera thật (mặt bàn đen)
+        srcPb = gLastEmittedPixelBuffer;
+    }
+
     if (srcPb) {
         OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
         if (err == noErr) {
             CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldNotPropagate);
+            if (srcPb != gLastEmittedPixelBuffer) {
+                if (gLastEmittedPixelBuffer) CFRelease(gLastEmittedPixelBuffer);
+                CFRetain(srcPb);
+                gLastEmittedPixelBuffer = srcPb;
+            }
         }
     }
 
