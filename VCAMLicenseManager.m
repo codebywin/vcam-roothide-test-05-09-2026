@@ -637,61 +637,24 @@ static UIWindow *VCAMGetTopWindow(void) {
 
         NSString *title = @"🔐 Kích Hoạt VCAM iOS";
         NSString *hwidShort = (self.hwid.length >= 16) ? [self.hwid substringToIndex:16] : (self.hwid ?: @"Unknown");
-        NSString *msg = reason ?: [NSString stringWithFormat:@"Mã máy (HWID):\n%@\n\nVui lòng nhập mã key để tiếp tục sử dụng:", hwidShort];
+        NSString *msg = reason ?: [NSString stringWithFormat:@"Mã máy (HWID):\n%@\n\nChạm giữ vào ô bên dưới và chọn 'Dán' (Paste):", hwidShort];
 
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
 
-        // Tự động kiểm tra Clipboard: Nếu đã copy key (chứa "VCAM" hoặc có dấu gạch ngang), tự động điền sẵn vào ô nhập
-        NSString *initialKey = self.currentKey ?: @"";
-        @try {
-            NSString *pasteStr = [UIPasteboard generalPasteboard].string;
-            if (pasteStr.length > 0) {
-                pasteStr = [pasteStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if (pasteStr.length >= 8 && ([pasteStr containsString:@"VCAM"] || [pasteStr containsString:@"-"])) {
-                    initialKey = pasteStr;
-                }
-            }
-        } @catch (id ex) {}
-
+        // Tuyệt đối KHÔNG đọc [UIPasteboard generalPasteboard].string tại đây để tránh deadlock treo SpringBoard trên iOS 16
         [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-            textField.placeholder = @"VCAM-XXXX-XXXX-XXXX";
+            textField.placeholder = @"Chạm giữ và chọn 'Dán' key";
             textField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
             textField.autocorrectionType = UITextAutocorrectionTypeNo;
-            textField.text = initialKey;
+            textField.text = self.currentKey ?: @"";
             textField.clearButtonMode = UITextFieldViewModeWhileEditing;
         }];
 
         __weak typeof(self) weakSelf = self;
 
-        // Nút 1: Dán từ clipboard và Kích hoạt ngay (Không bao giờ mở lại alert gây treo máy)
-        [alert addAction:[UIAlertAction actionWithTitle:@"📋 Dán mã & Kích hoạt" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            NSString *pasteStr = nil;
-            @try {
-                pasteStr = [UIPasteboard generalPasteboard].string;
-            } @catch (id ex) {}
-
-            UITextField *tf = alert.textFields.firstObject;
-            NSString *keyToUse = (pasteStr.length >= 6) ? pasteStr : tf.text;
-            keyToUse = [keyToUse stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-
-            if (keyToUse.length == 0) {
-                return;
-            }
-
-            [weakSelf activateWithKey:keyToUse completion:^(BOOL success, NSString *message) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    UIAlertController *resultAlert = [UIAlertController alertControllerWithTitle:success ? @"🎉 Thành Công" : @"❌ Thất Bại"
-                                                                                         message:message
-                                                                                  preferredStyle:UIAlertControllerStyleAlert];
-                    [resultAlert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-                    [targetVC presentViewController:resultAlert animated:YES completion:nil];
-                });
-            }];
-        }]];
-
-        // Nút 2: Kích hoạt (Dùng nội dung trong textfield)
+        // Nút 1: Kích hoạt (Dùng nội dung trong textfield được dán bằng cơ chế native của iOS)
         [alert addAction:[UIAlertAction actionWithTitle:@"⚡ Kích Hoạt" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             UITextField *tf = alert.textFields.firstObject;
             NSString *key = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -708,11 +671,14 @@ static UIWindow *VCAMGetTopWindow(void) {
             }];
         }]];
 
-        // Nút 3: Sao chép HWID (hỗ trợ user copy gửi admin)
+        // Nút 2: Sao chép HWID (Chạy nền bất đồng bộ để tuyệt đối không bao giờ block main runloop của SpringBoard)
         [alert addAction:[UIAlertAction actionWithTitle:@"📋 Sao chép HWID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            @try {
-                [UIPasteboard generalPasteboard].string = weakSelf.hwid ?: @"";
-            } @catch (id ex) {}
+            NSString *hwidToCopy = weakSelf.hwid ?: @"";
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                @try {
+                    [UIPasteboard generalPasteboard].string = hwidToCopy;
+                } @catch (id ex) {}
+            });
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
