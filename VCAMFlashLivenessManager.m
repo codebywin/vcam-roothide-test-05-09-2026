@@ -56,10 +56,8 @@ typedef CFTypeRef (*UICreateScreenUIImageFunc)(void);
             _uikitCreateScreenUIImage = (UICreateScreenUIImageFunc)dlsym(RTLD_DEFAULT, "_UICreateScreenUIImage");
         }
 
-        // Default to disabled on startup to prevent unwanted background execution
-        _isEnabled = NO;
-        _isTestMode = NO;
-        _intensity = 0.35f;
+        // Tự động bật giám sát màn hình ngầm để luôn sẵn sàng bắt chớp sáng chụp ảnh
+        [self startScreenColorMonitoring];
     }
     return self;
 }
@@ -77,12 +75,6 @@ typedef CFTypeRef (*UICreateScreenUIImageFunc)(void);
     s.testMode = _isTestMode;
     s.intensity = (float)_intensity;
     [VCAMFlashLivenessManager saveFlashState:s];
-
-    if (enabled) {
-        [self startScreenColorMonitoring];
-    } else {
-        [self stopScreenColorMonitoring];
-    }
 }
 
 - (BOOL)isTestModeEnabled {
@@ -240,9 +232,19 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
 }
 
 - (void)_sampleTick {
-    if (!_isEnabled) return;
+    // Chỉ lấy mẫu khi VCAM đang bật thay thế camera
+    static BOOL sHasEnabled = NO;
+    static NSTimeInterval sLastFlagCheck = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - sLastFlagCheck > 0.5) {
+        sLastFlagCheck = now;
+        sHasEnabled = (access("/var/tmp/vcam_enabled", F_OK) == 0 ||
+                       access("/rootfs/private/var/tmp/vcam_enabled", F_OK) == 0 ||
+                       access("/private/var/tmp/vcam_enabled", F_OK) == 0);
+    }
+    if (!sHasEnabled) return;
 
-    if (_isTestMode) {
+    if (_isTestMode && _isEnabled) {
         // Test Simulation: Cycle through common eKYC flash colors every 500ms (0% memory overhead)
         static const float testPalette[6][3] = {
             {1.00f, 1.00f, 1.00f}, // Sáng trắng
@@ -254,7 +256,6 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
         };
 
         static NSTimeInterval lastCycleTime = 0;
-        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         if (now - lastCycleTime > 0.50) {
             lastCycleTime = now;
             _testColorIndex = (_testColorIndex + 1) % 6;
@@ -292,22 +293,24 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
                     float sampleR = 1.0f, sampleG = 1.0f, sampleB = 1.0f;
                     ComputeAverageRGB(cg, &sampleR, &sampleG, &sampleB);
 
-                    // Tự động kích hoạt chớp sáng nếu phát hiện màn hình chớp trắng chụp ảnh
+                    // 1. LUÔN TỰ ĐỘNG BẮT CHỚP SÁNG CHỤP ẢNH (Auto Screen Flash on Capture)
                     [VCAMFlashBurstManager checkAndAutoTriggerWithScreenRGB:sampleR g:sampleG b:sampleB];
 
-                    // Sensor Latency Simulation (Low-pass EMA filter)
-                    _smoothedR = _smoothedR * 0.35f + sampleR * 0.65f;
-                    _smoothedG = _smoothedG * 0.35f + sampleG * 0.65f;
-                    _smoothedB = _smoothedB * 0.35f + sampleB * 0.65f;
+                    // 2. Nếu người dùng bật thêm nút ⚡ (KYC Flash) thì hắt thêm màu phản quang
+                    if (_isEnabled) {
+                        _smoothedR = _smoothedR * 0.35f + sampleR * 0.65f;
+                        _smoothedG = _smoothedG * 0.35f + sampleG * 0.65f;
+                        _smoothedB = _smoothedB * 0.35f + sampleB * 0.65f;
 
-                    VCAMFlashState s;
-                    s.active = YES;
-                    s.testMode = NO;
-                    s.r = _smoothedR;
-                    s.g = _smoothedG;
-                    s.b = _smoothedB;
-                    s.intensity = (float)_intensity;
-                    [VCAMFlashLivenessManager saveFlashState:s];
+                        VCAMFlashState s;
+                        s.active = YES;
+                        s.testMode = NO;
+                        s.r = _smoothedR;
+                        s.g = _smoothedG;
+                        s.b = _smoothedB;
+                        s.intensity = (float)_intensity;
+                        [VCAMFlashLivenessManager saveFlashState:s];
+                    }
                 }
             }
         }

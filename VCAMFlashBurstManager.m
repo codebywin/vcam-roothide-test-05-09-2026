@@ -182,10 +182,10 @@ static NSString *FindExistingBurstPath(void) {
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     float currentBrightness = (r + g + b) / 3.0f;
 
-    // Điều kiện chớp tự động: Màn hình sáng trắng đột ngột (> 82%) và tăng vọt > 25% so với nhịp trước
-    if (currentBrightness > 0.82f && (currentBrightness - lastBrightness) > 0.22f) {
-        // Cooldown 3.0 giây để chống kích hoạt liên tục khi xem màn hình trắng thông thường
-        if (now - lastTriggerTime > 3.0) {
+    // Điều kiện chớp tự động: Màn hình sáng trắng (> 78%) và tăng vọt > 18% so với nhịp trước
+    if (currentBrightness > 0.78f && (currentBrightness - lastBrightness) > 0.18f) {
+        // Cooldown 2.5 giây để chống kích hoạt trùng lặp
+        if (now - lastTriggerTime > 2.5) {
             lastTriggerTime = now;
             [self triggerFlashBurst];
         }
@@ -195,3 +195,4 @@ static NSString *FindExistingBurstPath(void) {
 }
 
 @end
+
