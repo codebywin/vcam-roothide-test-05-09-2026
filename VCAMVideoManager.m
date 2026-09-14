@@ -60,7 +60,7 @@ static NSArray<NSString *> *PossibleTmpDirs(void) {
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.mediaTypes = @[@"public.movie"];
     picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
-    picker.allowsEditing = YES; // Bật tính năng cắt video mặc định của iOS
+    picker.allowsEditing = NO; // Tắt hoàn toàn giao diện cắt video, chọn trực tiếp video gốc
     picker.videoMaximumDuration = 600.0; // Giới hạn tối đa 10 phút
     picker.delegate = self;
 
@@ -76,7 +76,7 @@ static NSArray<NSString *> *PossibleTmpDirs(void) {
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
 
-    // Lấy URL video đã cắt/chọn từ iOS trimmer
+    // Lấy URL video trực tiếp từ photo library
     NSURL *url = info[UIImagePickerControllerMediaURL];
     if (!url) {
         url = info[UIImagePickerControllerReferenceURL];
@@ -103,15 +103,13 @@ static NSArray<NSString *> *PossibleTmpDirs(void) {
 
     for (NSString *dir in PossibleTmpDirs()) {
         NSString *destPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempFileName]];
-        unlink([destPath UTF8String]);
+        NSString *tmpWritePath = [destPath stringByAppendingString:@".tmp"];
+        unlink([tmpWritePath UTF8String]);
 
-        // Xóa ảnh cũ để ưu tiên video vừa chọn
-        NSString *photoPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempPhotoFileName]];
-        unlink([photoPath UTF8String]);
-
+        // Ghi vào file tạm .tmp trước để không làm gián đoạn mediaserverd đang đọc
         BOOL saved = NO;
         if (data && data.length > 0) {
-            FILE *f = fopen([destPath UTF8String], "wb");
+            FILE *f = fopen([tmpWritePath UTF8String], "wb");
             if (f) {
                 size_t written = fwrite(data.bytes, 1, data.length, f);
                 fflush(f);
@@ -121,18 +119,25 @@ static NSArray<NSString *> *PossibleTmpDirs(void) {
         }
 
         if (!saved) {
-            [fm removeItemAtPath:destPath error:nil];
-            saved = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:destPath] error:nil];
+            [fm removeItemAtPath:tmpWritePath error:nil];
+            saved = [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:tmpWritePath] error:nil];
         }
 
         if (!saved && url.path) {
-            saved = [fm copyItemAtPath:url.path toPath:destPath error:nil];
+            saved = [fm copyItemAtPath:url.path toPath:tmpWritePath error:nil];
         }
 
-        if (saved || (access([destPath UTF8String], F_OK) == 0)) {
+        if (saved || (access([tmpWritePath UTF8String], F_OK) == 0)) {
+            chmod([tmpWritePath UTF8String], 0666);
+            // Đổi tên nguyên tử (Atomic Rename): mediaserverd sẽ lập tức thấy file hoàn chỉnh, không bao giờ thấy file rỗng hay bị xóa dở
+            rename([tmpWritePath UTF8String], [destPath UTF8String]);
             chmod([destPath UTF8String], 0666);
             anySaved = YES;
         }
+
+        // Xóa ảnh cũ để ưu tiên video vừa chọn
+        NSString *photoPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamTempPhotoFileName]];
+        unlink([photoPath UTF8String]);
 
         // Bật cờ enabled
         NSString *enPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCamEnabledFlagName]];
@@ -150,7 +155,7 @@ static NSArray<NSString *> *PossibleTmpDirs(void) {
 
     if (anySaved) {
         NSLog(@"[VCAMVideo] Video đã được lưu thành công vào các thư mục tmp (size: %lu bytes)", (unsigned long)(data ? data.length : 0));
-        [self _showToast:@"🎬 Đã chọn & cắt video thành công!" inView:_currentPresenter.view];
+        [self _showToast:@"🎬 Đã chọn video thành công!" inView:_currentPresenter.view];
         [[NSNotificationCenter defaultCenter] postNotificationName:@"kVCAMMediaChangedNotification" object:nil];
     } else {
         NSLog(@"[VCAMVideo] LỖI ghi file video: %@", err.localizedDescription);

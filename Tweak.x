@@ -361,14 +361,87 @@ static void VCamResetReader(BOOL clearCachedFrame) {
     }
 }
 
-static BOOL VCamSetupReader(NSString *videoPath, OSType subtype, BOOL isLooping) {
+static BOOL VCamRestartReader(NSString *videoPath, OSType outputFormat) {
+    if (!videoPath || access([videoPath UTF8String], F_OK) != 0) return NO;
+
+    NSURL *url = [NSURL fileURLWithPath:videoPath];
+    AVURLAsset *newAsset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
+    AVAssetTrack *newTrack = [[newAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!newTrack) return NO;
+
+    NSError *err = nil;
+    AVAssetReader *newReader = [AVAssetReader assetReaderWithAsset:newAsset error:&err];
+    if (!newReader) return NO;
+
+    AVAssetReaderTrackOutput *newOutp = [[AVAssetReaderTrackOutput alloc]
+        initWithTrack:newTrack
+        outputSettings:@{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(outputFormat),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        }];
+    newOutp.alwaysCopiesSampleData = NO;
+    [newReader addOutput:newOutp];
+
+    if (![newReader startReading]) {
+        return NO;
+    }
+
+    // Đọc frame 0 của vòng lặp mới TRƯỚC KHI hủy reader cũ
+    CMSampleBufferRef firstBuf = [newOutp copyNextSampleBuffer];
+    if (!firstBuf) {
+        [newReader cancelReading];
+        return NO;
+    }
+
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
+    if (!pb) {
+        CFRelease(firstBuf);
+        [newReader cancelReading];
+        return NO;
+    }
+
+    // Frame 0 đã ở trong tay! An toàn 100% để hủy reader cũ
+    if (gAssetReader) {
+        [gAssetReader cancelReading];
+        gAssetReader = nil;
+    }
+    if (gNextSampleBuffer) {
+        CFRelease(gNextSampleBuffer);
+        gNextSampleBuffer = nil;
+    }
+
+    // Cập nhật gCachedPixelBuffer = frame 0
+    CFRetain(pb);
+    if (gCachedPixelBuffer) CFRelease(gCachedPixelBuffer);
+    gCachedPixelBuffer = pb;
+    CFRelease(firstBuf);
+
+    // Pre-fetch frame 1
+    gNextSampleBuffer = [newOutp copyNextSampleBuffer];
+    if (gNextSampleBuffer) {
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(gNextSampleBuffer);
+        gNextFramePTS = CMTimeGetSeconds(pts);
+    } else {
+        gNextFramePTS = gCachedDuration;
+    }
+
+    gAsset = newAsset;
+    gVideoTrack = newTrack;
+    gAssetReader = newReader;
+    gTrackOutput = newOutp;
+    gReaderFormat = outputFormat;
+
+    return YES;
+}
+
+static BOOL VCamSetupReader(NSString *videoPath, OSType subtype) {
     if (!videoPath || access([videoPath UTF8String], F_OK) != 0) {
         VCamResetReader(YES);
         return NO;
     }
 
-    // Khi lặp lại video: Không hủy frame cũ để tránh chớp đen (Seamless Double-Buffering)
-    VCamResetReader(!isLooping);
+    // Giữ gCachedPixelBuffer sống cho đến khi frame đầu tiên sẵn sàng
+    VCamResetReader(NO);
 
     OSType outputFormat = subtype;
     if (outputFormat != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
@@ -377,31 +450,22 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype, BOOL isLooping)
         outputFormat = kCVPixelFormatType_32BGRA;
     }
 
-    AVAsset *asset = gAsset;
-    AVAssetTrack *track = gVideoTrack;
+    NSURL *url = [NSURL fileURLWithPath:videoPath];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
+    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!track) return NO;
 
-    if (!asset || !track || ![videoPath isEqualToString:gLoadedVideoPath]) {
-        NSURL *url = [NSURL fileURLWithPath:videoPath];
-        asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
-        track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-        if (!track) return NO;
+    double angle = atan2(track.preferredTransform.b, track.preferredTransform.a);
+    if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
+    else if (fabs(angle + M_PI_2) < 0.05)     gVideoExifOrientation = 8;
+    else if (fabs(fabs(angle) - M_PI) < 0.05) gVideoExifOrientation = 3;
+    else                                       gVideoExifOrientation = 1;
 
-        gAsset = asset;
-        gVideoTrack = track;
-        gLoadedVideoPath = [videoPath copy];
+    Float64 dur = CMTimeGetSeconds(asset.duration);
+    gCachedDuration = (dur > 0.05) ? dur : 1.0;
 
-        double angle = atan2(track.preferredTransform.b, track.preferredTransform.a);
-        if (fabs(angle - M_PI_2) < 0.05)          gVideoExifOrientation = 6;
-        else if (fabs(angle + M_PI_2) < 0.05)     gVideoExifOrientation = 8;
-        else if (fabs(fabs(angle) - M_PI) < 0.05) gVideoExifOrientation = 3;
-        else                                       gVideoExifOrientation = 1;
-
-        Float64 dur = CMTimeGetSeconds(asset.duration);
-        gCachedDuration = (dur > 0.05) ? dur : 1.0;
-
-        float f = track.nominalFrameRate;
-        gVideoFPS = (f >= 1.0f && f <= 120.0f) ? f : 30.0f;
-    }
+    float f = track.nominalFrameRate;
+    gVideoFPS = (f >= 1.0f && f <= 120.0f) ? f : 30.0f;
 
     NSError *err = nil;
     AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
@@ -420,12 +484,8 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype, BOOL isLooping)
         return NO;
     }
 
-    gAssetReader = r;
-    gTrackOutput = outp;
-    gReaderFormat = outputFormat;
-
     // Đọc ngay frame đầu tiên vào gCachedPixelBuffer (Chỉ giải phóng frame cũ sau khi frame mới đã sẵn sàng)
-    CMSampleBufferRef firstBuf = [gTrackOutput copyNextSampleBuffer];
+    CMSampleBufferRef firstBuf = [outp copyNextSampleBuffer];
     if (firstBuf) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(firstBuf);
         if (pb) {
@@ -437,13 +497,20 @@ static BOOL VCamSetupReader(NSString *videoPath, OSType subtype, BOOL isLooping)
     }
 
     // Pre-fetch frame thứ hai và lấy PTS
-    gNextSampleBuffer = [gTrackOutput copyNextSampleBuffer];
+    gNextSampleBuffer = [outp copyNextSampleBuffer];
     if (gNextSampleBuffer) {
         CMTime pts = CMSampleBufferGetPresentationTimeStamp(gNextSampleBuffer);
         gNextFramePTS = CMTimeGetSeconds(pts);
     } else {
         gNextFramePTS = gCachedDuration;
     }
+
+    gAsset = asset;
+    gVideoTrack = track;
+    gAssetReader = r;
+    gTrackOutput = outp;
+    gReaderFormat = outputFormat;
+    gLoadedVideoPath = [videoPath copy];
 
     return YES;
 }
@@ -510,10 +577,7 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
                 CFRelease(gRawPhotoBuffer);
                 gRawPhotoBuffer = NULL;
             }
-            if (gCachedPixelBuffer) {
-                CFRelease(gCachedPixelBuffer);
-                gCachedPixelBuffer = NULL;
-            }
+            // Không xóa gCachedPixelBuffer ở đây để camera không bị đen trong lúc nạp file mới
         }
         if (gActiveTempPath) {
             NSDate *modified = [[NSFileManager defaultManager] attributesOfItemAtPath:gActiveTempPath error:nil].fileModificationDate;
@@ -524,10 +588,7 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
                     CFRelease(gRawPhotoBuffer);
                     gRawPhotoBuffer = NULL;
                 }
-                if (gCachedPixelBuffer) {
-                    CFRelease(gCachedPixelBuffer);
-                    gCachedPixelBuffer = NULL;
-                }
+                // Không xóa gCachedPixelBuffer ở đây để camera không bị đen trong lúc nạp file mới
             }
         }
     }
@@ -556,7 +617,7 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
 
     // Khởi tạo hoặc tải lại reader nếu cần
     if (gNeedsReaderReload || !gAssetReader || gAssetReader.status != AVAssetReaderStatusReading) {
-        BOOL ok = VCamSetupReader(gActiveTempPath, originSubtype, NO);
+        BOOL ok = VCamSetupReader(gActiveTempPath, originSubtype);
         if (!ok) {
             gNeedsReaderReload = YES;
             return gCachedPixelBuffer;
@@ -572,9 +633,11 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
     // Seamless Infinite Loop: Tái sinh reader ngay khi hết frame hoặc hết thời lượng video (Double-buffering)
     BOOL trackEnded = (gNextSampleBuffer == nil && elapsed > 0.05);
     if ((gCachedDuration > 0.05 && elapsed >= gCachedDuration) || trackEnded) {
-        gPlaybackStartRealTime = now;
-        elapsed = 0;
-        VCamSetupReader(gActiveTempPath, gReaderFormat, YES);
+        BOOL ok = VCamRestartReader(gActiveTempPath, gReaderFormat);
+        if (ok) {
+            gPlaybackStartRealTime = now;
+            elapsed = 0;
+        }
     }
 
     // Tiến trình hiển thị frame theo đúng PTS thực của video (Zero-copy retain)
