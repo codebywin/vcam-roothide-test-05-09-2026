@@ -885,20 +885,48 @@ static VCamFloat *gVCamFloat = nil;
     if (gVCamFloat) [gVCamFloat _hideMenu];
 }
 
-- (void)_setup {
-    if (_win) return;
-    CGFloat sz = 58;
-    CGRect screen = UIScreen.mainScreen.bounds;
-
+- (void)_ensureVisible {
     if (@available(iOS 13.0, *)) {
-        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]]) {
-                _win = [[VCamFloatWindow alloc] initWithWindowScene:(UIWindowScene *)s];
-                break;
+        if (_win && !_win.windowScene) {
+            for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                if ([s isKindOfClass:[UIWindowScene class]]) {
+                    _win.windowScene = (UIWindowScene *)s;
+                    break;
+                }
             }
         }
     }
-    if (!_win) _win = [[VCamFloatWindow alloc] initWithFrame:screen];
+    if (_win && _win.hidden) {
+        _win.hidden = NO;
+    }
+}
+
+- (void)_setup {
+    CGFloat sz = 58;
+    CGRect screen = UIScreen.mainScreen.bounds;
+
+    if (_win) {
+        [self _ensureVisible];
+        return;
+    }
+
+    UIWindowScene *activeScene = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)s;
+                if (ws.activationState == UISceneActivationStateForegroundActive || !activeScene) {
+                    activeScene = ws;
+                }
+            }
+        }
+    }
+
+    if (activeScene) {
+        _win = [[VCamFloatWindow alloc] initWithWindowScene:activeScene];
+    } else {
+        _win = [[VCamFloatWindow alloc] initWithFrame:screen];
+    }
 
     _win.frame = screen;
     _win.windowLevel = UIWindowLevelAlert + 300;
@@ -938,6 +966,7 @@ static VCamFloat *gVCamFloat = nil;
 }
 
 - (void)_periodicRefresh {
+    [self _ensureVisible];
     [VCamFloat refreshButton];
 }
 
@@ -1444,8 +1473,7 @@ static void VCamFloatRefreshButton(void)     { [VCamFloat refreshButton]; }
 static void VCamFloatHideMenu(void)          { [VCamFloat hideMenu]; }
 
 static void VCamInitSpringBoardHooks(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
+    void (^showBlock)(void) = ^{
         [[VCAMLicenseManager sharedManager] startHeartbeat];
         [[NSNotificationCenter defaultCenter] addObserverForName:kVCAMLicenseRevokedNotification
                                                           object:nil
@@ -1463,7 +1491,19 @@ static void VCamInitSpringBoardHooks(void) {
             VCamFloatRefreshButton();
         }];
         [VCamFloat show];
-    });
+    };
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), showBlock);
+
+    if (@available(iOS 13.0, *)) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:UISceneDidActivateNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            [VCamFloat show];
+        }];
+    }
 }
 
 %ctor {
