@@ -24,6 +24,7 @@
 #define VCamPickerDelegate              _0x77d20f
 #define VCAMPhotoManager                _0x11e47a
 #define VCAMVideoManager                _0x55c391
+#define VCAMFlashBurstManager           _0x7b39a4
 
 // 2. Mã hóa các hàm kiểm tra bản quyền & kích hoạt
 #define isLicenseValid                  _0xa8f102
