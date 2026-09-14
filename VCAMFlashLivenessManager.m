@@ -155,7 +155,7 @@ static NSString *FindExistingStatePath(void) {
     static VCAMFlashState cachedState = {1.0f, 1.0f, 1.0f, 0.35f, NO, NO};
     static NSTimeInterval lastReadTime = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - lastReadTime < 0.05) { // 50ms throttle cache
+    if (now - lastReadTime < 0.30) { // 300ms throttle cache to reduce disk I/O
         return cachedState;
     }
     lastReadTime = now;
