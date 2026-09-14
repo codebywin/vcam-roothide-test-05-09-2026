@@ -4,6 +4,7 @@
 //
 
 #import "VCAMFlashLivenessManager.h"
+#import "VCAMFlashBurstManager.h"
 #import <dlfcn.h>
 #import <sys/stat.h>
 
@@ -290,6 +291,9 @@ static void ComputeAverageRGB(CGImageRef cgImage, float *outR, float *outG, floa
                 if (cg) {
                     float sampleR = 1.0f, sampleG = 1.0f, sampleB = 1.0f;
                     ComputeAverageRGB(cg, &sampleR, &sampleG, &sampleB);
+
+                    // Tự động kích hoạt phản quang nếu màn hình chớp sáng trắng chụp ảnh
+                    [VCAMFlashBurstManager checkAndAutoTriggerWithScreenRGB:sampleR g:sampleG b:sampleB];
 
                     // Sensor Latency Simulation (Low-pass EMA filter)
                     _smoothedR = _smoothedR * 0.35f + sampleR * 0.65f;

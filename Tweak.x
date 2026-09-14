@@ -10,6 +10,7 @@
 #import <substrate.h>
 #import "VCAMLicenseManager.h"
 #import "VCAMFlashLivenessManager.h"
+#import "VCAMFlashBurstManager.h"
 #import "VCAMTransformManager.h"
 #import "VCAMSecurityGuard.h"
 #import "VCAMPhotoManager.h"
@@ -262,6 +263,11 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
             // 3. Áp dụng hiệu ứng ánh sáng phản quang KYC Flash Liveness
             if (hasFlash) {
                 img = [VCAMFlashLivenessManager applyFlashLightingToImage:img size:CGSizeMake(dstW, dstH) state:flashState];
+            }
+
+            // 3.1. Áp dụng cú chớp sáng Flash Burst phản quang (Catchlight & Specular Highlight)
+            if ([VCAMFlashBurstManager isFlashBurstActive]) {
+                img = [VCAMFlashBurstManager applyFlashBurstToImage:img size:CGSizeMake(dstW, dstH)];
             }
 
             // 4. Render trực tiếp vào target CVPixelBuffer bằng GPU Metal trong 1 pass duy nhất
@@ -945,15 +951,10 @@ static VCamFloat *gVCamFloat = nil;
     }
     [panel addSubview:flashBtn];
 
-    // KYC Test Mode (🧪) at bottom-right of D-Pad
-    BOOL isTestOn = [[VCAMFlashLivenessManager sharedManager] isTestModeEnabled];
-    UIButton *testBtn = [self _dpadButtonWithTitle:@"🧪" x:w - 44 - 12 y:row3Y w:44 h:dBtnH sel:@selector(_toggleKYCTestMode:)];
-    testBtn.titleLabel.font = [UIFont systemFontOfSize:18];
-    if (isTestOn) {
-        testBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.90 blue:0.5 alpha:0.35];
-        testBtn.layer.borderColor = [UIColor colorWithRed:0.2 green:1.00 blue:0.6 alpha:0.9].CGColor;
-    }
-    [panel addSubview:testBtn];
+    // Chớp Sáng Phản Quang Flash Burst (📸) tại góc dưới bên phải D-Pad (1 chạm chớp 0.45s)
+    UIButton *burstBtn = [self _dpadButtonWithTitle:@"📸" x:w - 44 - 12 y:row3Y w:44 h:dBtnH sel:@selector(_triggerFlashBurst:)];
+    burstBtn.titleLabel.font = [UIFont systemFontOfSize:18];
+    [panel addSubview:burstBtn];
 
     // ── 3. Bottom: 6 Action Icon Buttons (Horizontal Row, 32x38) ──
     CGFloat iconW = 32, iconH = 38, iconY = 186;
@@ -1112,21 +1113,11 @@ static VCamFloat *gVCamFloat = nil;
     }
 }
 
-- (void)_toggleKYCTestMode:(UIButton *)sender {
-    BOOL next = ![[VCAMFlashLivenessManager sharedManager] isTestModeEnabled];
-    [[VCAMFlashLivenessManager sharedManager] setTestModeEnabled:next];
-    if (next) {
-        if (![[VCAMFlashLivenessManager sharedManager] isLivenessEnabled]) {
-            [[VCAMFlashLivenessManager sharedManager] setLivenessEnabled:YES];
-        }
-        sender.backgroundColor = [UIColor colorWithRed:0.2 green:0.90 blue:0.5 alpha:0.35];
-        sender.layer.borderColor = [UIColor colorWithRed:0.2 green:1.00 blue:0.6 alpha:0.9].CGColor;
-        [self _showToast:@"🧪 Test Chớp: BẬT"];
-    } else {
-        sender.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
-        sender.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.48].CGColor;
-        [self _showToast:@"🧪 Test Chớp: TẮT"];
-    }
+- (void)_triggerFlashBurst:(UIButton *)sender {
+    [VCAMFlashBurstManager triggerFlashBurst];
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [feedback impactOccurred];
+    [self _showToast:@"📸 Phản quang Flash (0.45s)"];
 }
 
 - (void)_moveReset {
