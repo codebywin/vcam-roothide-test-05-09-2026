@@ -590,7 +590,8 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
     }
 
     // Do not re-process buffers that have already been swapped by VCam in an upstream node
-    static const CFStringRef kVCamProcessedKey = CFSTR("kVCamProcessedBuffer");
+    // Dùng cờ kCVAttachmentMode_DoNotPropagate và tên giả lập FigCapture để không bao giờ lộ ra client app/ngân hàng
+    static const CFStringRef kVCamProcessedKey = CFSTR("FigCaptureStreamBufferProcessed");
     if (CVBufferGetAttachment(targetPb, kVCamProcessedKey, NULL)) {
         if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
         return;
@@ -600,7 +601,7 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
     if (srcPb) {
         OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
         if (err == noErr) {
-            CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
+            CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_DoNotPropagate);
         }
     }
 
