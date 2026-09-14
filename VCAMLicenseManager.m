@@ -448,6 +448,7 @@ static UIWindow *VCAMGetTopWindow(void) {
                 
                 [strongSelf saveLicenseWithKey:key expiresAt:expires signature:sig];
                 strongSelf.isLicenseValid = YES;
+                [strongSelf startHeartbeat];
                 
                 // Cập nhật mốc giờ chuẩn từ Cloudflare
                 strongSelf->_serverAnchorTime = [[NSDate date] timeIntervalSince1970];
@@ -534,7 +535,10 @@ static UIWindow *VCAMGetTopWindow(void) {
                 // CHỈ KHI SERVER CHỦ ĐỘNG XÁC NHẬN KEY ĐÃ BỊ KHÓA / GỠ / HẾT HẠN MỚI THU HỒI
                 NSLog(@"[VCAMLicense] SERVER ĐÃ KHÓA/HỦY KEY: %@", json[@"error"]);
                 strongSelf.isLicenseValid = NO;
-                [VCAMSecurityGuard revokeAuthorizationToken];
+                
+                // Dừng ngay Heartbeat và xóa license cũ để tránh lặp lại kiểm tra key đã bị khóa
+                [strongSelf stopHeartbeat];
+                [strongSelf clearSavedLicense];
                 
                 // Tắt ngay cờ replace camera ở toàn bộ các đường dẫn tmp
                 unlink("/var/tmp/vcam_enabled");
@@ -548,7 +552,7 @@ static UIWindow *VCAMGetTopWindow(void) {
                 [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseRevokedNotification object:json[@"error"]];
                 [[NSNotificationCenter defaultCenter] postNotificationName:kVCAMLicenseStatusChangedNotification object:nil];
 
-                // Hiển thị cảnh báo đỏ trên màn hình
+                // Hiển thị cảnh báo đỏ trên màn hình (chỉ 1 lần duy nhất)
                 NSString *reason = json[@"error"] ?: @"Mã bản quyền của bạn đã bị KHÓA hoặc THU HỒI bởi Quản trị viên!";
                 [strongSelf showBannedAlert:reason];
 
@@ -559,6 +563,8 @@ static UIWindow *VCAMGetTopWindow(void) {
                 NSLog(@"[VCAMLicense] Máy chủ chưa thể xác thực trực tuyến (Status %ld), chuyển sang kiểm tra offline an toàn.", (long)httpRes.statusCode);
                 BOOL localValid = [strongSelf validateLocalSignatureOffline];
                 if (!localValid) {
+                    [strongSelf stopHeartbeat];
+                    [strongSelf clearSavedLicense];
                     unlink("/var/tmp/vcam_enabled");
                     unlink("/private/var/tmp/vcam_enabled");
                     unlink("/rootfs/private/var/tmp/vcam_enabled");
@@ -579,6 +585,9 @@ static UIWindow *VCAMGetTopWindow(void) {
 
 - (void)showBannedAlert:(NSString *)reason {
     dispatch_async(dispatch_get_main_queue(), ^{
+        static BOOL sBannedAlertShowing = NO;
+        if (sBannedAlertShowing) return;
+
         UIWindow *window = VCAMGetTopWindow();
         UIViewController *rootVC = window.rootViewController;
         while (rootVC.presentedViewController) {
@@ -586,10 +595,13 @@ static UIWindow *VCAMGetTopWindow(void) {
         }
         if (!rootVC) return;
 
+        sBannedAlertShowing = YES;
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⛔ BẢN QUYỀN BỊ KHÓA"
                                                                        message:reason
                                                                 preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Đã hiểu" style:UIAlertActionStyleDestructive handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Đã hiểu" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+            sBannedAlertShowing = NO;
+        }]];
         [rootVC presentViewController:alert animated:YES completion:nil];
     });
 }
