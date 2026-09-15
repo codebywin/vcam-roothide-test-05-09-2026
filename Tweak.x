@@ -179,6 +179,26 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     CGFloat userOffsetX = transformState.offsetX;
     CGFloat userOffsetY = transformState.offsetY;
 
+    // === DIAGNOSTIC: log mỗi 3 giây để xác nhận pipeline đang chạy ===
+    {
+        static NSTimeInterval sLastEntryLog = 0;
+        static int sCallCount = 0;
+        sCallCount++;
+        NSTimeInterval _t = [NSDate timeIntervalSinceReferenceDate];
+        if (_t - sLastEntryLog > 3.0) {
+            sLastEntryLog = _t;
+            FILE *lf = fopen("/rootfs/private/var/tmp/vcam_pipeline.log", "a");
+            if (!lf) lf = fopen("/var/tmp/vcam_pipeline.log", "a");
+            if (lf) {
+                fprintf(lf, "[VCamPipeline] Entry calls=%d src=%zux%zu dst=%zux%zu\n",
+                        sCallCount, srcW, srcH, dstW, dstH);
+                fclose(lf);
+                chmod("/rootfs/private/var/tmp/vcam_pipeline.log", 0666);
+                chmod("/var/tmp/vcam_pipeline.log", 0666);
+            }
+        }
+    }
+
     // Khởi tạo Metal GPU CIContext một lần duy nhất
     static CIContext *gCIContext = nil;
     static dispatch_once_t gCIOnce;

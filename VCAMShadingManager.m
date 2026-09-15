@@ -188,25 +188,46 @@ static NSString *FindExistingShadingStatePath(void) {
 
     CIImage *currentImage = image;
 
+    // === DIAGNOSTIC TEST: Tint màu XANH LÁ mạnh để xác nhận CIContext pipeline đang chạy ===
+    // Nếu video có màu xanh lá rõ ràng → pipeline OK, shading đang được áp dụng
+    // Ghi log ra nhiều đường dẫn khác nhau
     static NSTimeInterval lastLog = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - lastLog > 2.0) {
         lastLog = now;
-        FILE *f = fopen("/var/tmp/vcam_shading.log", "a");
-        if (f) {
-            fprintf(f, "[Shading] Shading=%d (%.2f) | Grain=%d (%.2f) | Size=%.0fx%.0f\n",
-                    state.shadingEnabled, state.shadingIntensity, state.grainEnabled, state.grainIntensity, size.width, size.height);
-            fclose(f);
-            chmod("/var/tmp/vcam_shading.log", 0666);
-        }
-        FILE *f2 = fopen("/rootfs/private/var/tmp/vcam_shading.log", "a");
-        if (f2) {
-            fprintf(f2, "[Shading] Shading=%d (%.2f) | Grain=%d (%.2f) | Size=%.0fx%.0f\n",
-                    state.shadingEnabled, state.shadingIntensity, state.grainEnabled, state.grainIntensity, size.width, size.height);
-            fclose(f2);
-            chmod("/rootfs/private/var/tmp/vcam_shading.log", 0666);
+        const char *logPaths[] = {
+            "/rootfs/private/var/tmp/vcam_shading.log",
+            "/var/tmp/vcam_shading.log",
+            "/private/var/tmp/vcam_shading.log",
+            "/var/mobile/vcam_shading.log",
+            NULL
+        };
+        for (int pi = 0; logPaths[pi]; pi++) {
+            FILE *f = fopen(logPaths[pi], "a");
+            if (f) {
+                fprintf(f, "[Shading] CALLED Shading=%d (%.2f) Grain=%d (%.2f) Size=%.0fx%.0f\n",
+                        state.shadingEnabled, state.shadingIntensity,
+                        state.grainEnabled, state.grainIntensity,
+                        size.width, size.height);
+                fclose(f);
+                chmod(logPaths[pi], 0666);
+                break; // Ghi được 1 đường dẫn là đủ
+            }
         }
     }
+
+    // TEST TINT: Overlay màu tím nhạt để xác nhận pipeline CIContext đang chạy
+    // (Sẽ xóa sau khi xác nhận xong)
+    @try {
+        CIFilter *testTint = [CIFilter filterWithName:@"CIColorControls"];
+        [testTint setValue:currentImage forKey:kCIInputImageKey];
+        [testTint setValue:@(0.0f) forKey:@"inputBrightness"];
+        [testTint setValue:@(2.5f) forKey:@"inputContrast"];
+        [testTint setValue:@(1.5f) forKey:@"inputSaturation"];
+        CIImage *tinted = testTint.outputImage;
+        if (tinted) currentImage = tinted;
+    } @catch (...) {}
+
 
     // ──────────────────────────────────────────────────────────────────────────
     // 1. ĐỔ BÓNG TẠO KHỐI 3D KHUÔN MẶT (3D Volumetric Face Shading)
