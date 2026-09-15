@@ -183,28 +183,35 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     static CIContext *gCIContext = nil;
     static dispatch_once_t gCIOnce;
     dispatch_once(&gCIOnce, ^{
+        // Thử Metal context (dùng nil options để tránh crash với [NSNull null] trong mediaserverd sandbox)
         @try {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
             if (device) {
-                gCIContext = [CIContext contextWithMTLDevice:device options:@{
-                    kCIContextWorkingColorSpace: [NSNull null],
-                    kCIContextOutputColorSpace: [NSNull null]
-                }];
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal GPU context created: %@", gCIContext]);
+                gCIContext = [CIContext contextWithMTLDevice:device options:nil];
             }
-        } @catch (id ex) {
-            VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal init failed: %@", ex]);
+        } @catch (...) {}
+
+        // Fallback 1: CIContext không options
+        if (!gCIContext) {
+            @try { gCIContext = [CIContext context]; } @catch (...) {}
         }
+
+        // Fallback 2: CIContext với Software Renderer tắt
         if (!gCIContext) {
             @try {
-                gCIContext = [CIContext contextWithOptions:@{
-                    kCIContextWorkingColorSpace: [NSNull null],
-                    kCIContextOutputColorSpace: [NSNull null]
-                }];
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Default GPU context created: %@", gCIContext]);
-            } @catch (id ex) {
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Fallback failed: %@", ex]);
-            }
+                gCIContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @(NO)}];
+            } @catch (...) {}
+        }
+
+        // Production log — ghi ra file để xác nhận trạng thái Metal/CIContext trong mediaserverd
+        const char *status = gCIContext ? "OK" : "FAILED";
+        FILE *lf = fopen("/rootfs/private/var/tmp/vcam_pipeline.log", "a");
+        if (!lf) lf = fopen("/var/tmp/vcam_pipeline.log", "a");
+        if (lf) {
+            fprintf(lf, "[VCamPipeline] CIContext init: %s\n", status);
+            fclose(lf);
+            chmod("/rootfs/private/var/tmp/vcam_pipeline.log", 0666);
+            chmod("/var/tmp/vcam_pipeline.log", 0666);
         }
     });
 
@@ -277,7 +284,19 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
             [gCIContext render:img toCVPixelBuffer:target bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:nil];
             status = noErr;
         } @catch (NSException *e) {
-            VCamDebugLog([NSString stringWithFormat:@"[CIContext render error] %@", e]);
+            // Ghi exception ra file để debug trong mediaserverd
+            static NSTimeInterval sLastErrLog = 0;
+            NSTimeInterval _now = [NSDate timeIntervalSinceReferenceDate];
+            if (_now - sLastErrLog > 2.0) {
+                sLastErrLog = _now;
+                FILE *ef = fopen("/rootfs/private/var/tmp/vcam_pipeline.log", "a");
+                if (!ef) ef = fopen("/var/tmp/vcam_pipeline.log", "a");
+                if (ef) {
+                    fprintf(ef, "[VCamPipeline] @try exception: %s\n", [[e description] UTF8String]);
+                    fclose(ef);
+                    chmod("/rootfs/private/var/tmp/vcam_pipeline.log", 0666);
+                }
+            }
         }
     }
 
