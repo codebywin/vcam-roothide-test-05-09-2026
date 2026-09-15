@@ -218,34 +218,41 @@ static NSString *FindExistingShadingStatePath(void) {
 
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 1. HIỆU ỨNG ÁNH ĐÈN CHIẾU TÂM MÀN HÌNH + ĐỔ BÓNG RÌA
-    //    - Ánh đèn chiếu thẳng vào trung tâm khuôn mặt (Screen blend, ấm sáng tự nhiên)
-    //    - Rìa ngoài hơi tối dần tạo chiều sâu nổi khối 3D (Vignette falloff)
+    // 1. HIỆU ỨNG ÁNH ĐÈN PIN CHIẾU VÀO MẶT (Flashlight Beam & Deep Falloff Shadow)
+    //    - Chùm sáng đèn pin rọi mạnh trực diện vào trung tâm khuôn mặt (Screen blend, sáng rõ nét)
+    //    - Rìa ngoài chùm đèn chìm vào bóng tối sâu (Deep perimeter shadow falloff)
     // ──────────────────────────────────────────────────────────────────────────
     if (state.shadingEnabled && state.shadingIntensity > 0.02f) {
         @try {
             float intensity = state.shadingIntensity;
             CGFloat centerX = size.width  * 0.50f;
-            CGFloat centerY = size.height * 0.50f; // Đúng tâm màn hình
+            CGFloat centerY = size.height * 0.48f; // Tâm rọi ngay sống mũi / giữa mặt
             CGFloat baseR   = MIN(size.width, size.height);
 
-            // ── LỚP 1: Ánh đèn rọi tâm (Studio Key Light / Flash) ──
-            // Vùng giữa sáng rực nhẹ như có đèn chiếu thẳng vào mặt
+            // ── LỚP 1: Chùm sáng đèn pin rọi tâm (Flashlight Core Beam) ──
+            // Vùng giữa sáng rực rõ nét như có cây đèn pin chiếu thẳng vào mặt
             {
-                CIColor *lightCenter = [CIColor colorWithRed:1.0f green:0.98f blue:0.93f
-                                                       alpha:intensity * 0.42f];
+                CIColor *lightCenter = [CIColor colorWithRed:1.0f green:0.98f blue:0.92f
+                                                       alpha:intensity * 0.68f];
                 CIColor *lightEdge   = [CIColor colorWithRed:0.0f green:0.0f blue:0.0f alpha:0.0f];
 
                 CIFilter *lightGrad = [CIFilter filterWithName:@"CIRadialGradient"];
                 [lightGrad setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
-                [lightGrad setValue:@(baseR * 0.12f) forKey:@"inputRadius0"]; // Lõi sáng tâm
-                [lightGrad setValue:@(baseR * 0.58f) forKey:@"inputRadius1"]; // Lan tỏa dịu ra xung quanh
+                [lightGrad setValue:@(baseR * 0.08f) forKey:@"inputRadius0"]; // Tâm rọi mạnh
+                [lightGrad setValue:@(baseR * 0.52f) forKey:@"inputRadius1"]; // Bán kính chùm đèn pin
                 [lightGrad setValue:lightCenter forKey:@"inputColor0"];
                 [lightGrad setValue:lightEdge   forKey:@"inputColor1"];
 
                 CIImage *lightImg = lightGrad.outputImage;
                 if (lightImg) {
+                    // Elip dọc 1.0 x 1.25 ôm trọn khuôn mặt giống khung oval
+                    CGAffineTransform t = CGAffineTransformIdentity;
+                    t = CGAffineTransformTranslate(t, centerX, centerY);
+                    t = CGAffineTransformScale(t, 1.0f, 1.25f);
+                    t = CGAffineTransformTranslate(t, -centerX, -centerY);
+                    lightImg = [lightImg imageByApplyingTransform:t];
                     lightImg = [lightImg imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
+
                     CIFilter *screenBlend = [CIFilter filterWithName:@"CIScreenBlendMode"];
                     [screenBlend setValue:lightImg    forKey:kCIInputImageKey];
                     [screenBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];
@@ -254,26 +261,26 @@ static NSString *FindExistingShadingStatePath(void) {
                 }
             }
 
-            // ── LỚP 2: Đổ bóng viền ngoài (Falloff Vignette) ──
-            // Mép ngoài tối dần tạo cảm giác chiều sâu 3D tự nhiên
+            // ── LỚP 2: Đổ bóng sâu ngoài viền chùm đèn (Deep Flashlight Falloff Shadow) ──
+            // Bên ngoài chùm đèn pin đổ bóng tối rõ rệt, làm nổi bật khuôn mặt ở giữa
             {
                 CIColor *shadowCenter = [CIColor colorWithRed:0.0f green:0.0f blue:0.0f alpha:0.0f];
-                CIColor *shadowEdge   = [CIColor colorWithRed:0.0f green:0.0f blue:0.0f
-                                                        alpha:intensity * 0.28f];
+                CIColor *shadowEdge   = [CIColor colorWithRed:0.01f green:0.01f blue:0.02f
+                                                        alpha:intensity * 0.58f];
 
                 CIFilter *shadowGrad = [CIFilter filterWithName:@"CIRadialGradient"];
                 [shadowGrad setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
-                [shadowGrad setValue:@(baseR * 0.38f) forKey:@"inputRadius0"]; // Tâm giữ nguyên không bị tối
-                [shadowGrad setValue:@(baseR * 0.78f) forKey:@"inputRadius1"]; // Mép ngoài đổ bóng
+                [shadowGrad setValue:@(baseR * 0.22f) forKey:@"inputRadius0"]; // Vùng trong chùm đèn không bị tối
+                [shadowGrad setValue:@(baseR * 0.65f) forKey:@"inputRadius1"]; // Ra ngoài viền đổ bóng tối sâu
                 [shadowGrad setValue:shadowCenter forKey:@"inputColor0"];
                 [shadowGrad setValue:shadowEdge   forKey:@"inputColor1"];
 
                 CIImage *shadowImg = shadowGrad.outputImage;
                 if (shadowImg) {
-                    // Dáng elip theo tỷ lệ khuôn mặt
+                    // Cùng tỉ lệ elip 1.0 x 1.25 ôm trọn khuôn mặt
                     CGAffineTransform t = CGAffineTransformIdentity;
                     t = CGAffineTransformTranslate(t, centerX, centerY);
-                    t = CGAffineTransformScale(t, 1.0f, 1.20f);
+                    t = CGAffineTransformScale(t, 1.0f, 1.25f);
                     t = CGAffineTransformTranslate(t, -centerX, -centerY);
                     shadowImg = [shadowImg imageByApplyingTransform:t];
                     shadowImg = [shadowImg imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
