@@ -670,8 +670,8 @@ static UIViewController *VCamPresenter(void);
 }
 
 static VCamFloat *gVCamFloat = nil;
-static CGRect sTweakButtonFrame = {0, 0, 0, 0};
-static CGRect sTweakPanelFrame = {0, 0, 0, 0};
+static CGRect sTweakButtonFrame;
+static CGRect sTweakPanelFrame;
 static BOOL sTweakPanelVisible = NO;
 
 BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
