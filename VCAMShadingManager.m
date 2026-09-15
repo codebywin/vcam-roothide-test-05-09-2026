@@ -218,9 +218,9 @@ static NSString *FindExistingShadingStatePath(void) {
 
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 1. ĐỔ BÓNG KIỂU ÁNH ĐÈN CHIẾU (Studio Center-Light Effect)
-    //    - Vùng sáng ở tâm màn hình (Screen blend = chỉ làm sáng, không tối)
-    //    - Mép ngoài tối tự nhiên như bóng đổ
+    // 1. HIỆU ỨNG ÁNH ĐÈN CHIẾU TÂM MÀN HÌNH + ĐỔ BÓNG RÌA
+    //    - Ánh đèn chiếu thẳng vào trung tâm khuôn mặt (Screen blend, ấm sáng tự nhiên)
+    //    - Rìa ngoài hơi tối dần tạo chiều sâu nổi khối 3D (Vignette falloff)
     // ──────────────────────────────────────────────────────────────────────────
     if (state.shadingEnabled && state.shadingIntensity > 0.02f) {
         @try {
@@ -229,25 +229,23 @@ static NSString *FindExistingShadingStatePath(void) {
             CGFloat centerY = size.height * 0.50f; // Đúng tâm màn hình
             CGFloat baseR   = MIN(size.width, size.height);
 
-            // ── LAYER 1: Vùng sáng tâm (đèn chiếu từ phía trước) ──
-            // innerColor: trắng ấm bán trong suốt → Screen blend chỉ làm sáng
-            // outerColor: trong suốt → không ảnh hưởng mép
+            // ── LỚP 1: Ánh đèn rọi tâm (Studio Key Light / Flash) ──
+            // Vùng giữa sáng rực nhẹ như có đèn chiếu thẳng vào mặt
             {
-                CIColor *lightCenter = [CIColor colorWithRed:1.0f green:0.97f blue:0.90f
-                                                       alpha:intensity * 0.38f];
+                CIColor *lightCenter = [CIColor colorWithRed:1.0f green:0.98f blue:0.93f
+                                                       alpha:intensity * 0.42f];
                 CIColor *lightEdge   = [CIColor colorWithRed:0.0f green:0.0f blue:0.0f alpha:0.0f];
 
                 CIFilter *lightGrad = [CIFilter filterWithName:@"CIRadialGradient"];
                 [lightGrad setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
-                [lightGrad setValue:@(baseR * 0.15f) forKey:@"inputRadius0"]; // Vùng sáng đều
-                [lightGrad setValue:@(baseR * 0.60f) forKey:@"inputRadius1"]; // Fade ra
+                [lightGrad setValue:@(baseR * 0.12f) forKey:@"inputRadius0"]; // Lõi sáng tâm
+                [lightGrad setValue:@(baseR * 0.58f) forKey:@"inputRadius1"]; // Lan tỏa dịu ra xung quanh
                 [lightGrad setValue:lightCenter forKey:@"inputColor0"];
                 [lightGrad setValue:lightEdge   forKey:@"inputColor1"];
 
                 CIImage *lightImg = lightGrad.outputImage;
                 if (lightImg) {
                     lightImg = [lightImg imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
-                    // Screen blend = chỉ làm sáng, pixel tối hơn không thay đổi
                     CIFilter *screenBlend = [CIFilter filterWithName:@"CIScreenBlendMode"];
                     [screenBlend setValue:lightImg    forKey:kCIInputImageKey];
                     [screenBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];
@@ -256,8 +254,8 @@ static NSString *FindExistingShadingStatePath(void) {
                 }
             }
 
-            // ── LAYER 2: Vignette tối mép ngoài (bóng xung quanh) ──
-            // Tạo cảm giác ánh sáng tập trung vào tâm, viền ngoài rơi vào bóng tối nhẹ
+            // ── LỚP 2: Đổ bóng viền ngoài (Falloff Vignette) ──
+            // Mép ngoài tối dần tạo cảm giác chiều sâu 3D tự nhiên
             {
                 CIColor *shadowCenter = [CIColor colorWithRed:0.0f green:0.0f blue:0.0f alpha:0.0f];
                 CIColor *shadowEdge   = [CIColor colorWithRed:0.0f green:0.0f blue:0.0f
@@ -265,14 +263,14 @@ static NSString *FindExistingShadingStatePath(void) {
 
                 CIFilter *shadowGrad = [CIFilter filterWithName:@"CIRadialGradient"];
                 [shadowGrad setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
-                [shadowGrad setValue:@(baseR * 0.40f) forKey:@"inputRadius0"]; // Vùng tâm không tối
-                [shadowGrad setValue:@(baseR * 0.75f) forKey:@"inputRadius1"]; // Fade tối ra mép
+                [shadowGrad setValue:@(baseR * 0.38f) forKey:@"inputRadius0"]; // Tâm giữ nguyên không bị tối
+                [shadowGrad setValue:@(baseR * 0.78f) forKey:@"inputRadius1"]; // Mép ngoài đổ bóng
                 [shadowGrad setValue:shadowCenter forKey:@"inputColor0"];
                 [shadowGrad setValue:shadowEdge   forKey:@"inputColor1"];
 
                 CIImage *shadowImg = shadowGrad.outputImage;
                 if (shadowImg) {
-                    // Elip dọc theo tỷ lệ mặt người
+                    // Dáng elip theo tỷ lệ khuôn mặt
                     CGAffineTransform t = CGAffineTransformIdentity;
                     t = CGAffineTransformTranslate(t, centerX, centerY);
                     t = CGAffineTransformScale(t, 1.0f, 1.20f);
@@ -291,27 +289,32 @@ static NSString *FindExistingShadingStatePath(void) {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 2. HẠT NHIỄU LI TI NHƯ ISO NOISE (Ultra-Fine Sensor Grain)
+    // 2. HẠT NHIỄU CẢM BIẾN LI TI SẮC NÉT (Crisp 1px Tiled CMOS Sensor Grain)
     // ──────────────────────────────────────────────────────────────────────────
     if (state.grainEnabled && state.grainIntensity > 0.02f) {
         @try {
             float intensity = state.grainIntensity;
 
-            // Tile nhỏ 64×64 → hạt li ti hơn 4× so với 256×256
+            // Texture nhiễu hạt 128x128 được lặp vô tận trên toàn khung hình bằng CIAffineTile
             static NSData  *sNoiseData     = nil;
             static CIImage *sBaseNoiseTile = nil;
             static dispatch_once_t sNoiseOnce;
             dispatch_once(&sNoiseOnce, ^{
-                const int w = 64, h = 64;
+                const int w = 128, h = 128;
                 uint8_t *bytes = (uint8_t *)malloc(w * h * 4);
                 if (bytes) {
-                    uint32_t seed = 0xdeadbeef;
+                    uint32_t seed = 0x1337cafe;
                     for (int i = 0; i < w * h; i++) {
                         seed = seed * 1664525u + 1013904223u;
-                        uint8_t val = (uint8_t)(seed >> 24);
-                        bytes[i*4+0] = val;
-                        bytes[i*4+1] = val;
-                        bytes[i*4+2] = val;
+                        uint32_t r = seed >> 16;
+                        int delta = ((int)(r & 0xFF)) - 128;
+                        int val = 128 + (int)(delta * 0.90);
+                        if (val < 0) val = 0;
+                        if (val > 255) val = 255;
+                        uint8_t byteVal = (uint8_t)val;
+                        bytes[i*4+0] = byteVal;
+                        bytes[i*4+1] = byteVal;
+                        bytes[i*4+2] = byteVal;
                         bytes[i*4+3] = 255;
                     }
                     sNoiseData = [NSData dataWithBytesNoCopy:bytes length:w*h*4 freeWhenDone:YES];
@@ -320,29 +323,32 @@ static NSString *FindExistingShadingStatePath(void) {
                                                                 size:CGSizeMake(w, h)
                                                               format:kCIFormatRGBA8
                                                           colorSpace:nil];
-                    sBaseNoiseTile = [rawNoise imageByClampingToExtent];
+                    // Dùng CIAffineTile để lặp texture 128x128 trải đều 100% diện tích màn hình
+                    CIFilter *tileFilter = [CIFilter filterWithName:@"CIAffineTile"];
+                    [tileFilter setValue:rawNoise forKey:kCIInputImageKey];
+                    sBaseNoiseTile = tileFilter.outputImage;
                 }
             });
 
             if (sBaseNoiseTile) {
-                // Contrast rất thấp: hạt cực nhạt, chỉ thấy khi nhìn kỹ
+                // Điều chỉnh độ nổi bật của hạt nhiễu theo intensity
                 CIFilter *contrastFilter = [CIFilter filterWithName:@"CIColorControls"];
                 [contrastFilter setValue:sBaseNoiseTile forKey:kCIInputImageKey];
                 [contrastFilter setValue:@(0.0f) forKey:@"inputBrightness"];
-                [contrastFilter setValue:@(0.05f + intensity * 0.18f) forKey:@"inputContrast"];
+                [contrastFilter setValue:@(0.35f + intensity * 1.10f) forKey:@"inputContrast"];
                 CIImage *tunedNoise = contrastFilter.outputImage;
 
                 if (tunedNoise) {
-                    // Jitter mỗi frame để hạt nhiễu động như cảm biến thật
+                    // Dịch chuyển ngẫu nhiên mỗi frame để hạt nhiễu động chân thực như camera thật
                     static uint32_t sFrameSeed = 0;
-                    sFrameSeed = (sFrameSeed + 137) % 10000;
-                    CGFloat dx = (CGFloat)(sFrameSeed % 61);
-                    CGFloat dy = (CGFloat)((sFrameSeed * 7) % 61);
+                    sFrameSeed = (sFrameSeed + 71) % 50000;
+                    CGFloat dx = (CGFloat)(sFrameSeed % 127);
+                    CGFloat dy = (CGFloat)((sFrameSeed * 17) % 127);
 
                     CIImage *jitteredNoise = [tunedNoise imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
                     jitteredNoise = [jitteredNoise imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
 
-                    // Soft Light blend — hạt hoà vào ảnh tự nhiên
+                    // Soft Light blend: 128 giữ nguyên màu gốc, hạt sáng/tối tạo đốm nhiễu li ti
                     CIFilter *grainBlend = [CIFilter filterWithName:@"CISoftLightBlendMode"];
                     [grainBlend setValue:jitteredNoise forKey:kCIInputImageKey];
                     [grainBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];
