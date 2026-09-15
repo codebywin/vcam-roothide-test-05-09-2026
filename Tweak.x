@@ -170,184 +170,150 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
 
     os_unfair_lock_lock(&gTransferLock);
 
+    size_t srcW = CVPixelBufferGetWidth(source);
+    size_t srcH = CVPixelBufferGetHeight(source);
+    size_t dstW = CVPixelBufferGetWidth(target);
+    size_t dstH = CVPixelBufferGetHeight(target);
+
+    VCAMTransformState transformState = [VCAMTransformManager currentTransformState];
+    CGFloat userScale = transformState.scale;
+    CGFloat userOffsetX = transformState.offsetX;
+    CGFloat userOffsetY = transformState.offsetY;
+
+    // Khởi tạo Metal GPU CIContext một lần duy nhất
+    static CIContext *gCIContext = nil;
+    static dispatch_once_t gCIOnce;
+    dispatch_once(&gCIOnce, ^{
+        @try {
+            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            if (device) {
+                gCIContext = [CIContext contextWithMTLDevice:device options:@{
+                    kCIContextWorkingColorSpace: [NSNull null],
+                    kCIContextOutputColorSpace: [NSNull null]
+                }];
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal GPU context created: %@", gCIContext]);
+            }
+        } @catch (id ex) {
+            VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal init failed: %@", ex]);
+        }
+        if (!gCIContext) {
+            @try {
+                gCIContext = [CIContext contextWithOptions:@{
+                    kCIContextWorkingColorSpace: [NSNull null],
+                    kCIContextOutputColorSpace: [NSNull null]
+                }];
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Default GPU context created: %@", gCIContext]);
+            } @catch (id ex) {
+                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Fallback failed: %@", ex]);
+            }
+        }
+    });
+
+    VCAMFlashState flashState = [VCAMFlashLivenessManager currentFlashState];
+    BOOL hasFlash = (flashState.active && flashState.intensity > 0.01f);
+
     OSStatus status = -1;
 
-    @autoreleasepool {
-        size_t srcW = CVPixelBufferGetWidth(source);
-        size_t srcH = CVPixelBufferGetHeight(source);
-        size_t dstW = CVPixelBufferGetWidth(target);
-        size_t dstH = CVPixelBufferGetHeight(target);
+    if (gCIContext) {
+        CGFloat scale = userScale;
+        if (scale < 0.4f) scale = 0.4f;
+        if (scale > 2.5f) scale = 2.5f;
 
-        VCAMTransformState transformState = [VCAMTransformManager currentTransformState];
-        CGFloat userScale = transformState.scale;
-        CGFloat userOffsetX = transformState.offsetX;
-        CGFloat userOffsetY = transformState.offsetY;
-
-        VCAMFlashState flashState = [VCAMFlashLivenessManager currentFlashState];
-        BOOL hasFlash = (flashState.active && flashState.intensity > 0.01f);
-        BOOL hasBurst = [VCAMFlashBurstManager isFlashBurstActive];
-
-        int rot = ((transformState.rotation + 270) % 360 + 360) % 360;
-        int orientation = 1;
-        if (rot == 90)       orientation = 6; // 90 CW
-        else if (rot == 180) orientation = 3; // 180
-        else if (rot == 270) orientation = 8; // 270 CW (90 CCW)
-
-        // 1. FAST-PATH: Hardware VideoToolbox Scaler (0% Metal GPU, 0% CPU, giu may mat lanh)
-        // Neu khung hinh khong can xoay, khong thu phong/dich chuyen D-Pad va khong flash
-        if (orientation == 1 && !transformState.hasTransform && !hasFlash && !hasBurst) {
-            static VTPixelTransferSessionCreateFunc createFunc = NULL;
-            static VTSessionSetPropertyFunc setPropFunc = NULL;
-            static dispatch_once_t gSymbolsOnce;
-            dispatch_once(&gSymbolsOnce, ^{
-                dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
-                createFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
-                gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
-                setPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
-            });
-
-            static size_t gLastSrcW = 0, gLastSrcH = 0;
-            static size_t gLastDstW = 0, gLastDstH = 0;
-            OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
-            OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
-            static OSType gLastSrcFmt = 0, gLastDstFmt = 0;
-
-            if (!gTransferSession || srcW != gLastSrcW || srcH != gLastSrcH || dstW != gLastDstW || dstH != gLastDstH || srcFmt != gLastSrcFmt || dstFmt != gLastDstFmt) {
-                if (gTransferSession) {
-                    CFRelease(gTransferSession);
-                    gTransferSession = NULL;
+        // Xóa sạch buffer target về màu đen khi thu nhỏ hoặc có dịch chuyển để viền ngoài đen sạch sẽ
+        if (scale < 0.999f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f) {
+            CVPixelBufferLockBaseAddress(target, 0);
+            if (CVPixelBufferIsPlanar(target)) {
+                size_t planes = CVPixelBufferGetPlaneCount(target);
+                for (size_t p = 0; p < planes; p++) {
+                    void *base = CVPixelBufferGetBaseAddressOfPlane(target, p);
+                    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(target, p);
+                    size_t rows = CVPixelBufferGetHeightOfPlane(target, p);
+                    memset(base, (p == 0) ? 0 : 128, bpr * rows);
                 }
-                if (createFunc && gVTPixelTransferSessionTransferImage) {
-                    OSStatus err = createFunc(kCFAllocatorDefault, &gTransferSession);
-                    if (err == noErr && gTransferSession && setPropFunc) {
-                        setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("Normal"));
-                    }
-                }
-                gLastSrcW = srcW; gLastSrcH = srcH;
-                gLastDstW = dstW; gLastDstH = dstH;
-                gLastSrcFmt = srcFmt; gLastDstFmt = dstFmt;
+            } else {
+                void *base = CVPixelBufferGetBaseAddress(target);
+                size_t bpr = CVPixelBufferGetBytesPerRow(target);
+                size_t rows = CVPixelBufferGetHeight(target);
+                memset(base, 0, bpr * rows);
             }
-
-            if (gTransferSession && gVTPixelTransferSessionTransferImage) {
-                status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
-                if (status == noErr) {
-                    os_unfair_lock_unlock(&gTransferLock);
-                    return noErr;
-                }
-            }
+            CVPixelBufferUnlockBaseAddress(target, 0);
         }
 
-        // 2. METAL GPU PIPELINE (Chi dung khi can xoay, phong to, lech goc hoac flash)
-        // Khoi tao Metal GPU CIContext voi muc uu tien thap de chong nong may
-        static CIContext *gCIContext = nil;
-        static dispatch_once_t gCIOnce;
-        dispatch_once(&gCIOnce, ^{
-            @try {
-                id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-                if (device) {
-                    gCIContext = [CIContext contextWithMTLDevice:device options:@{
-                        kCIContextWorkingColorSpace: [NSNull null],
-                        kCIContextOutputColorSpace: [NSNull null],
-                        (id)kCIContextPriorityRequestLow: @YES
-                    }];
-                    VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal GPU context created (Low Power): %@", gCIContext]);
-                }
-            } @catch (id ex) {
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext] Metal init failed: %@", ex]);
+        @try {
+            CIImage *img = [CIImage imageWithCVPixelBuffer:source];
+
+            // 1. Áp dụng góc xoay bằng GPU (Metal Orientation) - Khử hoàn toàn CPU loop
+            int rot = ((transformState.rotation + 270) % 360 + 360) % 360;
+            int orientation = 1;
+            if (rot == 90)       orientation = 6; // 90 CW
+            else if (rot == 180) orientation = 3; // 180
+            else if (rot == 270) orientation = 8; // 270 CW (90 CCW)
+
+            if (orientation != 1) {
+                img = [img imageByApplyingOrientation:orientation];
             }
-            if (!gCIContext) {
-                @try {
-                    gCIContext = [CIContext contextWithOptions:@{
-                        kCIContextWorkingColorSpace: [NSNull null],
-                        kCIContextOutputColorSpace: [NSNull null],
-                        (id)kCIContextPriorityRequestLow: @YES
-                    }];
-                    VCamDebugLog([NSString stringWithFormat:@"[CIContext] Default GPU context created: %@", gCIContext]);
-                } @catch (id ex) {
-                    VCamDebugLog([NSString stringWithFormat:@"[CIContext] Fallback failed: %@", ex]);
-                }
+
+            // 2. Áp dụng thu phóng, lật gương và dịch chuyển D-Pad qua GPU
+            CGSize currentSize = img.extent.size;
+            img = [VCAMTransformManager applyTransformToImage:img
+                                                      srcSize:currentSize
+                                                      dstSize:CGSizeMake(dstW, dstH)
+                                                        state:transformState];
+
+            // 3. Áp dụng hiệu ứng ánh sáng phản quang KYC Flash Liveness
+            if (hasFlash) {
+                img = [VCAMFlashLivenessManager applyFlashLightingToImage:img size:CGSizeMake(dstW, dstH) state:flashState];
             }
+
+            // 3.1. Áp dụng cú chớp sáng Flash Burst phản quang (Catchlight & Specular Highlight)
+            if ([VCAMFlashBurstManager isFlashBurstActive]) {
+                img = [VCAMFlashBurstManager applyFlashBurstToImage:img size:CGSizeMake(dstW, dstH)];
+            }
+
+            // 4. Render trực tiếp vào target CVPixelBuffer bằng GPU Metal trong 1 pass duy nhất
+            [gCIContext render:img toCVPixelBuffer:target bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:nil];
+            status = noErr;
+        } @catch (NSException *e) {
+            VCamDebugLog([NSString stringWithFormat:@"[CIContext render error] %@", e]);
+        }
+    }
+
+    // Fallback VideoToolbox nếu GPU context không sẵn sàng
+    if (status != noErr) {
+        static VTPixelTransferSessionCreateFunc createFunc = NULL;
+        static VTSessionSetPropertyFunc setPropFunc = NULL;
+        static dispatch_once_t gSymbolsOnce;
+        dispatch_once(&gSymbolsOnce, ^{
+            dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
+            createFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
+            gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
+            setPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
         });
 
-        if (gCIContext) {
-            CGFloat scale = userScale;
-            if (scale < 0.4f) scale = 0.4f;
-            if (scale > 2.5f) scale = 2.5f;
+        static size_t gLastSrcW = 0, gLastSrcH = 0;
+        static size_t gLastDstW = 0, gLastDstH = 0;
+        OSType srcFmt = CVPixelBufferGetPixelFormatType(source);
+        OSType dstFmt = CVPixelBufferGetPixelFormatType(target);
+        static OSType gLastSrcFmt = 0, gLastDstFmt = 0;
 
-            // Xoa sach buffer target ve mau den khi thu nho hoac co dich chuyen de vien ngoai den sach se
-            if (scale < 0.999f || fabs(userOffsetX) > 0.1f || fabs(userOffsetY) > 0.1f) {
-                CVPixelBufferLockBaseAddress(target, 0);
-                if (CVPixelBufferIsPlanar(target)) {
-                    size_t planes = CVPixelBufferGetPlaneCount(target);
-                    for (size_t p = 0; p < planes; p++) {
-                        void *base = CVPixelBufferGetBaseAddressOfPlane(target, p);
-                        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(target, p);
-                        size_t rows = CVPixelBufferGetHeightOfPlane(target, p);
-                        memset(base, (p == 0) ? 0 : 128, bpr * rows);
-                    }
-                } else {
-                    void *base = CVPixelBufferGetBaseAddress(target);
-                    size_t bpr = CVPixelBufferGetBytesPerRow(target);
-                    size_t rows = CVPixelBufferGetHeight(target);
-                    memset(base, 0, bpr * rows);
-                }
-                CVPixelBufferUnlockBaseAddress(target, 0);
+        if (!gTransferSession || srcW != gLastSrcW || srcH != gLastSrcH || dstW != gLastDstW || dstH != gLastDstH || srcFmt != gLastSrcFmt || dstFmt != gLastDstFmt) {
+            if (gTransferSession) {
+                CFRelease(gTransferSession);
+                gTransferSession = NULL;
             }
-
-            @try {
-                CIImage *img = [CIImage imageWithCVPixelBuffer:source];
-
-                // 2.1. Ap dung goc xoay bang GPU
-                if (orientation != 1) {
-                    img = [img imageByApplyingOrientation:orientation];
+            if (createFunc && gVTPixelTransferSessionTransferImage) {
+                OSStatus err = createFunc(kCFAllocatorDefault, &gTransferSession);
+                if (err == noErr && gTransferSession && setPropFunc) {
+                    setPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("Normal"));
                 }
-
-                // 2.2. Ap dung thu phong, lat guong va dich chuyen D-Pad qua GPU
-                CGSize currentSize = img.extent.size;
-                img = [VCAMTransformManager applyTransformToImage:img
-                                                          srcSize:currentSize
-                                                          dstSize:CGSizeMake(dstW, dstH)
-                                                            state:transformState];
-
-                // 2.3. Ap dung hieu ung anh sang phan quang KYC Flash Liveness
-                if (hasFlash) {
-                    img = [VCAMFlashLivenessManager applyFlashLightingToImage:img size:CGSizeMake(dstW, dstH) state:flashState];
-                }
-
-                // 2.4. Ap dung cu chop sang Flash Burst phan quang
-                if (hasBurst) {
-                    img = [VCAMFlashBurstManager applyFlashBurstToImage:img size:CGSizeMake(dstW, dstH)];
-                }
-
-                // 2.5. Render truc tiep vao target CVPixelBuffer bang GPU Metal
-                [gCIContext render:img toCVPixelBuffer:target bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:nil];
-                status = noErr;
-            } @catch (NSException *e) {
-                VCamDebugLog([NSString stringWithFormat:@"[CIContext render error] %@", e]);
             }
+            gLastSrcW = srcW; gLastSrcH = srcH;
+            gLastDstW = dstW; gLastDstH = dstH;
+            gLastSrcFmt = srcFmt; gLastDstFmt = dstFmt;
         }
 
-        // Fallback VideoToolbox neu GPU khong the render
-        if (status != noErr) {
-            static VTPixelTransferSessionCreateFunc fbCreateFunc = NULL;
-            static VTSessionSetPropertyFunc fbSetPropFunc = NULL;
-            static dispatch_once_t fbSymbolsOnce;
-            dispatch_once(&fbSymbolsOnce, ^{
-                dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
-                fbCreateFunc = (VTPixelTransferSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionCreate");
-                gVTPixelTransferSessionTransferImage = (VTPixelTransferSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionTransferImage");
-                fbSetPropFunc = (VTSessionSetPropertyFunc)dlsym(RTLD_DEFAULT, "VTSessionSetProperty");
-            });
-
-            if (!gTransferSession && fbCreateFunc) {
-                OSStatus err = fbCreateFunc(kCFAllocatorDefault, &gTransferSession);
-                if (err == noErr && gTransferSession && fbSetPropFunc) {
-                    fbSetPropFunc(gTransferSession, CFSTR("ScalingMode"), CFSTR("Normal"));
-                }
-            }
-            if (gTransferSession && gVTPixelTransferSessionTransferImage) {
-                status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
-            }
+        if (gTransferSession && gVTPixelTransferSessionTransferImage) {
+            status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
         }
     }
 
@@ -473,12 +439,12 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
 
     CFTimeInterval now = CACurrentMediaTime();
 
-    // Throttled flag check (chỉ kiểm tra cờ mỗi 0.5s để giảm I/O trên camera thread)
+    // Throttled flag check (chỉ kiểm tra cờ mỗi 0.3s để giảm I/O trên camera thread)
     static BOOL gCachedActive = NO;
     static BOOL gCachedPaused = NO;
     static int  gCachedRotation = -1;
     static CFTimeInterval gLastFlagCheck = 0;
-    if (now - gLastFlagCheck > 0.5) {
+    if (now - gLastFlagCheck > 0.3) {
         gLastFlagCheck = now;
         gCachedActive = VCamIsActive() && (VCamCheckFileExists(kVCamTempFileName) || VCamCheckFileExists(kVCamTempPhotoFileName));
         gCachedPaused = VCamIsPaused();
@@ -637,22 +603,11 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         return;
     }
 
-    // Debounce duplicate PTS within the same frame across multiple pipeline nodes (ISP, Preview, Defringe)
-    static CMTime gLastProcessedPTS = {0, 0, 0, 0};
-    CMTime currentPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-    if (CMTIME_IS_VALID(currentPTS) && CMTIME_IS_VALID(gLastProcessedPTS) && CMTimeCompare(currentPTS, gLastProcessedPTS) == 0) {
-        if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-        return;
-    }
-
-    @autoreleasepool {
-        CVPixelBufferRef srcPb = VCamGetPixelBufferMatching(sampleBuffer);
-        if (srcPb) {
-            OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
-            if (err == noErr) {
-                CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
-                gLastProcessedPTS = currentPTS;
-            }
+    CVPixelBufferRef srcPb = VCamGetPixelBufferMatching(sampleBuffer);
+    if (srcPb) {
+        OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
+        if (err == noErr) {
+            CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
         }
     }
 
@@ -821,7 +776,7 @@ static VCamFloat *gVCamFloat = nil;
     _win.hidden = NO;
 
     [VCamFloat refreshButton];
-    [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(_periodicRefresh) userInfo:nil repeats:YES];
+    [NSTimer scheduledTimerWithTimeInterval:1.5 target:self selector:@selector(_periodicRefresh) userInfo:nil repeats:YES];
     [[NSNotificationCenter defaultCenter] addObserverForName:@"kVCAMMediaChangedNotification" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification * _Nonnull note) {
         [VCamFloat refreshButton];
     }];

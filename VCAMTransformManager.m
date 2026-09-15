@@ -265,7 +265,7 @@ static NSString *FindTmpFilePath(const char *name) {
     static VCAMTransformState cachedState = {1.0f, 0.0f, 0.0f, 0, NO, NO};
     static NSTimeInterval lastRead = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - lastRead < 0.50) { // Cache 500ms giam tai I/O trong render loop mediaserverd
+    if (now - lastRead < 0.15) { // Cache 150ms để giảm tải I/O trong render loop mediaserverd
         return cachedState;
     }
     lastRead = now;
@@ -279,8 +279,7 @@ static NSString *FindTmpFilePath(const char *name) {
     cachedState.hasTransform = (fabs(cachedState.scale - 1.0f) > 0.01f ||
                                 fabs(cachedState.offsetX) > 0.1f ||
                                 fabs(cachedState.offsetY) > 0.1f ||
-                                cachedState.isFlipped ||
-                                cachedState.rotation != 0);
+                                cachedState.isFlipped);
     return cachedState;
 }
 
