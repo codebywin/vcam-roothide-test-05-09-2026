@@ -289,29 +289,37 @@ static NSString *FindExistingShadingStatePath(void) {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 2. HẠT NHIỄU CẢM BIẾN LI TI SẮC NÉT (Crisp 1px Tiled CMOS Sensor Grain)
+    // 2. HẠT NHIỄU CẢM BIẾN LI TI THƯA (Sparse 1px CMOS Sensor Grain)
     // ──────────────────────────────────────────────────────────────────────────
     if (state.grainEnabled && state.grainIntensity > 0.02f) {
         @try {
             float intensity = state.grainIntensity;
 
-            // Texture nhiễu hạt 128x128 được lặp vô tận trên toàn khung hình bằng CIAffineTile
+            // Texture nhiễu hạt 256x256 rải hạt rất thưa (chỉ ~3.5% pixel có hạt)
             static NSData  *sNoiseData     = nil;
             static CIImage *sBaseNoiseTile = nil;
             static dispatch_once_t sNoiseOnce;
             dispatch_once(&sNoiseOnce, ^{
-                const int w = 128, h = 128;
+                const int w = 256, h = 256;
                 uint8_t *bytes = (uint8_t *)malloc(w * h * 4);
                 if (bytes) {
                     uint32_t seed = 0x1337cafe;
                     for (int i = 0; i < w * h; i++) {
                         seed = seed * 1664525u + 1013904223u;
                         uint32_t r = seed >> 16;
-                        int delta = ((int)(r & 0xFF)) - 128;
-                        int val = 128 + (int)(delta * 0.90);
-                        if (val < 0) val = 0;
-                        if (val > 255) val = 255;
-                        uint8_t byteVal = (uint8_t)val;
+                        uint8_t byteVal = 128; // Mặc định 128: trung tính tuyệt đối (không làm mờ/ảnh hưởng ảnh gốc)
+
+                        // Giảm số hạt lại, rải thưa ~3.5% pixel xuất hiện đốm li ti
+                        if ((r % 1000) < 35) {
+                            if ((r & 1) == 0) {
+                                // Hạt sáng li ti (specular highlight / hot pixel)
+                                byteVal = (uint8_t)(128 + 40 + ((r >> 8) % 65)); // 168..233
+                            } else {
+                                // Hạt tối li ti
+                                byteVal = (uint8_t)(128 - 30 - ((r >> 8) % 40)); // 58..98
+                            }
+                        }
+
                         bytes[i*4+0] = byteVal;
                         bytes[i*4+1] = byteVal;
                         bytes[i*4+2] = byteVal;
@@ -323,7 +331,7 @@ static NSString *FindExistingShadingStatePath(void) {
                                                                 size:CGSizeMake(w, h)
                                                               format:kCIFormatRGBA8
                                                           colorSpace:nil];
-                    // Dùng CIAffineTile để lặp texture 128x128 trải đều 100% diện tích màn hình
+                    // Dùng CIAffineTile để lặp texture 256x256 trải đều toàn màn hình
                     CIFilter *tileFilter = [CIFilter filterWithName:@"CIAffineTile"];
                     [tileFilter setValue:rawNoise forKey:kCIInputImageKey];
                     sBaseNoiseTile = tileFilter.outputImage;
@@ -331,24 +339,24 @@ static NSString *FindExistingShadingStatePath(void) {
             });
 
             if (sBaseNoiseTile) {
-                // Điều chỉnh độ nổi bật của hạt nhiễu theo intensity
+                // Điều chỉnh độ rõ nét của hạt nhiễu theo slider intensity
                 CIFilter *contrastFilter = [CIFilter filterWithName:@"CIColorControls"];
                 [contrastFilter setValue:sBaseNoiseTile forKey:kCIInputImageKey];
                 [contrastFilter setValue:@(0.0f) forKey:@"inputBrightness"];
-                [contrastFilter setValue:@(0.35f + intensity * 1.10f) forKey:@"inputContrast"];
+                [contrastFilter setValue:@(0.30f + intensity * 1.05f) forKey:@"inputContrast"];
                 CIImage *tunedNoise = contrastFilter.outputImage;
 
                 if (tunedNoise) {
-                    // Dịch chuyển ngẫu nhiên mỗi frame để hạt nhiễu động chân thực như camera thật
+                    // Dịch chuyển ngẫu nhiên mỗi frame để hạt nhiễu động chân thực
                     static uint32_t sFrameSeed = 0;
-                    sFrameSeed = (sFrameSeed + 71) % 50000;
-                    CGFloat dx = (CGFloat)(sFrameSeed % 127);
-                    CGFloat dy = (CGFloat)((sFrameSeed * 17) % 127);
+                    sFrameSeed = (sFrameSeed + 97) % 100000;
+                    CGFloat dx = (CGFloat)(sFrameSeed % 251);
+                    CGFloat dy = (CGFloat)((sFrameSeed * 23) % 251);
 
                     CIImage *jitteredNoise = [tunedNoise imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
                     jitteredNoise = [jitteredNoise imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
 
-                    // Soft Light blend: 128 giữ nguyên màu gốc, hạt sáng/tối tạo đốm nhiễu li ti
+                    // Soft Light blend: pixel 128 giữ nguyên ảnh gốc, đốm sáng/tối tạo hạt li ti thưa
                     CIFilter *grainBlend = [CIFilter filterWithName:@"CISoftLightBlendMode"];
                     [grainBlend setValue:jitteredNoise forKey:kCIInputImageKey];
                     [grainBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];

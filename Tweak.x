@@ -976,14 +976,14 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
     tintOverlay.userInteractionEnabled = NO;
     [panel addSubview:tintOverlay];
 
-    // ── 0. Top Mode Selector: [ 🔍 Zoom ] vs [ ⚡ Flash ] vs [ 🎭 3D ] ──
-    UISegmentedControl *modeCtrl = [[UISegmentedControl alloc] initWithItems:@[@"🔍 Zoom", @"⚡ Flash", @"🎭 3D"]];
-    modeCtrl.frame = CGRectMake((w - 212) / 2.0, 8, 212, 26);
+    // ── 0. Top Mode Selector: [ 🔍 Zoom ] vs [ ⚡ Flash ] vs [ 💡 Đèn ] vs [ ✨ Hạt ] ──
+    UISegmentedControl *modeCtrl = [[UISegmentedControl alloc] initWithItems:@[@"🔍 Zoom", @"⚡ Flash", @"💡 Đèn", @"✨ Hạt"]];
+    modeCtrl.frame = CGRectMake((w - 216) / 2.0, 8, 216, 26);
     modeCtrl.selectedSegmentIndex = _topSliderMode;
     if (@available(iOS 13.0, *)) {
         modeCtrl.selectedSegmentTintColor = [UIColor colorWithWhite:1.0 alpha:0.25];
-        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor], NSFontAttributeName: [UIFont boldSystemFontOfSize:11]} forState:UIControlStateNormal];
-        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0], NSFontAttributeName: [UIFont boldSystemFontOfSize:11]} forState:UIControlStateSelected];
+        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor], NSFontAttributeName: [UIFont boldSystemFontOfSize:10]} forState:UIControlStateNormal];
+        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0], NSFontAttributeName: [UIFont boldSystemFontOfSize:10]} forState:UIControlStateSelected];
     }
     [modeCtrl addTarget:self action:@selector(_sliderModeChanged:) forControlEvents:UIControlEventValueChanged];
     [panel addSubview:modeCtrl];
@@ -1016,7 +1016,12 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
         _zoomSlider.minimumValue = 0.05f;
         _zoomSlider.maximumValue = 1.00f;
         _zoomSlider.value = [[VCAMShadingManager sharedManager] shadingIntensity];
-        _zoomSlider.tintColor = [UIColor colorWithRed:0.85 green:0.45 blue:1.0 alpha:1.0];
+        _zoomSlider.tintColor = [UIColor colorWithRed:1.00 green:0.82 blue:0.40 alpha:1.0];
+    } else if (_topSliderMode == 3) {
+        _zoomSlider.minimumValue = 0.05f;
+        _zoomSlider.maximumValue = 0.80f;
+        _zoomSlider.value = [[VCAMShadingManager sharedManager] grainIntensity];
+        _zoomSlider.tintColor = [UIColor colorWithRed:0.75 green:0.75 blue:1.00 alpha:1.0];
     } else {
         _zoomSlider.minimumValue = 0.4f;
         _zoomSlider.maximumValue = 2.5f;
@@ -1170,19 +1175,26 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
         _zoomSlider.value = curIntensity;
         _zoomSlider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.18 alpha:1.0];
         [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", curIntensity * 100.0f]];
-    } else if (_topSliderMode == 2) { // 🎭 3D & Hạt
+    } else if (_topSliderMode == 2) { // 💡 Đèn (Ánh đèn tâm)
         CGFloat curShading = [[VCAMShadingManager sharedManager] shadingIntensity];
-        if (curShading < 0.05f) curShading = 0.45f; // Default nếu chưa từng set
+        if (curShading < 0.05f) curShading = 0.45f;
         _zoomSlider.minimumValue = 0.05f;
         _zoomSlider.maximumValue = 1.00f;
         _zoomSlider.value = curShading;
-        _zoomSlider.tintColor = [UIColor colorWithRed:0.85 green:0.45 blue:1.0 alpha:1.0];
-        // Tự động bật shading + grain khi chọn tab 🎭
+        _zoomSlider.tintColor = [UIColor colorWithRed:1.00 green:0.82 blue:0.40 alpha:1.0];
         [[VCAMShadingManager sharedManager] setShadingEnabled:YES];
-        [[VCAMShadingManager sharedManager] setGrainEnabled:YES];
         [[VCAMShadingManager sharedManager] setShadingIntensity:curShading];
-        [[VCAMShadingManager sharedManager] setGrainIntensity:curShading * 0.65f];
-        [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", curShading * 100.0f]];
+        [self _showToast:[NSString stringWithFormat:@"💡 Ánh đèn tâm: %.0f%%", curShading * 100.0f]];
+    } else if (_topSliderMode == 3) { // ✨ Hạt (Hạt nhiễu li ti)
+        CGFloat curGrain = [[VCAMShadingManager sharedManager] grainIntensity];
+        if (curGrain < 0.05f) curGrain = 0.25f;
+        _zoomSlider.minimumValue = 0.05f;
+        _zoomSlider.maximumValue = 0.80f;
+        _zoomSlider.value = curGrain;
+        _zoomSlider.tintColor = [UIColor colorWithRed:0.75 green:0.75 blue:1.00 alpha:1.0];
+        [[VCAMShadingManager sharedManager] setGrainEnabled:YES];
+        [[VCAMShadingManager sharedManager] setGrainIntensity:curGrain];
+        [self _showToast:[NSString stringWithFormat:@"✨ Hạt nhiễu: %.0f%%", curGrain * 100.0f]];
     } else { // 🔍 Zoom
         CGFloat curScale = VCamGetScale();
         _zoomSlider.minimumValue = 0.4f;
@@ -1212,14 +1224,21 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
         CGFloat val = slider.value;
         if (val < 0.08f) {
             [[VCAMShadingManager sharedManager] setShadingEnabled:NO];
-            [[VCAMShadingManager sharedManager] setGrainEnabled:NO];
-            [self _showToast:@"🎭 Khối 3D & Hạt: TẮT"];
+            [self _showToast:@"💡 Ánh đèn: TẮT"];
         } else {
             [[VCAMShadingManager sharedManager] setShadingEnabled:YES];
-            [[VCAMShadingManager sharedManager] setGrainEnabled:YES];
             [[VCAMShadingManager sharedManager] setShadingIntensity:val];
-            [[VCAMShadingManager sharedManager] setGrainIntensity:val * 0.65f];
-            [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", val * 100.0f]];
+            [self _showToast:[NSString stringWithFormat:@"💡 Ánh đèn tâm: %.0f%%", val * 100.0f]];
+        }
+    } else if (_topSliderMode == 3) {
+        CGFloat val = slider.value;
+        if (val < 0.06f) {
+            [[VCAMShadingManager sharedManager] setGrainEnabled:NO];
+            [self _showToast:@"✨ Hạt nhiễu: TẮT"];
+        } else {
+            [[VCAMShadingManager sharedManager] setGrainEnabled:YES];
+            [[VCAMShadingManager sharedManager] setGrainIntensity:val];
+            [self _showToast:[NSString stringWithFormat:@"✨ Hạt nhiễu: %.0f%%", val * 100.0f]];
         }
     } else {
         [self _updateZoomValue:slider.value];
@@ -1240,8 +1259,14 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
         if (next < 0.05f) next = 0.05f;
         if (_zoomSlider) _zoomSlider.value = next;
         [[VCAMShadingManager sharedManager] setShadingIntensity:next];
-        [[VCAMShadingManager sharedManager] setGrainIntensity:next * 0.65f];
-        [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", next * 100.0f]];
+        [self _showToast:[NSString stringWithFormat:@"💡 Ánh đèn: %.0f%%", next * 100.0f]];
+    } else if (_topSliderMode == 3) {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMShadingManager sharedManager] grainIntensity];
+        CGFloat next = current - 0.05f;
+        if (next < 0.05f) next = 0.05f;
+        if (_zoomSlider) _zoomSlider.value = next;
+        [[VCAMShadingManager sharedManager] setGrainIntensity:next];
+        [self _showToast:[NSString stringWithFormat:@"✨ Hạt nhiễu: %.0f%%", next * 100.0f]];
     } else {
         CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
         CGFloat next = current - 0.10f;
@@ -1265,8 +1290,14 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
         if (next > 1.00f) next = 1.00f;
         if (_zoomSlider) _zoomSlider.value = next;
         [[VCAMShadingManager sharedManager] setShadingIntensity:next];
-        [[VCAMShadingManager sharedManager] setGrainIntensity:next * 0.65f];
-        [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", next * 100.0f]];
+        [self _showToast:[NSString stringWithFormat:@"💡 Ánh đèn: %.0f%%", next * 100.0f]];
+    } else if (_topSliderMode == 3) {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMShadingManager sharedManager] grainIntensity];
+        CGFloat next = current + 0.05f;
+        if (next > 0.80f) next = 0.80f;
+        if (_zoomSlider) _zoomSlider.value = next;
+        [[VCAMShadingManager sharedManager] setGrainIntensity:next];
+        [self _showToast:[NSString stringWithFormat:@"✨ Hạt nhiễu: %.0f%%", next * 100.0f]];
     } else {
         CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
         CGFloat next = current + 0.10f;
