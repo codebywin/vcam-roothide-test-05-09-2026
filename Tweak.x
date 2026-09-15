@@ -1144,10 +1144,16 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
         [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", curIntensity * 100.0f]];
     } else if (_topSliderMode == 2) { // 🎭 3D & Hạt
         CGFloat curShading = [[VCAMShadingManager sharedManager] shadingIntensity];
+        if (curShading < 0.05f) curShading = 0.45f; // Default nếu chưa từng set
         _zoomSlider.minimumValue = 0.05f;
         _zoomSlider.maximumValue = 1.00f;
         _zoomSlider.value = curShading;
         _zoomSlider.tintColor = [UIColor colorWithRed:0.85 green:0.45 blue:1.0 alpha:1.0];
+        // Tự động bật shading + grain khi chọn tab 🎭
+        [[VCAMShadingManager sharedManager] setShadingEnabled:YES];
+        [[VCAMShadingManager sharedManager] setGrainEnabled:YES];
+        [[VCAMShadingManager sharedManager] setShadingIntensity:curShading];
+        [[VCAMShadingManager sharedManager] setGrainIntensity:curShading * 0.65f];
         [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", curShading * 100.0f]];
     } else { // 🔍 Zoom
         CGFloat curScale = VCamGetScale();
