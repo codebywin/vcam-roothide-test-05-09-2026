@@ -216,18 +216,6 @@ static NSString *FindExistingShadingStatePath(void) {
         }
     }
 
-    // TEST TINT: Overlay màu tím nhạt để xác nhận pipeline CIContext đang chạy
-    // (Sẽ xóa sau khi xác nhận xong)
-    @try {
-        CIFilter *testTint = [CIFilter filterWithName:@"CIColorControls"];
-        [testTint setValue:currentImage forKey:kCIInputImageKey];
-        [testTint setValue:@(0.0f) forKey:@"inputBrightness"];
-        [testTint setValue:@(2.5f) forKey:@"inputContrast"];
-        [testTint setValue:@(1.5f) forKey:@"inputSaturation"];
-        CIImage *tinted = testTint.outputImage;
-        if (tinted) currentImage = tinted;
-    } @catch (...) {}
-
 
     // ──────────────────────────────────────────────────────────────────────────
     // 1. ĐỔ BÓNG TẠO KHỐI 3D KHUÔN MẶT (3D Volumetric Face Shading)
