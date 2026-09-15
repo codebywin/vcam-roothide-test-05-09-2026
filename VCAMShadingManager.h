@@ -20,10 +20,15 @@ typedef struct {
 
 + (instancetype)sharedManager;
 
-@property (nonatomic, assign) BOOL isShadingEnabled;
-@property (nonatomic, assign) BOOL isGrainEnabled;
+@property (nonatomic, assign, getter=isShadingEnabled, setter=setShadingEnabled:) BOOL shadingEnabled;
+@property (nonatomic, assign, getter=isGrainEnabled, setter=setGrainEnabled:) BOOL grainEnabled;
 @property (nonatomic, assign) CGFloat shadingIntensity;
 @property (nonatomic, assign) CGFloat grainIntensity;
+
+- (void)setShadingEnabled:(BOOL)shadingEnabled;
+- (void)setGrainEnabled:(BOOL)grainEnabled;
+- (BOOL)isShadingEnabled;
+- (BOOL)isGrainEnabled;
 
 + (VCAMShadingState)currentShadingState;
 + (void)saveShadingState:(VCAMShadingState)state;
