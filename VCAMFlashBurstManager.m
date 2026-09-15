@@ -153,10 +153,10 @@ static NSString *FindExistingBurstPath(void) {
         CIImage *blended = blendFilter.outputImage;
         if (!blended) blended = image;
 
-        // 3. Tăng nhẹ phơi sáng (Auto-Exposure Surge) trong khoảnh khắc lóe sáng
+        // 3. Tăng nhẹ phơi sáng (Auto-Exposure Surge) rất nhẹ trong khoảnh khắc lóe sáng, chống cháy sáng da
         CIFilter *exposureFilter = [CIFilter filterWithName:@"CIExposureAdjust"];
         [exposureFilter setValue:blended forKey:kCIInputImageKey];
-        [exposureFilter setValue:@(intensity * 0.65f) forKey:@"inputEV"];
+        [exposureFilter setValue:@(intensity * 0.15f) forKey:@"inputEV"];
         CIImage *finalImg = exposureFilter.outputImage;
 
         return finalImg ?: blended;

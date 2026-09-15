@@ -88,9 +88,9 @@ typedef CFTypeRef (*UICreateScreenUIImageFunc)(void);
 - (void)setLivenessEnabled:(BOOL)enabled {
     _isEnabled = enabled;
     VCAMFlashState s = [VCAMFlashLivenessManager currentFlashState];
-    s.active = enabled;
+    s.active = NO;
     s.testMode = _isTestMode;
-    s.intensity = (float)_intensity;
+    s.intensity = 0.0f;
     [VCAMFlashLivenessManager saveFlashState:s];
 
     if (enabled) {
@@ -269,10 +269,16 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
         for (int y = 0; y < sampleH; y++) {
             float normY = (float)y / (float)sampleH;
 
+            // 1. Loại trừ top 12% (Header, Status Bar, App Title) và bottom 10% (Home Indicator, Guide Banner)
+            // Ngăn chặn 100% việc nhận diện nhầm thanh giao diện màu xanh của MSB Bank!
+            if (normY < 0.12f || normY > 0.90f) {
+                continue;
+            }
+
             for (int x = 0; x < sampleW; x++) {
                 float normX = (float)x / (float)sampleW;
 
-                // 1. Loại trừ 100% vùng giao diện của chính tweak (Floating Button & Control Panel)
+                // 2. Loại trừ 100% vùng giao diện của chính tweak (Floating Button & Control Panel)
                 if (VCamIsScreenPointInTweakUI(normX, normY)) {
                     continue;
                 }
@@ -292,15 +298,15 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
                 float delta = maxVal - minVal;
 
                 // Bỏ qua các điểm ảnh tối hoặc xám/trắng/trung tính (da mặt bình thường, nền xám/đen)
-                // Ngưỡng bão hòa delta >= 0.16f
-                if (maxVal < 0.18f || delta < 0.16f) {
+                // Ngưỡng bão hòa delta >= 0.18f
+                if (maxVal < 0.18f || delta < 0.18f) {
                     continue;
                 }
 
                 // Trọng số bão hòa bình phương: điểm ảnh càng rực màu thì tiếng nói càng áp đảo
                 float weight = delta * delta * maxVal;
                 // Vùng viền màn hình (nơi app eKYC hay chớp màu) được tăng 30% trọng số
-                if (y < 5 || y > 18 || x < 5 || x > 18) {
+                if (y < 6 || y > 17 || x < 5 || x > 18) {
                     weight *= 1.30f;
                 }
 
@@ -341,8 +347,9 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
             }
         }
 
-        // Ngưỡng xác nhận KYC Flash: cần ít nhất 6 điểm ảnh bão hòa cao và tổng trọng số > 1.2
-        if (bestBin != BIN_NONE && bins[bestBin].pixelCount >= 6 && maxWeight > 1.2f) {
+        // Ngưỡng xác nhận KYC Flash: cần ít nhất 35 điểm ảnh bão hòa cao và tổng trọng số > 15.0
+        // (Tránh hoàn toàn việc các icon nhỏ hay viền màu nhẹ kích hoạt nhầm)
+        if (bestBin != BIN_NONE && bins[bestBin].pixelCount >= 35 && maxWeight > 15.0f) {
             float avgR = bins[bestBin].sumR / bins[bestBin].totalWeight;
             float avgG = bins[bestBin].sumG / bins[bestBin].totalWeight;
             float avgB = bins[bestBin].sumB / bins[bestBin].totalWeight;
@@ -366,7 +373,7 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
             if (outVotedCount) *outVotedCount = bins[bestBin].pixelCount;
             if (outVotedWeight) *outVotedWeight = maxWeight;
         } else {
-            // Không có chớp màu đặc biệt (màn hình trung tính, camera preview bình thường)
+            // Không có chớp màu đặc biệt (màn hình trung tính, camera preview bình thường, hoặc đang chụp ảnh khuôn mặt)
             if (outSat) *outSat = 0.0f;
             if (validSampledCount > 0) {
                 *outR = totalR / validSampledCount;
@@ -474,29 +481,39 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
 
                         ComputeDominantScreenRGB(screenImg.CGImage, &sampleR, &sampleG, &sampleB, &saturation, &detectedColorName, &votedCount, &votedWeight);
 
-                        // Tự động kích hoạt phản quang nếu màn hình chớp sáng trắng chụp ảnh
-                        [VCAMFlashBurstManager checkAndAutoTriggerWithScreenRGB:sampleR g:sampleG b:sampleB];
+                        // 1. Không tự động kích hoạt flash burst ở đây để chống làm cháy sáng mặt khi chụp ảnh chân dung CCCD
+                        // (Phản quang Flash Burst 0.45s chỉ kích hoạt khi người dùng bấm nút 📸 trên menu)
 
-                        // Sensor Latency Simulation (Bộ lọc trễ cảm biến quang học EMA)
-                        // Nếu là màu chớp rực rỡ (sat > 0.20): phản ứng cực nhanh (85% giá trị mới, trễ < 80ms)
-                        // Nếu trở về bình thường: làm mượt chuyển cảnh (60% giá trị mới)
-                        if (saturation > 0.20f) {
+                        // 2. Tính toán cường độ phản quang theo nhịp chớp màu thực tế (Dynamic Modulation)
+                        // Khi xem trước bình thường hoặc khi app chụp ảnh chân dung: saturation <= 0.22 -> intensity = 0, active = NO!
+                        // Khuôn mặt sẽ 100% nguyên bản, sắc nét tự nhiên, khắc phục triệt để lỗi "ảnh chụp khuôn mặt ko hợp lệ" (LOG-025)!
+                        float effectiveIntensity = 0.0f;
+                        if (_isTestMode) {
+                            effectiveIntensity = (float)_intensity;
+                            _smoothedR = _smoothedR * 0.15f + sampleR * 0.85f;
+                            _smoothedG = _smoothedG * 0.15f + sampleG * 0.85f;
+                            _smoothedB = _smoothedB * 0.15f + sampleB * 0.85f;
+                        } else if (saturation > 0.22f && votedCount >= 35) {
+                            // Màn hình thực sự chớp màu KYC (Đỏ, Xanh lục, Xanh lam, v.v.)
+                            effectiveIntensity = (float)_intensity * MIN(1.0f, saturation * 1.35f);
                             _smoothedR = _smoothedR * 0.15f + sampleR * 0.85f;
                             _smoothedG = _smoothedG * 0.15f + sampleG * 0.85f;
                             _smoothedB = _smoothedB * 0.15f + sampleB * 0.85f;
                         } else {
-                            _smoothedR = _smoothedR * 0.40f + sampleR * 0.60f;
-                            _smoothedG = _smoothedG * 0.40f + sampleG * 0.60f;
-                            _smoothedB = _smoothedB * 0.40f + sampleB * 0.60f;
+                            // Trạng thái bình thường / chụp ảnh: TẮT HOÀN TOÀN TINT
+                            effectiveIntensity = 0.0f;
+                            _smoothedR = _smoothedR * 0.40f + 1.0f * 0.60f;
+                            _smoothedG = _smoothedG * 0.40f + 1.0f * 0.60f;
+                            _smoothedB = _smoothedB * 0.40f + 1.0f * 0.60f;
                         }
 
                         VCAMFlashState s;
-                        s.active = YES;
-                        s.testMode = NO;
+                        s.active = (effectiveIntensity > 0.01f);
+                        s.testMode = _isTestMode;
                         s.r = _smoothedR;
                         s.g = _smoothedG;
                         s.b = _smoothedB;
-                        s.intensity = (float)_intensity;
+                        s.intensity = effectiveIntensity;
                         [VCAMFlashLivenessManager saveFlashState:s];
 
                         // Ghi log vào /var/tmp/vcam_flash.log và /rootfs/private/var/tmp/vcam_flash.log
@@ -504,8 +521,8 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
                         NSTimeInterval nowLog = [NSDate timeIntervalSinceReferenceDate];
                         if (nowLog - lastLogTime > 0.35) {
                             lastLogTime = nowLog;
-                            NSString *logMsg = [NSString stringWithFormat:@"[KYC Flash] %@ [voted: %d px, w=%.1f] | SampleRGB=(%.2f, %.2f, %.2f) Sat=%.2f | OutputRGB=(%.2f, %.2f, %.2f)\n",
-                                                detectedColorName, votedCount, votedWeight, sampleR, sampleG, sampleB, saturation, _smoothedR, _smoothedG, _smoothedB];
+                            NSString *logMsg = [NSString stringWithFormat:@"[KYC Flash] %@ [voted: %d px, w=%.1f] | Active=%s Inten=%.2f | SampleRGB=(%.2f, %.2f, %.2f) Sat=%.2f | OutRGB=(%.2f, %.2f, %.2f)\n",
+                                                detectedColorName, votedCount, votedWeight, s.active ? "YES" : "NO", effectiveIntensity, sampleR, sampleG, sampleB, saturation, _smoothedR, _smoothedG, _smoothedB];
                             for (NSString *dir in PossibleTmpDirs()) {
                                 NSString *logPath = [dir stringByAppendingPathComponent:@"vcam_flash.log"];
                                 FILE *lf = fopen([logPath UTF8String], "a");
@@ -593,14 +610,14 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
         if (intensity < 0.05f) intensity = 0.05f;
         if (intensity > 0.85f) intensity = 0.85f;
 
-        // 1. Calculate lighting geometry: Soft spotlight concentrated on the face center
+        // 1. Phản quang tán xạ tự nhiên bao phủ đều khuôn mặt (Diffuse Photometric Screen Reflection)
         CGFloat centerX = size.width / 2.0f;
-        CGFloat centerY = size.height / 2.0f;
-        CGFloat innerRadius = MIN(size.width, size.height) * 0.22f;
-        CGFloat outerRadius = MAX(size.width, size.height) * 0.72f;
+        CGFloat centerY = size.height * 0.48f;
+        CGFloat innerRadius = MIN(size.width, size.height) * 0.38f; // Lan tỏa đều trán, mắt, má, mũi
+        CGFloat outerRadius = MAX(size.width, size.height) * 0.85f; // Tán xạ mềm biên ngoài màn hình
 
-        CIColor *centerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity];
-        CIColor *outerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.12f];
+        CIColor *centerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.70f];
+        CIColor *outerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.06f];
 
         CIFilter *radialGradient = [CIFilter filterWithName:@"CIRadialGradient"];
         [radialGradient setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
