@@ -152,25 +152,36 @@ static NSArray<NSString *> *PossibleTmpDirs(void) {
 }
 
 static NSString *FindExistingStatePath(void) {
-    for (NSString *dir in PossibleTmpDirs()) {
-        NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashStateFileName]];
-        if (access([p UTF8String], F_OK) == 0) {
-            return p;
+    static NSString *cachedPath = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSString *dir in PossibleTmpDirs()) {
+            NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashStateFileName]];
+            if (access([p UTF8String], F_OK) == 0) {
+                cachedPath = p;
+                break;
+            }
         }
-    }
-    for (NSString *dir in PossibleTmpDirs()) {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:dir]) {
-            return [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashStateFileName]];
+        if (!cachedPath) {
+            for (NSString *dir in PossibleTmpDirs()) {
+                if ([[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+                    cachedPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashStateFileName]];
+                    break;
+                }
+            }
         }
-    }
-    return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashStateFileName]];
+        if (!cachedPath) {
+            cachedPath = [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMFlashStateFileName]];
+        }
+    });
+    return cachedPath;
 }
 
 + (VCAMFlashState)currentFlashState {
     static VCAMFlashState cachedState = {1.0f, 1.0f, 1.0f, 0.35f, NO, NO};
     static NSTimeInterval lastReadTime = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - lastReadTime < 0.08) { // 80ms throttle cache for high responsiveness to fast 250ms eKYC flashes
+    if (now - lastReadTime < 0.12) { // 120ms throttle cache: 8-9 reads/sec for fast responsiveness with low I/O
         return cachedState;
     }
     lastReadTime = now;
@@ -252,10 +263,14 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
     const int sampleH = 24;
     uint32_t pixels[sampleW * sampleH] = {0};
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    if (!colorSpace) return;
+    static CGColorSpaceRef sColorSpace = NULL;
+    static dispatch_once_t sColorOnce;
+    dispatch_once(&sColorOnce, ^{
+        sColorSpace = CGColorSpaceCreateDeviceRGB();
+    });
+    if (!sColorSpace) return;
 
-    CGContextRef context = CGBitmapContextCreate(pixels, sampleW, sampleH, 8, sampleW * 4, colorSpace,
+    CGContextRef context = CGBitmapContextCreate(pixels, sampleW, sampleH, 8, sampleW * 4, sColorSpace,
                                                  kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
     if (context) {
         CGContextSetInterpolationQuality(context, kCGInterpolationLow);
@@ -396,7 +411,6 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
             if (outVotedWeight) *outVotedWeight = 0.0f;
         }
     }
-    CGColorSpaceRelease(colorSpace);
 }
 
 - (void)startScreenColorMonitoring {
@@ -404,8 +418,8 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
 
     _monitorStartTime = [NSDate timeIntervalSinceReferenceDate];
     _samplingTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _samplingQueue);
-    // Tần số quét 250ms (~4 FPS), nhẹ, an toàn tuyệt đối và bắt trúng 100% các nhịp chớp màu 400-800ms của eKYC
-    dispatch_source_set_timer(_samplingTimer, DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC, 25 * NSEC_PER_MSEC);
+    // Tần số quét 320ms (~3 FPS), nhẹ, an toàn tuyệt đối và bắt trúng 100% các nhịp chớp màu 400-800ms của eKYC
+    dispatch_source_set_timer(_samplingTimer, DISPATCH_TIME_NOW, 320 * NSEC_PER_MSEC, 30 * NSEC_PER_MSEC);
 
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_samplingTimer, ^{
@@ -541,21 +555,23 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
                         s.intensity = effectiveIntensity;
                         [VCAMFlashLivenessManager saveFlashState:s];
 
-                        // Ghi log vào /var/tmp/vcam_flash.log và /rootfs/private/var/tmp/vcam_flash.log
+                        // Ghi log sự kiện có thay đổi hoặc định kỳ 1.0s vào /var/tmp/vcam_flash.log
                         static NSTimeInterval lastLogTime = 0;
+                        static BOOL lastLoggedActive = NO;
+                        static NSString *lastLoggedColor = nil;
                         NSTimeInterval nowLog = [NSDate timeIntervalSinceReferenceDate];
-                        if (nowLog - lastLogTime > 0.35) {
+                        BOOL stateChanged = (s.active != lastLoggedActive) || (![detectedColorName isEqualToString:lastLoggedColor]);
+                        if (stateChanged || (nowLog - lastLogTime > 1.0)) {
                             lastLogTime = nowLog;
+                            lastLoggedActive = s.active;
+                            lastLoggedColor = detectedColorName;
                             NSString *logMsg = [NSString stringWithFormat:@"[KYC Flash] %@ [voted: %d px, w=%.1f] | Active=%s Inten=%.2f | SampleRGB=(%.2f, %.2f, %.2f) Sat=%.2f | OutRGB=(%.2f, %.2f, %.2f)\n",
                                                 detectedColorName, votedCount, votedWeight, s.active ? "YES" : "NO", effectiveIntensity, sampleR, sampleG, sampleB, saturation, _smoothedR, _smoothedG, _smoothedB];
-                            for (NSString *dir in PossibleTmpDirs()) {
-                                NSString *logPath = [dir stringByAppendingPathComponent:@"vcam_flash.log"];
-                                FILE *lf = fopen([logPath UTF8String], "a");
-                                if (lf) {
-                                    fputs([logMsg UTF8String], lf);
-                                    fclose(lf);
-                                    chmod([logPath UTF8String], 0666);
-                                }
+                            FILE *lf = fopen("/var/tmp/vcam_flash.log", "a");
+                            if (lf) {
+                                fputs([logMsg UTF8String], lf);
+                                fclose(lf);
+                                chmod("/var/tmp/vcam_flash.log", 0666);
                             }
                         }
                     }
@@ -627,43 +643,45 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
         return sourceImage;
     }
 
-    @try {
-        float r = state.r;
-        float g = state.g;
-        float b = state.b;
-        float intensity = state.intensity;
-        if (intensity < 0.05f) intensity = 0.05f;
-        if (intensity > 0.85f) intensity = 0.85f;
+    @autoreleasepool {
+        @try {
+            float r = state.r;
+            float g = state.g;
+            float b = state.b;
+            float intensity = state.intensity;
+            if (intensity < 0.05f) intensity = 0.05f;
+            if (intensity > 0.85f) intensity = 0.85f;
 
-        // 1. Phản quang tán xạ tự nhiên bao phủ đều khuôn mặt (Diffuse Photometric Screen Reflection)
-        CGFloat centerX = size.width / 2.0f;
-        CGFloat centerY = size.height * 0.48f;
-        CGFloat innerRadius = MIN(size.width, size.height) * 0.38f; // Lan tỏa đều trán, mắt, má, mũi
-        CGFloat outerRadius = MAX(size.width, size.height) * 0.85f; // Tán xạ mềm biên ngoài màn hình
+            // 1. Phản quang tán xạ tự nhiên bao phủ đều khuôn mặt (Diffuse Photometric Screen Reflection)
+            CGFloat centerX = size.width / 2.0f;
+            CGFloat centerY = size.height * 0.48f;
+            CGFloat innerRadius = MIN(size.width, size.height) * 0.38f; // Lan tỏa đều trán, mắt, má, mũi
+            CGFloat outerRadius = MAX(size.width, size.height) * 0.85f; // Tán xạ mềm biên ngoài màn hình
 
-        CIColor *centerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.70f];
-        CIColor *outerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.06f];
+            CIColor *centerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.70f];
+            CIColor *outerColor = [CIColor colorWithRed:r green:g blue:b alpha:intensity * 0.06f];
 
-        CIFilter *radialGradient = [CIFilter filterWithName:@"CIRadialGradient"];
-        [radialGradient setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
-        [radialGradient setValue:@(innerRadius) forKey:@"inputRadius0"];
-        [radialGradient setValue:@(outerRadius) forKey:@"inputRadius1"];
-        [radialGradient setValue:centerColor forKey:@"inputColor0"];
-        [radialGradient setValue:outerColor forKey:@"inputColor1"];
+            CIFilter *radialGradient = [CIFilter filterWithName:@"CIRadialGradient"];
+            [radialGradient setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
+            [radialGradient setValue:@(innerRadius) forKey:@"inputRadius0"];
+            [radialGradient setValue:@(outerRadius) forKey:@"inputRadius1"];
+            [radialGradient setValue:centerColor forKey:@"inputColor0"];
+            [radialGradient setValue:outerColor forKey:@"inputColor1"];
 
-        CIImage *lightGradient = [radialGradient.outputImage imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
-        if (!lightGradient) return sourceImage;
+            CIImage *lightGradient = [radialGradient.outputImage imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
+            if (!lightGradient) return sourceImage;
 
-        // 2. Blend lighting onto video frame via Soft Light (photometric screen reflection)
-        CIFilter *blendFilter = [CIFilter filterWithName:@"CISoftLightBlendMode"];
-        [blendFilter setValue:lightGradient forKey:kCIInputImageKey];
-        [blendFilter setValue:sourceImage forKey:kCIInputBackgroundImageKey];
-        CIImage *output = blendFilter.outputImage;
+            // 2. Blend lighting onto video frame via Soft Light (photometric screen reflection)
+            CIFilter *blendFilter = [CIFilter filterWithName:@"CISoftLightBlendMode"];
+            [blendFilter setValue:lightGradient forKey:kCIInputImageKey];
+            [blendFilter setValue:sourceImage forKey:kCIInputBackgroundImageKey];
+            CIImage *output = blendFilter.outputImage;
 
-        return output ?: sourceImage;
-    } @catch (NSException *ex) {
-        NSLog(@"[VCAMFlashLivenessManager] Lighting error: %@", ex);
-        return sourceImage;
+            return output ?: sourceImage;
+        } @catch (NSException *ex) {
+            NSLog(@"[VCAMFlashLivenessManager] Lighting error: %@", ex);
+            return sourceImage;
+        }
     }
 }
 

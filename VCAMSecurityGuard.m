@@ -85,25 +85,33 @@ BOOL VCAMVerifyProcessAuthorization(void) {
         return NO;
     }
 
-    // Micro-cache RAM 250ms để không ảnh hưởng tốc độ render 60 FPS của camera
+    // Cache RAM 3.0s khi hợp lệ, 0.5s khi chưa hợp lệ để triệt tiêu tải CPU/HMAC trên luồng camera
     static BOOL sCachedValid = NO;
     static NSTimeInterval sLastCheck = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - sLastCheck < 0.25) {
+    NSTimeInterval cacheInterval = sCachedValid ? 3.0 : 0.5;
+    if (now - sLastCheck < cacheInterval) {
         return sCachedValid;
     }
     sLastCheck = now;
 
-    // Tìm file token ủy quyền
-    NSString *tokenPath = nil;
-    for (NSString *dir in PossibleTmpDirs()) {
-        NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMAuthTokenFileName]];
-        if (access([p UTF8String], F_OK) == 0) {
-            tokenPath = p;
-            break;
+    // Tìm file token ủy quyền (cache đường dẫn)
+    static NSString *tokenPath = nil;
+    static dispatch_once_t tokenOnce;
+    dispatch_once(&tokenOnce, ^{
+        for (NSString *dir in PossibleTmpDirs()) {
+            NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMAuthTokenFileName]];
+            if (access([p UTF8String], F_OK) == 0) {
+                tokenPath = p;
+                break;
+            }
         }
-    }
-    if (!tokenPath) {
+        if (!tokenPath) {
+            tokenPath = [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMAuthTokenFileName]];
+        }
+    });
+
+    if (!tokenPath || access([tokenPath UTF8String], F_OK) != 0) {
         sCachedValid = NO;
         return NO;
     }

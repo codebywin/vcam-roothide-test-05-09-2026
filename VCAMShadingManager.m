@@ -25,18 +25,29 @@ static NSArray<NSString *> *ShadingPossibleDirs(void) {
 }
 
 static NSString *FindExistingShadingStatePath(void) {
-    for (NSString *dir in ShadingPossibleDirs()) {
-        NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMShadingStateFileName]];
-        if (access([p UTF8String], F_OK) == 0) {
-            return p;
+    static NSString *cachedPath = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (NSString *dir in ShadingPossibleDirs()) {
+            NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMShadingStateFileName]];
+            if (access([p UTF8String], F_OK) == 0) {
+                cachedPath = p;
+                break;
+            }
         }
-    }
-    for (NSString *dir in ShadingPossibleDirs()) {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:dir]) {
-            return [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMShadingStateFileName]];
+        if (!cachedPath) {
+            for (NSString *dir in ShadingPossibleDirs()) {
+                if ([[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+                    cachedPath = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMShadingStateFileName]];
+                    break;
+                }
+            }
         }
-    }
-    return [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMShadingStateFileName]];
+        if (!cachedPath) {
+            cachedPath = [@"/var/tmp" stringByAppendingPathComponent:[NSString stringWithUTF8String:kVCAMShadingStateFileName]];
+        }
+    });
+    return cachedPath;
 }
 
 @interface VCAMShadingManager () {
@@ -127,7 +138,7 @@ static NSString *FindExistingShadingStatePath(void) {
     static VCAMShadingState cachedState = {YES, YES, 0.45f, 0.28f};
     static NSTimeInterval lastReadTime = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - lastReadTime < 0.15) {
+    if (now - lastReadTime < 0.25) {
         return cachedState;
     }
     lastReadTime = now;
@@ -175,108 +186,139 @@ static NSString *FindExistingShadingStatePath(void) {
     if (!image || size.width <= 0 || size.height <= 0) return image;
     if (!state.shadingEnabled && !state.grainEnabled) return image;
 
-    CIImage *currentImage = image;
+    @autoreleasepool {
+        CIImage *currentImage = image;
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // 1. ĐỔ BÓNG TẠO KHỐI 3D KHUÔN MẶT (3D Volumetric Face Shading)
-    // ──────────────────────────────────────────────────────────────────────────
-    if (state.shadingEnabled && state.shadingIntensity > 0.02f) {
-        @try {
-            float intensity = state.shadingIntensity;
-            CGFloat centerX = size.width * 0.50f;
-            CGFloat centerY = size.height * 0.48f;
+        // ──────────────────────────────────────────────────────────────────────────
+        // 1. ĐỔ BÓNG TẠO KHỐI 3D KHUÔN MẶT (Cached Volumetric Face Shading)
+        // ──────────────────────────────────────────────────────────────────────────
+        if (state.shadingEnabled && state.shadingIntensity > 0.02f) {
+            @try {
+                float intensity = state.shadingIntensity;
 
-            // Bán kính elip phỏng theo hình học hộp sọ khuôn mặt người
-            CGFloat baseR = MIN(size.width, size.height);
-            CGFloat innerRadius = baseR * 0.22f; // Vùng chữ T sáng (trán, sống mũi, gò má trong)
-            CGFloat outerRadius = baseR * 0.68f; // Vùng bóng đổ sâu viền má, thái dương, góc hàm
+                static CIImage *sCachedGradient = nil;
+                static CGSize sCachedGradientSize = {0, 0};
+                static float sCachedGradientIntensity = -1.0f;
 
-            // Tâm sáng mềm mại (Specular sheen vùng chữ T)
-            CIColor *centerColor = [CIColor colorWithRed:1.0f green:0.96f blue:0.92f alpha:intensity * 0.38f];
-            // Viền ngoài tối dần tự nhiên (Ambient Occlusion & Curvature Falloff)
-            CIColor *outerColor = [CIColor colorWithRed:0.04f green:0.04f blue:0.04f alpha:intensity * 0.55f];
+                if (!sCachedGradient ||
+                    !CGSizeEqualToSize(sCachedGradientSize, size) ||
+                    fabsf(sCachedGradientIntensity - intensity) > 0.01f) {
 
-            CIFilter *radialGradient = [CIFilter filterWithName:@"CIRadialGradient"];
-            [radialGradient setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
-            [radialGradient setValue:@(innerRadius) forKey:@"inputRadius0"];
-            [radialGradient setValue:@(outerRadius) forKey:@"inputRadius1"];
-            [radialGradient setValue:centerColor forKey:@"inputColor0"];
-            [radialGradient setValue:outerColor forKey:@"inputColor1"];
+                    CGFloat centerX = size.width * 0.50f;
+                    CGFloat centerY = size.height * 0.48f;
+                    CGFloat baseR = MIN(size.width, size.height);
+                    CGFloat innerRadius = baseR * 0.22f; // Chữ T trán, mũi, gò má trong
+                    CGFloat outerRadius = baseR * 0.68f; // Viền má, thái dương, góc hàm
 
-            CIImage *gradientImg = radialGradient.outputImage;
-            if (gradientImg) {
-                // Biến đổi hình tròn thành elip thuôn dọc theo tỷ lệ khuôn mặt (1 : 1.25)
-                CGAffineTransform t = CGAffineTransformIdentity;
-                t = CGAffineTransformTranslate(t, centerX, centerY);
-                t = CGAffineTransformScale(t, 1.0f, 1.25f);
-                t = CGAffineTransformTranslate(t, -centerX, -centerY);
-                gradientImg = [gradientImg imageByApplyingTransform:t];
-                gradientImg = [gradientImg imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
+                    CIColor *centerColor = [CIColor colorWithRed:1.0f green:0.96f blue:0.92f alpha:intensity * 0.38f];
+                    CIColor *outerColor  = [CIColor colorWithRed:0.04f green:0.04f blue:0.04f alpha:intensity * 0.55f];
 
-                // Pha trộn tạo khối bằng CISoftLightBlendMode
-                CIFilter *shadingBlend = [CIFilter filterWithName:@"CISoftLightBlendMode"];
-                [shadingBlend setValue:gradientImg forKey:kCIInputImageKey];
-                [shadingBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];
-                CIImage *shaded = shadingBlend.outputImage;
-                if (shaded) currentImage = shaded;
-            }
-        } @catch (__unused NSException *ex) {}
-    }
+                    CIFilter *radialGradient = [CIFilter filterWithName:@"CIRadialGradient"];
+                    [radialGradient setValue:[CIVector vectorWithX:centerX Y:centerY] forKey:@"inputCenter"];
+                    [radialGradient setValue:@(innerRadius) forKey:@"inputRadius0"];
+                    [radialGradient setValue:@(outerRadius) forKey:@"inputRadius1"];
+                    [radialGradient setValue:centerColor forKey:@"inputColor0"];
+                    [radialGradient setValue:outerColor forKey:@"inputColor1"];
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // 2. HẠT NHIỄU CẢM BIẾN CAMERA (Dynamic CMOS Camera Sensor Noise Grain)
-    // ──────────────────────────────────────────────────────────────────────────
-    if (state.grainEnabled && state.grainIntensity > 0.02f) {
-        @try {
-            float intensity = state.grainIntensity;
+                    CIImage *grad = radialGradient.outputImage;
+                    if (grad) {
+                        CGAffineTransform t = CGAffineTransformIdentity;
+                        t = CGAffineTransformTranslate(t, centerX, centerY);
+                        t = CGAffineTransformScale(t, 1.0f, 1.25f);
+                        t = CGAffineTransformTranslate(t, -centerX, -centerY);
+                        grad = [grad imageByApplyingTransform:t];
+                        grad = [grad imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
 
-            // Bộ tạo nhiễu ngẫu nhiên thời gian thực
-            CIFilter *noiseFilter = [CIFilter filterWithName:@"CIRandomGenerator"];
-            CIImage *noiseImg = noiseFilter.outputImage;
-
-            if (noiseImg) {
-                // Dịch chuyển ngẫu nhiên mỗi frame để hạt nhiễu chuyển động sống động như cảm biến ISO thật
-                static uint32_t sFrameSeed = 0;
-                sFrameSeed = (sFrameSeed + 137) % 10000;
-                CGFloat dx = (CGFloat)(sFrameSeed % 373);
-                CGFloat dy = (CGFloat)((sFrameSeed * 7) % 389);
-                noiseImg = [noiseImg imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
-
-                // Chuyển hạt nhiễu thành dạng đơn sắc (Luma/Grayscale noise) để không bị nhiễu màu loang lổ
-                CIFilter *matrixFilter = [CIFilter filterWithName:@"CIColorMatrix"];
-                [matrixFilter setValue:noiseImg forKey:kCIInputImageKey];
-                CIVector *grayVector = [CIVector vectorWithX:0.33f Y:0.33f Z:0.33f W:0.0f];
-                [matrixFilter setValue:grayVector forKey:@"inputRVector"];
-                [matrixFilter setValue:grayVector forKey:@"inputGVector"];
-                [matrixFilter setValue:grayVector forKey:@"inputBVector"];
-                [matrixFilter setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:1.0f] forKey:@"inputAVector"];
-                CIImage *grayNoise = matrixFilter.outputImage;
-
-                if (grayNoise) {
-                    // Điều chỉnh độ tương phản của hạt nhiễu quanh mức trung tính 0.5
-                    // Mức 0.5 trong Soft Light không làm biến đổi ảnh, các hạt sáng/tối quanh 0.5 tạo hạt nhiễu mịn
-                    CIFilter *contrastFilter = [CIFilter filterWithName:@"CIColorControls"];
-                    [contrastFilter setValue:grayNoise forKey:kCIInputImageKey];
-                    [contrastFilter setValue:@(0.0f) forKey:@"inputBrightness"];
-                    [contrastFilter setValue:@(intensity * 0.40f) forKey:@"inputContrast"];
-                    CIImage *tunedNoise = contrastFilter.outputImage;
-
-                    if (tunedNoise) {
-                        tunedNoise = [tunedNoise imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
-
-                        // Hòa trộn hạt nhiễu lên khuôn mặt
-                        CIFilter *grainBlend = [CIFilter filterWithName:@"CISoftLightBlendMode"];
-                        [grainBlend setValue:tunedNoise forKey:kCIInputImageKey];
-                        [grainBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];
-                        CIImage *grained = grainBlend.outputImage;
-                        if (grained) currentImage = grained;
+                        sCachedGradient = grad;
+                        sCachedGradientSize = size;
+                        sCachedGradientIntensity = intensity;
                     }
                 }
-            }
-        } @catch (__unused NSException *ex) {}
-    }
 
-    return currentImage;
+                if (sCachedGradient) {
+                    CIFilter *shadingBlend = [CIFilter filterWithName:@"CISoftLightBlendMode"];
+                    [shadingBlend setValue:sCachedGradient forKey:kCIInputImageKey];
+                    [shadingBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];
+                    CIImage *shaded = shadingBlend.outputImage;
+                    if (shaded) currentImage = shaded;
+                }
+            } @catch (__unused NSException *ex) {}
+        }
+
+        // ──────────────────────────────────────────────────────────────────────────
+        // 2. HẠT NHIỄU CẢM BIẾN CAMERA SIÊU NHẸ (Pre-computed CMOS Sensor Grain Tile)
+        // ──────────────────────────────────────────────────────────────────────────
+        if (state.grainEnabled && state.grainIntensity > 0.02f) {
+            @try {
+                float intensity = state.grainIntensity;
+
+                // Khởi tạo texture hạt nhiễu đơn sắc compact 256x256 một lần duy nhất trong RAM
+                static CIImage *sBaseNoiseTile = nil;
+                static dispatch_once_t sNoiseOnce;
+                dispatch_once(&sNoiseOnce, ^{
+                    const int w = 256;
+                    const int h = 256;
+                    uint8_t *bytes = (uint8_t *)malloc(w * h * 4);
+                    if (bytes) {
+                        uint32_t seed = 0x9e3779b9;
+                        for (int i = 0; i < w * h; i++) {
+                            seed = seed * 1664525u + 1013904223u;
+                            int delta = ((int)(seed >> 24) % 65) - 32; // Dao động -32 .. +32 quanh mức 128
+                            int val = 128 + delta;
+                            if (val < 0) val = 0;
+                            if (val > 255) val = 255;
+                            bytes[i * 4 + 0] = (uint8_t)val;
+                            bytes[i * 4 + 1] = (uint8_t)val;
+                            bytes[i * 4 + 2] = (uint8_t)val;
+                            bytes[i * 4 + 3] = 255;
+                        }
+                        NSData *data = [NSData dataWithBytesNoCopy:bytes length:w * h * 4 freeWhenDone:YES];
+                        CIImage *rawNoise = [CIImage imageWithBitmapData:data
+                                                             bytesPerRow:w * 4
+                                                                    size:CGSizeMake(w, h)
+                                                                  format:kCIFormatRGBA8
+                                                              colorSpace:nil];
+                        sBaseNoiseTile = [rawNoise imageByClampingToExtent];
+                    }
+                });
+
+                // Tinh chỉnh độ tương phản hạt nhiễu (chỉ tính lại khi người dùng đổi thanh trượt)
+                static CIImage *sTunedNoiseTile = nil;
+                static float sLastGrainIntensity = -1.0f;
+                if (!sTunedNoiseTile || fabsf(sLastGrainIntensity - intensity) > 0.01f) {
+                    if (sBaseNoiseTile) {
+                        CIFilter *contrastFilter = [CIFilter filterWithName:@"CIColorControls"];
+                        [contrastFilter setValue:sBaseNoiseTile forKey:kCIInputImageKey];
+                        [contrastFilter setValue:@(0.0f) forKey:@"inputBrightness"];
+                        [contrastFilter setValue:@(intensity * 0.40f) forKey:@"inputContrast"];
+                        sTunedNoiseTile = contrastFilter.outputImage;
+                        sLastGrainIntensity = intensity;
+                    }
+                }
+
+                if (sTunedNoiseTile) {
+                    // Dịch chuyển ngẫu nhiên mỗi frame để hạt nhiễu động như cảm biến ISO thật
+                    static uint32_t sFrameSeed = 0;
+                    sFrameSeed = (sFrameSeed + 137) % 10000;
+                    CGFloat dx = (CGFloat)(sFrameSeed % 251);
+                    CGFloat dy = (CGFloat)((sFrameSeed * 7) % 257);
+
+                    CIImage *jitteredNoise = [sTunedNoiseTile imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
+                    jitteredNoise = [jitteredNoise imageByCroppingToRect:CGRectMake(0, 0, size.width, size.height)];
+
+                    // Hòa trộn Soft Light cực nhanh trong 1 pass Metal
+                    CIFilter *grainBlend = [CIFilter filterWithName:@"CISoftLightBlendMode"];
+                    [grainBlend setValue:jitteredNoise forKey:kCIInputImageKey];
+                    [grainBlend setValue:currentImage forKey:kCIInputBackgroundImageKey];
+                    CIImage *grained = grainBlend.outputImage;
+                    if (grained) currentImage = grained;
+                }
+            } @catch (__unused NSException *ex) {}
+        }
+
+        return currentImage;
+    }
 }
 
 @end
+

@@ -87,19 +87,7 @@ static NSString *FindTmpFilePath(const char *name) {
         }
         if (!primaryDir) primaryDir = @"/var/tmp";
     });
-
-    NSString *directPath = [primaryDir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
-    if (access([directPath UTF8String], F_OK) == 0) {
-        return directPath;
-    }
-
-    for (NSString *dir in PossibleTmpDirs()) {
-        NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
-        if (access([path UTF8String], F_OK) == 0) {
-            return path;
-        }
-    }
-    return directPath;
+    return [primaryDir stringByAppendingPathComponent:[NSString stringWithUTF8String:name]];
 }
 
 #pragma mark - Scale / Zoom
@@ -265,7 +253,7 @@ static NSString *FindTmpFilePath(const char *name) {
     static VCAMTransformState cachedState = {1.0f, 0.0f, 0.0f, 0, NO, NO};
     static NSTimeInterval lastRead = 0;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - lastRead < 0.15) { // Cache 150ms để giảm tải I/O trong render loop mediaserverd
+    if (now - lastRead < 0.25) { // Cache 250ms để giảm tải I/O trong render loop mediaserverd
         return cachedState;
     }
     lastRead = now;

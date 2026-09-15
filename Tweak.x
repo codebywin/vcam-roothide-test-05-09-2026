@@ -169,8 +169,6 @@ static os_unfair_lock gTransferLock = OS_UNFAIR_LOCK_INIT;
 static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef target) {
     if (!source || !target) return -1;
 
-    os_unfair_lock_lock(&gTransferLock);
-
     size_t srcW = CVPixelBufferGetWidth(source);
     size_t srcH = CVPixelBufferGetHeight(source);
     size_t dstW = CVPixelBufferGetWidth(target);
@@ -285,6 +283,7 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
 
     // Fallback VideoToolbox nếu GPU context không sẵn sàng
     if (status != noErr) {
+        os_unfair_lock_lock(&gTransferLock);
         static VTPixelTransferSessionCreateFunc createFunc = NULL;
         static VTSessionSetPropertyFunc setPropFunc = NULL;
         static dispatch_once_t gSymbolsOnce;
@@ -320,9 +319,9 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
         if (gTransferSession && gVTPixelTransferSessionTransferImage) {
             status = gVTPixelTransferSessionTransferImage(gTransferSession, source, target);
         }
+        os_unfair_lock_unlock(&gTransferLock);
     }
 
-    os_unfair_lock_unlock(&gTransferLock);
     return status;
 }
 
@@ -568,7 +567,9 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
     }
 
     // Tiến trình hiển thị frame theo đúng PTS thực của video (Zero-copy retain)
-    while (gNextSampleBuffer && elapsed >= gNextFramePTS) {
+    // Giới hạn tối đa 2 frame mỗi nhịp để không bao giờ block luồng camera thời gian thực
+    int advanceCount = 0;
+    while (gNextSampleBuffer && elapsed >= gNextFramePTS && advanceCount < 2) {
         CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(gNextSampleBuffer);
         if (pb) {
             CFRetain(pb);
@@ -583,6 +584,13 @@ static CVPixelBufferRef VCamGetPixelBufferMatching(CMSampleBufferRef originSampl
         } else {
             gNextFramePTS = gCachedDuration;
         }
+        advanceCount++;
+    }
+
+    // Cơ chế chống treo máy khi app vào background hoặc camera bị lag:
+    // Nếu thời gian elapsed vượt quá xa frame hiện tại (> 0.1s), đồng bộ lại clock thay vì decode dồn dập
+    if (gNextSampleBuffer && elapsed > gNextFramePTS + 0.1) {
+        gPlaybackStartRealTime = now - gNextFramePTS;
     }
 
     return gCachedPixelBuffer;
@@ -595,24 +603,20 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         return;
     }
 
-    CVPixelBufferRef targetPb = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!targetPb) {
-        if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-        return;
-    }
-
-    // Do not re-process buffers that have already been swapped by VCam in an upstream node
-    static const CFStringRef kVCamProcessedKey = CFSTR("kVCamProcessedBuffer");
-    if (CVBufferGetAttachment(targetPb, kVCamProcessedKey, NULL)) {
-        if (orig_BWNodeOutput_emitSampleBuffer) orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
-        return;
-    }
-
-    CVPixelBufferRef srcPb = VCamGetPixelBufferMatching(sampleBuffer);
-    if (srcPb) {
-        OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
-        if (err == noErr) {
-            CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
+    @autoreleasepool {
+        CVPixelBufferRef targetPb = CMSampleBufferGetImageBuffer(sampleBuffer);
+        if (targetPb) {
+            // Do not re-process buffers that have already been swapped by VCam in an upstream node
+            static const CFStringRef kVCamProcessedKey = CFSTR("kVCamProcessedBuffer");
+            if (!CVBufferGetAttachment(targetPb, kVCamProcessedKey, NULL)) {
+                CVPixelBufferRef srcPb = VCamGetPixelBufferMatching(sampleBuffer);
+                if (srcPb) {
+                    OSStatus err = VCamCopyPixelBuffer(srcPb, targetPb);
+                    if (err == noErr) {
+                        CVBufferSetAttachment(targetPb, kVCamProcessedKey, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
+                    }
+                }
+            }
         }
     }
 
