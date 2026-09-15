@@ -200,27 +200,35 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
     }
 
     // Khởi tạo Metal GPU CIContext một lần duy nhất
+    // QUAN TRỌNG: Phải dùng [NSNull null] cho colorspace để tắt color conversion
+    // Nếu không, CIContext dùng colorspace mặc định (Wide/Linear) → video bị tối
     static CIContext *gCIContext = nil;
     static dispatch_once_t gCIOnce;
     dispatch_once(&gCIOnce, ^{
-        // Thử Metal context (dùng nil options để tránh crash với [NSNull null] trong mediaserverd sandbox)
+        // Thử Metal + [NSNull null] colorspace (không có color conversion = đúng màu nhất)
         @try {
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
             if (device) {
-                gCIContext = [CIContext contextWithMTLDevice:device options:nil];
+                gCIContext = [CIContext contextWithMTLDevice:device options:@{
+                    kCIContextWorkingColorSpace: [NSNull null],
+                    kCIContextOutputColorSpace:  [NSNull null]
+                }];
             }
         } @catch (...) {}
 
-        // Fallback 1: CIContext không options
-        if (!gCIContext) {
-            @try { gCIContext = [CIContext context]; } @catch (...) {}
-        }
-
-        // Fallback 2: CIContext với Software Renderer tắt
+        // Fallback 1: CIContext không có Metal nhưng vẫn dùng [NSNull null]
         if (!gCIContext) {
             @try {
-                gCIContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @(NO)}];
+                gCIContext = [CIContext contextWithOptions:@{
+                    kCIContextWorkingColorSpace: [NSNull null],
+                    kCIContextOutputColorSpace:  [NSNull null]
+                }];
             } @catch (...) {}
+        }
+
+        // Fallback 2: CIContext đơn giản nhất (không có color space option)
+        if (!gCIContext) {
+            @try { gCIContext = [CIContext context]; } @catch (...) {}
         }
 
         // Production log — ghi ra file để xác nhận trạng thái Metal/CIContext trong mediaserverd
