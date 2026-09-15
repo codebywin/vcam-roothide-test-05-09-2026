@@ -13,12 +13,12 @@ static const char *kVCAMFlashStateFileName = "vcam_flash_state";
 #if defined(__cplusplus)
 extern "C" {
 #endif
-UIImage *_UICreateScreenUIImage(void) __attribute__((weak_import));
+CFTypeRef _UICreateScreenUIImage(void) __attribute__((weak_import));
 #if defined(__cplusplus)
 }
 #endif
 
-typedef UIImage *(*UICreateScreenUIImageFunc)(void);
+typedef CFTypeRef (*UICreateScreenUIImageFunc)(void);
 
 @interface VCAMFlashLivenessManager () {
     dispatch_source_t _samplingTimer;
@@ -459,7 +459,7 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
     if (_uikitCreateScreenUIImage) {
         @autoreleasepool {
             @try {
-                void *rawImg = (void *)_uikitCreateScreenUIImage();
+                CFTypeRef rawImg = _uikitCreateScreenUIImage();
                 if (rawImg) {
                     UIImage *screenImg = (__bridge_transfer UIImage *)rawImg;
                     if (screenImg && screenImg.CGImage) {
