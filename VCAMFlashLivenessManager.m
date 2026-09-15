@@ -213,14 +213,42 @@ static NSString *FindExistingStatePath(void) {
 
 #pragma mark - Screen Color Sampler (SpringBoard)
 
-/// Thuật toán trích xuất dải màu bão hòa chủ đạo (Dominant Chroma Extraction)
-/// Quét lưới 16x16 (256 điểm) siêu nhẹ (< 0.03ms), tự động phát hiện màu viền/màu nền chớp của app eKYC
-static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *outG, float *outB, float *outSat) {
+/// Các dải màu nhận diện KYC Flash
+typedef enum {
+    BIN_NONE = -1,
+    BIN_RED = 0,
+    BIN_GREEN,
+    BIN_BLUE,
+    BIN_YELLOW,
+    BIN_CYAN,
+    BIN_MAGENTA,
+    BIN_COUNT
+} KYCColorBinType;
+
+typedef struct {
+    float sumR;
+    float sumG;
+    float sumB;
+    float totalWeight;
+    int pixelCount;
+} KYCColorBin;
+
+static const char *kBinNames[BIN_COUNT] = {
+    "ĐỎ (Red)",
+    "XANH LỤC (Green)",
+    "XANH LAM (Blue)",
+    "VÀNG (Yellow)",
+    "CYAN (Xanh ngọc)",
+    "TÍM (Magenta)"
+};
+
+/// Thuật toán trích xuất dải màu bão hòa chủ đạo (Dominant Chroma Bin Voting)
+/// Quét lưới 24x24 (576 điểm ảnh), loại trừ 100% giao diện tweak, phân loại cụm màu áp đảo
+static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *outG, float *outB, float *outSat, NSString **outColorName, int *outVotedCount, float *outVotedWeight) {
     if (!cgImage) return;
 
-    const int sampleW = 16;
-    const int sampleH = 16;
-    const int totalPixels = sampleW * sampleH;
+    const int sampleW = 24;
+    const int sampleH = 24;
     uint32_t pixels[sampleW * sampleH] = {0};
 
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
@@ -233,52 +261,122 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
         CGContextDrawImage(context, CGRectMake(0, 0, sampleW, sampleH), cgImage);
         CGContextRelease(context);
 
-        float maxSaturation = 0.0f;
-        float bestR = 1.0f, bestG = 1.0f, bestB = 1.0f;
+        KYCColorBin bins[BIN_COUNT] = {0};
         float totalR = 0, totalG = 0, totalB = 0;
+        int validSampledCount = 0;
 
-        for (int i = 0; i < totalPixels; i++) {
-            uint32_t p = pixels[i];
-            float r = (float)(p & 0xFF) / 255.0f;
-            float g = (float)((p >> 8) & 0xFF) / 255.0f;
-            float b = (float)((p >> 16) & 0xFF) / 255.0f;
+        for (int y = 0; y < sampleH; y++) {
+            float normY = (float)y / (float)sampleH;
 
-            totalR += r;
-            totalG += g;
-            totalB += b;
+            for (int x = 0; x < sampleW; x++) {
+                float normX = (float)x / (float)sampleW;
 
-            float maxVal = MAX(r, MAX(g, b));
-            float minVal = MIN(r, MIN(g, b));
-            float delta = maxVal - minVal;
+                // 1. Loại trừ 100% vùng giao diện của chính tweak (Floating Button & Control Panel)
+                if (VCamIsScreenPointInTweakUI(normX, normY)) {
+                    continue;
+                }
 
-            // Tìm điểm ảnh có độ bão hòa màu cao nhất (Xanh lá, Xanh dương, Đỏ, Vàng, Cyan, Tím...)
-            if (maxVal > 0.15f && delta > maxSaturation) {
-                maxSaturation = delta;
-                bestR = r;
-                bestG = g;
-                bestB = b;
+                uint32_t p = pixels[y * sampleW + x];
+                float r = (float)(p & 0xFF) / 255.0f;
+                float g = (float)((p >> 8) & 0xFF) / 255.0f;
+                float b = (float)((p >> 16) & 0xFF) / 255.0f;
+
+                totalR += r;
+                totalG += g;
+                totalB += b;
+                validSampledCount++;
+
+                float maxVal = MAX(r, MAX(g, b));
+                float minVal = MIN(r, MIN(g, b));
+                float delta = maxVal - minVal;
+
+                // Bỏ qua các điểm ảnh tối hoặc xám/trắng/trung tính (da mặt bình thường, nền xám/đen)
+                // Ngưỡng bão hòa delta >= 0.16f
+                if (maxVal < 0.18f || delta < 0.16f) {
+                    continue;
+                }
+
+                // Trọng số bão hòa bình phương: điểm ảnh càng rực màu thì tiếng nói càng áp đảo
+                float weight = delta * delta * maxVal;
+                // Vùng viền màn hình (nơi app eKYC hay chớp màu) được tăng 30% trọng số
+                if (y < 5 || y > 18 || x < 5 || x > 18) {
+                    weight *= 1.30f;
+                }
+
+                // Phân loại dải màu (Chroma Bin Classification)
+                KYCColorBinType binIdx = BIN_NONE;
+
+                if (r > 0.40f && r > g * 1.30f && r > b * 1.30f) {
+                    binIdx = BIN_RED; // ĐỎ
+                } else if (g > 0.35f && g > r * 1.20f && g > b * 1.15f) {
+                    binIdx = BIN_GREEN; // XANH LỤC
+                } else if (b > 0.38f && b > r * 1.25f && b > g * 1.05f) {
+                    binIdx = BIN_BLUE; // XANH LAM
+                } else if (g > 0.35f && b > 0.35f && (g + b) > 2.0f * r && fabsf(g - b) < 0.25f) {
+                    binIdx = BIN_CYAN; // CYAN (Xanh ngọc)
+                } else if (r > 0.50f && g > 0.42f && b < 0.32f && (r + g) > 2.2f * b) {
+                    binIdx = BIN_YELLOW; // VÀNG
+                } else if (r > 0.45f && b > 0.45f && g < 0.35f) {
+                    binIdx = BIN_MAGENTA; // TÍM
+                }
+
+                if (binIdx != BIN_NONE) {
+                    bins[binIdx].sumR += r * weight;
+                    bins[binIdx].sumG += g * weight;
+                    bins[binIdx].sumB += b * weight;
+                    bins[binIdx].totalWeight += weight;
+                    bins[binIdx].pixelCount++;
+                }
             }
         }
 
-        if (outSat) *outSat = maxSaturation;
-
-        // Nếu phát hiện dải màu sắc nét trên màn hình (app đang chớp màu viền hoặc toàn màn hình)
-        if (maxSaturation > 0.12f) {
-            // Tối ưu độ rực màu (Boost Saturation) để ánh sáng phản chiếu lên da mặt camera rõ nét
-            float maxC = MAX(bestR, MAX(bestG, bestB));
-            if (maxC > 0.01f) {
-                bestR = bestR / maxC;
-                bestG = bestG / maxC;
-                bestB = bestB / maxC;
+        // Tìm bin màu áp đảo (Dominant Bin)
+        KYCColorBinType bestBin = BIN_NONE;
+        float maxWeight = 0.0f;
+        for (int k = 0; k < BIN_COUNT; k++) {
+            if (bins[k].totalWeight > maxWeight) {
+                maxWeight = bins[k].totalWeight;
+                bestBin = (KYCColorBinType)k;
             }
-            *outR = bestR;
-            *outG = bestG;
-            *outB = bestB;
+        }
+
+        // Ngưỡng xác nhận KYC Flash: cần ít nhất 6 điểm ảnh bão hòa cao và tổng trọng số > 1.2
+        if (bestBin != BIN_NONE && bins[bestBin].pixelCount >= 6 && maxWeight > 1.2f) {
+            float avgR = bins[bestBin].sumR / bins[bestBin].totalWeight;
+            float avgG = bins[bestBin].sumG / bins[bestBin].totalWeight;
+            float avgB = bins[bestBin].sumB / bins[bestBin].totalWeight;
+
+            // Tăng cường độ rực màu (Boost Saturation) để phản chiếu lên da mặt rõ nét nhất
+            float maxC = MAX(avgR, MAX(avgG, avgB));
+            if (maxC > 0.01f) {
+                avgR /= maxC;
+                avgG /= maxC;
+                avgB /= maxC;
+            }
+
+            float minC = MIN(avgR, MIN(avgG, avgB));
+            float sat = maxC - minC;
+
+            if (outSat) *outSat = sat;
+            *outR = avgR;
+            *outG = avgG;
+            *outB = avgB;
+            if (outColorName) *outColorName = [NSString stringWithUTF8String:kBinNames[bestBin]];
+            if (outVotedCount) *outVotedCount = bins[bestBin].pixelCount;
+            if (outVotedWeight) *outVotedWeight = maxWeight;
         } else {
-            // Màn hình trắng/xám thông thường hoặc chớp sáng trắng chụp ảnh
-            *outR = totalR / totalPixels;
-            *outG = totalG / totalPixels;
-            *outB = totalB / totalPixels;
+            // Không có chớp màu đặc biệt (màn hình trung tính, camera preview bình thường)
+            if (outSat) *outSat = 0.0f;
+            if (validSampledCount > 0) {
+                *outR = totalR / validSampledCount;
+                *outG = totalG / validSampledCount;
+                *outB = totalB / validSampledCount;
+            } else {
+                *outR = 1.0f; *outG = 1.0f; *outB = 1.0f;
+            }
+            if (outColorName) *outColorName = @"Trắng/Trung tính";
+            if (outVotedCount) *outVotedCount = 0;
+            if (outVotedWeight) *outVotedWeight = 0.0f;
         }
     }
     CGColorSpaceRelease(colorSpace);
@@ -358,15 +456,27 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
 
                     float sampleR = 1.0f, sampleG = 1.0f, sampleB = 1.0f;
                     float saturation = 0.0f;
-                    ComputeDominantScreenRGB(screenImg.CGImage, &sampleR, &sampleG, &sampleB, &saturation);
+                    NSString *detectedColorName = @"Trắng/Trung tính";
+                    int votedCount = 0;
+                    float votedWeight = 0.0f;
+
+                    ComputeDominantScreenRGB(screenImg.CGImage, &sampleR, &sampleG, &sampleB, &saturation, &detectedColorName, &votedCount, &votedWeight);
 
                     // Tự động kích hoạt phản quang nếu màn hình chớp sáng trắng chụp ảnh
                     [VCAMFlashBurstManager checkAndAutoTriggerWithScreenRGB:sampleR g:sampleG b:sampleB];
 
                     // Sensor Latency Simulation (Bộ lọc trễ cảm biến quang học EMA)
-                    _smoothedR = _smoothedR * 0.30f + sampleR * 0.70f;
-                    _smoothedG = _smoothedG * 0.30f + sampleG * 0.70f;
-                    _smoothedB = _smoothedB * 0.30f + sampleB * 0.70f;
+                    // Nếu là màu chớp rực rỡ (sat > 0.20): phản ứng cực nhanh (85% giá trị mới, trễ < 80ms)
+                    // Nếu trở về bình thường: làm mượt chuyển cảnh (60% giá trị mới)
+                    if (saturation > 0.20f) {
+                        _smoothedR = _smoothedR * 0.15f + sampleR * 0.85f;
+                        _smoothedG = _smoothedG * 0.15f + sampleG * 0.85f;
+                        _smoothedB = _smoothedB * 0.15f + sampleB * 0.85f;
+                    } else {
+                        _smoothedR = _smoothedR * 0.40f + sampleR * 0.60f;
+                        _smoothedG = _smoothedG * 0.40f + sampleG * 0.60f;
+                        _smoothedB = _smoothedB * 0.40f + sampleB * 0.60f;
+                    }
 
                     VCAMFlashState s;
                     s.active = YES;
@@ -377,27 +487,21 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
                     s.intensity = (float)_intensity;
                     [VCAMFlashLivenessManager saveFlashState:s];
 
-                    // Ghi log vào /var/tmp/vcam_flash.log phục vụ kiểm thử KYC trực tiếp
+                    // Ghi log vào /var/tmp/vcam_flash.log và /rootfs/private/var/tmp/vcam_flash.log
                     static NSTimeInterval lastLogTime = 0;
                     NSTimeInterval nowLog = [NSDate timeIntervalSinceReferenceDate];
-                    if (nowLog - lastLogTime > 0.4) {
+                    if (nowLog - lastLogTime > 0.35) {
                         lastLogTime = nowLog;
-                        NSString *colorName = @"Trắng/Trung tính";
-                        if (saturation > 0.12f) {
-                            if (sampleR > 0.6f && sampleG < 0.45f && sampleB < 0.45f) colorName = @"ĐỎ (Red)";
-                            else if (sampleG > 0.55f && sampleR < 0.5f) colorName = @"XANH LỤC (Green)";
-                            else if (sampleB > 0.6f && sampleR < 0.45f) colorName = @"XANH LAM (Blue)";
-                            else if (sampleR > 0.6f && sampleG > 0.6f && sampleB < 0.4f) colorName = @"VÀNG (Yellow)";
-                            else if (sampleB > 0.5f && sampleG > 0.5f && sampleR < 0.4f) colorName = @"CYAN (Xanh ngọc)";
-                            else if (sampleR > 0.5f && sampleB > 0.5f && sampleG < 0.4f) colorName = @"TÍM (Magenta)";
-                        }
-                        NSString *logMsg = [NSString stringWithFormat:@"[KYC Flash] %@ | SampleRGB=(%.2f, %.2f, %.2f) Sat=%.2f | OutputRGB=(%.2f, %.2f, %.2f)\n",
-                                            colorName, sampleR, sampleG, sampleB, saturation, _smoothedR, _smoothedG, _smoothedB];
-                        FILE *lf = fopen("/var/tmp/vcam_flash.log", "a");
-                        if (lf) {
-                            fputs([logMsg UTF8String], lf);
-                            fclose(lf);
-                            chmod("/var/tmp/vcam_flash.log", 0666);
+                        NSString *logMsg = [NSString stringWithFormat:@"[KYC Flash] %@ [voted: %d px, w=%.1f] | SampleRGB=(%.2f, %.2f, %.2f) Sat=%.2f | OutputRGB=(%.2f, %.2f, %.2f)\n",
+                                            detectedColorName, votedCount, votedWeight, sampleR, sampleG, sampleB, saturation, _smoothedR, _smoothedG, _smoothedB];
+                        for (NSString *dir in PossibleTmpDirs()) {
+                            NSString *logPath = [dir stringByAppendingPathComponent:@"vcam_flash.log"];
+                            FILE *lf = fopen([logPath UTF8String], "a");
+                            if (lf) {
+                                fputs([logMsg UTF8String], lf);
+                                fclose(lf);
+                                chmod([logPath UTF8String], 0666);
+                            }
                         }
                     }
                 }

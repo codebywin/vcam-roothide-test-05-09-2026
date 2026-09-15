@@ -9,6 +9,14 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+#if defined(__cplusplus)
+extern "C" {
+#endif
+BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY);
+#if defined(__cplusplus)
+}
+#endif
+
 typedef struct {
     float r;
     float g;

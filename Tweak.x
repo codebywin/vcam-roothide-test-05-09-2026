@@ -670,6 +670,22 @@ static UIViewController *VCamPresenter(void);
 }
 
 static VCamFloat *gVCamFloat = nil;
+static CGRect sTweakButtonFrame = {0, 0, 0, 0};
+static CGRect sTweakPanelFrame = {0, 0, 0, 0};
+static BOOL sTweakPanelVisible = NO;
+
+BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
+    CGRect screen = UIScreen.mainScreen.bounds;
+    if (screen.size.width <= 0 || screen.size.height <= 0) return NO;
+    CGPoint pt = CGPointMake(normX * screen.size.width, normY * screen.size.height);
+    if (!CGRectIsEmpty(sTweakButtonFrame) && CGRectContainsPoint(CGRectInset(sTweakButtonFrame, -8, -8), pt)) {
+        return YES;
+    }
+    if (sTweakPanelVisible && !CGRectIsEmpty(sTweakPanelFrame) && CGRectContainsPoint(CGRectInset(sTweakPanelFrame, -8, -8), pt)) {
+        return YES;
+    }
+    return NO;
+}
 
 + (void)show {
     if (!gVCamFloat) gVCamFloat = [self new];
@@ -773,6 +789,7 @@ static VCamFloat *gVCamFloat = nil;
     [_rootVC.view addSubview:btn];
     _rootVC.view.userInteractionEnabled = YES;
     _btn = btn;
+    sTweakButtonFrame = btn.frame;
     _win.hidden = NO;
 
     [VCamFloat refreshButton];
@@ -806,6 +823,7 @@ static VCamFloat *gVCamFloat = nil;
 
 - (void)_hideMenu {
     VCamDebugLog(@"[UI] _hideMenu");
+    sTweakPanelVisible = NO;
     UIView *ov = _menuOverlay;
     UIView *pan = _panel;
     _menuOverlay = nil;
@@ -882,6 +900,8 @@ static VCamFloat *gVCamFloat = nil;
     panel.layer.cornerRadius = 22;
     panel.layer.masksToBounds = YES;
     _panel = panel;
+    sTweakPanelFrame = panel.frame;
+    sTweakPanelVisible = YES;
 
     UIVisualEffectView *blurView = [[UIVisualEffectView alloc] initWithEffect:
         [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
@@ -995,8 +1015,8 @@ static VCamFloat *gVCamFloat = nil;
     UIButton *flashBtn = [self _dpadButtonWithTitle:@"⚡" x:12 y:row3Y w:44 h:dBtnH sel:@selector(_toggleKYCFlash:)];
     flashBtn.titleLabel.font = [UIFont systemFontOfSize:18];
     if (isFlashOn) {
-        flashBtn.backgroundColor = [UIColor colorWithRed:1.0 green:0.80 blue:0.1 alpha:0.35];
-        flashBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:0.9].CGColor;
+        flashBtn.backgroundColor = [UIColor colorWithRed:0.20 green:0.80 blue:0.40 alpha:0.35];
+        flashBtn.layer.borderColor = [UIColor colorWithRed:0.20 green:0.85 blue:0.45 alpha:0.9].CGColor;
     }
     [panel addSubview:flashBtn];
 
@@ -1198,13 +1218,16 @@ static VCamFloat *gVCamFloat = nil;
     BOOL next = ![[VCAMFlashLivenessManager sharedManager] isLivenessEnabled];
     [[VCAMFlashLivenessManager sharedManager] setLivenessEnabled:next];
     if (next) {
-        sender.backgroundColor = [UIColor colorWithRed:1.0 green:0.80 blue:0.1 alpha:0.35];
-        sender.layer.borderColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:0.9].CGColor;
+        sender.backgroundColor = [UIColor colorWithRed:0.20 green:0.80 blue:0.40 alpha:0.35];
+        sender.layer.borderColor = [UIColor colorWithRed:0.20 green:0.85 blue:0.45 alpha:0.9].CGColor;
         if (_modeControl) {
             _modeControl.selectedSegmentIndex = 1;
             [self _sliderModeChanged:_modeControl];
         }
         [self _showToast:@"⚡ KYC Flash: ĐÃ BẬT"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self _hideMenu];
+        });
     } else {
         sender.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
         sender.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.48].CGColor;
@@ -1292,6 +1315,7 @@ static VCamFloat *gVCamFloat = nil;
     CGPoint d = [gr translationInView:_rootVC.view];
     _btn.center = CGPointMake(_btn.center.x + d.x, _btn.center.y + d.y);
     [gr setTranslation:CGPointZero inView:_rootVC.view];
+    sTweakButtonFrame = _btn.frame;
     if (gr.state == UIGestureRecognizerStateEnded ||
         gr.state == UIGestureRecognizerStateCancelled) {
         [self _snapButton:_btn];
@@ -1308,8 +1332,13 @@ static VCamFloat *gVCamFloat = nil;
     [UIView animateWithDuration:0.35 delay:0
          usingSpringWithDamping:0.7 initialSpringVelocity:0.5
                         options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{ btn.center = CGPointMake(x, y); }
-                     completion:nil];
+                     animations:^{ 
+                         btn.center = CGPointMake(x, y); 
+                         sTweakButtonFrame = btn.frame;
+                     }
+                     completion:^(BOOL finished) {
+                         sTweakButtonFrame = btn.frame;
+                     }];
 }
 
 @end
