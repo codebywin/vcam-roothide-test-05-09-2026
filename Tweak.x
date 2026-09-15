@@ -15,6 +15,7 @@
 #import "VCAMSecurityGuard.h"
 #import "VCAMPhotoManager.h"
 #import "VCAMVideoManager.h"
+#import "VCAMShadingManager.h"
 #import <ImageIO/ImageIO.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -269,6 +270,10 @@ static OSStatus VCamCopyPixelBuffer(CVPixelBufferRef source, CVPixelBufferRef ta
             if ([VCAMFlashBurstManager isFlashBurstActive]) {
                 img = [VCAMFlashBurstManager applyFlashBurstToImage:img size:CGSizeMake(dstW, dstH)];
             }
+
+            // 3.2. Áp dụng Đổ bóng tạo khối 3D khuôn mặt & Hạt nhiễu cảm biến camera (3D Shading & CMOS Sensor Grain)
+            VCAMShadingState shadingState = [VCAMShadingManager currentShadingState];
+            img = [VCAMShadingManager apply3DShadingAndGrainToImage:img size:CGSizeMake(dstW, dstH) state:shadingState];
 
             // 4. Render trực tiếp vào target CVPixelBuffer bằng GPU Metal trong 1 pass duy nhất
             [gCIContext render:img toCVPixelBuffer:target bounds:CGRectMake(0, 0, dstW, dstH) colorSpace:nil];
@@ -664,7 +669,7 @@ static UIViewController *VCamPresenter(void);
     UIView  *_panel;
     UISlider *_zoomSlider;
     UISegmentedControl *_modeControl;
-    BOOL _isFlashSliderMode;
+    int _topSliderMode; // 0: Zoom, 1: Flash, 2: 3D & Grain
     CGFloat _curOffsetX;
     CGFloat _curOffsetY;
 }
@@ -920,14 +925,14 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
     tintOverlay.userInteractionEnabled = NO;
     [panel addSubview:tintOverlay];
 
-    // ── 0. Top Mode Selector: [ 🔍 Zoom ] vs [ ⚡ Flash ] ──
-    UISegmentedControl *modeCtrl = [[UISegmentedControl alloc] initWithItems:@[@"🔍 Zoom", @"⚡ Flash"]];
-    modeCtrl.frame = CGRectMake((w - 170) / 2.0, 8, 170, 26);
-    modeCtrl.selectedSegmentIndex = _isFlashSliderMode ? 1 : 0;
+    // ── 0. Top Mode Selector: [ 🔍 Zoom ] vs [ ⚡ Flash ] vs [ 🎭 3D ] ──
+    UISegmentedControl *modeCtrl = [[UISegmentedControl alloc] initWithItems:@[@"🔍 Zoom", @"⚡ Flash", @"🎭 3D"]];
+    modeCtrl.frame = CGRectMake((w - 212) / 2.0, 8, 212, 26);
+    modeCtrl.selectedSegmentIndex = _topSliderMode;
     if (@available(iOS 13.0, *)) {
         modeCtrl.selectedSegmentTintColor = [UIColor colorWithWhite:1.0 alpha:0.25];
-        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor], NSFontAttributeName: [UIFont boldSystemFontOfSize:12]} forState:UIControlStateNormal];
-        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0], NSFontAttributeName: [UIFont boldSystemFontOfSize:12]} forState:UIControlStateSelected];
+        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor], NSFontAttributeName: [UIFont boldSystemFontOfSize:11]} forState:UIControlStateNormal];
+        [modeCtrl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.3 green:0.85 blue:1.0 alpha:1.0], NSFontAttributeName: [UIFont boldSystemFontOfSize:11]} forState:UIControlStateSelected];
     }
     [modeCtrl addTarget:self action:@selector(_sliderModeChanged:) forControlEvents:UIControlEventValueChanged];
     [panel addSubview:modeCtrl];
@@ -951,11 +956,16 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
     CGFloat sliderX = CGRectGetMaxX(minusBtn.frame) + 6;
     CGFloat sliderW = w - sliderX - plusBtnW - 10 - 6;
     _zoomSlider = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, ctrlY, sliderW, ctrlH)];
-    if (_isFlashSliderMode) {
+    if (_topSliderMode == 1) {
         _zoomSlider.minimumValue = 0.10f;
         _zoomSlider.maximumValue = 0.90f;
         _zoomSlider.value = [[VCAMFlashLivenessManager sharedManager] flashIntensity];
         _zoomSlider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.18 alpha:1.0];
+    } else if (_topSliderMode == 2) {
+        _zoomSlider.minimumValue = 0.05f;
+        _zoomSlider.maximumValue = 1.00f;
+        _zoomSlider.value = [[VCAMShadingManager sharedManager] shadingIntensity];
+        _zoomSlider.tintColor = [UIColor colorWithRed:0.85 green:0.45 blue:1.0 alpha:1.0];
     } else {
         _zoomSlider.minimumValue = 0.4f;
         _zoomSlider.maximumValue = 2.5f;
@@ -1098,8 +1108,8 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
 }
 
 - (void)_sliderModeChanged:(UISegmentedControl *)sender {
-    _isFlashSliderMode = (sender.selectedSegmentIndex == 1);
-    if (_isFlashSliderMode) {
+    _topSliderMode = (int)sender.selectedSegmentIndex;
+    if (_topSliderMode == 1) { // ⚡ Flash
         if (![[VCAMFlashLivenessManager sharedManager] isLivenessEnabled]) {
             [[VCAMFlashLivenessManager sharedManager] setLivenessEnabled:YES];
         }
@@ -1109,7 +1119,14 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
         _zoomSlider.value = curIntensity;
         _zoomSlider.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.18 alpha:1.0];
         [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", curIntensity * 100.0f]];
-    } else {
+    } else if (_topSliderMode == 2) { // 🎭 3D & Hạt
+        CGFloat curShading = [[VCAMShadingManager sharedManager] shadingIntensity];
+        _zoomSlider.minimumValue = 0.05f;
+        _zoomSlider.maximumValue = 1.00f;
+        _zoomSlider.value = curShading;
+        _zoomSlider.tintColor = [UIColor colorWithRed:0.85 green:0.45 blue:1.0 alpha:1.0];
+        [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", curShading * 100.0f]];
+    } else { // 🔍 Zoom
         CGFloat curScale = VCamGetScale();
         _zoomSlider.minimumValue = 0.4f;
         _zoomSlider.maximumValue = 2.5f;
@@ -1128,25 +1145,46 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
 }
 
 - (void)_sliderChanged:(UISlider *)slider {
-    if (_isFlashSliderMode) {
+    if (_topSliderMode == 1) {
         CGFloat val = slider.value;
         if (val < 0.10f) val = 0.10f;
         if (val > 0.90f) val = 0.90f;
         [[VCAMFlashLivenessManager sharedManager] setFlashIntensity:val];
         [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", val * 100.0f]];
+    } else if (_topSliderMode == 2) {
+        CGFloat val = slider.value;
+        if (val < 0.08f) {
+            [[VCAMShadingManager sharedManager] setShadingEnabled:NO];
+            [[VCAMShadingManager sharedManager] setGrainEnabled:NO];
+            [self _showToast:@"🎭 Khối 3D & Hạt: TẮT"];
+        } else {
+            [[VCAMShadingManager sharedManager] setShadingEnabled:YES];
+            [[VCAMShadingManager sharedManager] setGrainEnabled:YES];
+            [[VCAMShadingManager sharedManager] setShadingIntensity:val];
+            [[VCAMShadingManager sharedManager] setGrainIntensity:val * 0.65f];
+            [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", val * 100.0f]];
+        }
     } else {
         [self _updateZoomValue:slider.value];
     }
 }
 
 - (void)_zoomMinus {
-    if (_isFlashSliderMode) {
+    if (_topSliderMode == 1) {
         CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMFlashLivenessManager sharedManager] flashIntensity];
         CGFloat next = current - 0.05f;
         if (next < 0.10f) next = 0.10f;
         if (_zoomSlider) _zoomSlider.value = next;
         [[VCAMFlashLivenessManager sharedManager] setFlashIntensity:next];
         [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", next * 100.0f]];
+    } else if (_topSliderMode == 2) {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMShadingManager sharedManager] shadingIntensity];
+        CGFloat next = current - 0.05f;
+        if (next < 0.05f) next = 0.05f;
+        if (_zoomSlider) _zoomSlider.value = next;
+        [[VCAMShadingManager sharedManager] setShadingIntensity:next];
+        [[VCAMShadingManager sharedManager] setGrainIntensity:next * 0.65f];
+        [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", next * 100.0f]];
     } else {
         CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
         CGFloat next = current - 0.10f;
@@ -1157,13 +1195,21 @@ BOOL VCamIsScreenPointInTweakUI(CGFloat normX, CGFloat normY) {
 }
 
 - (void)_zoomPlus {
-    if (_isFlashSliderMode) {
+    if (_topSliderMode == 1) {
         CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMFlashLivenessManager sharedManager] flashIntensity];
         CGFloat next = current + 0.05f;
         if (next > 0.90f) next = 0.90f;
         if (_zoomSlider) _zoomSlider.value = next;
         [[VCAMFlashLivenessManager sharedManager] setFlashIntensity:next];
         [self _showToast:[NSString stringWithFormat:@"⚡ Độ đậm: %.0f%%", next * 100.0f]];
+    } else if (_topSliderMode == 2) {
+        CGFloat current = _zoomSlider ? _zoomSlider.value : [[VCAMShadingManager sharedManager] shadingIntensity];
+        CGFloat next = current + 0.05f;
+        if (next > 1.00f) next = 1.00f;
+        if (_zoomSlider) _zoomSlider.value = next;
+        [[VCAMShadingManager sharedManager] setShadingIntensity:next];
+        [[VCAMShadingManager sharedManager] setGrainIntensity:next * 0.65f];
+        [self _showToast:[NSString stringWithFormat:@"🎭 Khối 3D & Hạt: %.0f%%", next * 100.0f]];
     } else {
         CGFloat current = _zoomSlider ? _zoomSlider.value : VCamGetScale();
         CGFloat next = current + 0.10f;

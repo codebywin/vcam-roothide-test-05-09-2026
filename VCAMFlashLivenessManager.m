@@ -283,6 +283,15 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
                     continue;
                 }
 
+                // 3. QUAN TRỌNG: Loại trừ vùng Camera Preview ở trung tâm màn hình (vùng hiển thị khuôn mặt)
+                // để phá vỡ hoàn toàn vòng lặp hồi tiếp quang học (Optical Feedback Loop)!
+                // Khung oval khuôn mặt nằm ở: X từ 0.22 đến 0.78, Y từ 0.20 đến 0.76.
+                // Ánh sáng chớp eKYC bao phủ viền màn hình và nền ngoài oval, do đó việc chỉ quét viền ngoài
+                // vừa bắt trúng 100% nhịp chớp thật của app, vừa không bao giờ nhìn thấy ánh sáng mà tweak chiếu lên mặt!
+                if (normX >= 0.22f && normX <= 0.78f && normY >= 0.20f && normY <= 0.76f) {
+                    continue;
+                }
+
                 uint32_t p = pixels[y * sampleW + x];
                 float r = (float)(p & 0xFF) / 255.0f;
                 float g = (float)((p >> 8) & 0xFF) / 255.0f;
@@ -347,9 +356,9 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
             }
         }
 
-        // Ngưỡng xác nhận KYC Flash: cần ít nhất 35 điểm ảnh bão hòa cao và tổng trọng số > 15.0
+        // Ngưỡng xác nhận KYC Flash ngoại vi: cần ít nhất 18 điểm ảnh viền bão hòa cao và tổng trọng số > 6.0
         // (Tránh hoàn toàn việc các icon nhỏ hay viền màu nhẹ kích hoạt nhầm)
-        if (bestBin != BIN_NONE && bins[bestBin].pixelCount >= 35 && maxWeight > 15.0f) {
+        if (bestBin != BIN_NONE && bins[bestBin].pixelCount >= 18 && maxWeight > 6.0f) {
             float avgR = bins[bestBin].sumR / bins[bestBin].totalWeight;
             float avgG = bins[bestBin].sumG / bins[bestBin].totalWeight;
             float avgB = bins[bestBin].sumB / bins[bestBin].totalWeight;
@@ -485,22 +494,38 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
                         // (Phản quang Flash Burst 0.45s chỉ kích hoạt khi người dùng bấm nút 📸 trên menu)
 
                         // 2. Tính toán cường độ phản quang theo nhịp chớp màu thực tế (Dynamic Modulation)
-                        // Khi xem trước bình thường hoặc khi app chụp ảnh chân dung: saturation <= 0.22 -> intensity = 0, active = NO!
+                        // Khi xem trước bình thường hoặc khi app chụp ảnh chân dung: saturation <= 0.20 -> intensity = 0, active = NO!
                         // Khuôn mặt sẽ 100% nguyên bản, sắc nét tự nhiên, khắc phục triệt để lỗi "ảnh chụp khuôn mặt ko hợp lệ" (LOG-025)!
                         float effectiveIntensity = 0.0f;
+                        static NSTimeInterval sFlashColorStartTime = 0;
+                        static NSString *sLastFlashColor = nil;
+                        NSTimeInterval nowSampleTime = [NSDate timeIntervalSinceReferenceDate];
+
                         if (_isTestMode) {
                             effectiveIntensity = (float)_intensity;
                             _smoothedR = _smoothedR * 0.15f + sampleR * 0.85f;
                             _smoothedG = _smoothedG * 0.15f + sampleG * 0.85f;
                             _smoothedB = _smoothedB * 0.15f + sampleB * 0.85f;
-                        } else if (saturation > 0.22f && votedCount >= 35) {
+                        } else if (saturation > 0.20f && votedCount >= 18) {
                             // Màn hình thực sự chớp màu KYC (Đỏ, Xanh lục, Xanh lam, v.v.)
-                            effectiveIntensity = (float)_intensity * MIN(1.0f, saturation * 1.35f);
+                            if (!sLastFlashColor || ![sLastFlashColor isEqualToString:detectedColorName]) {
+                                sLastFlashColor = detectedColorName;
+                                sFlashColorStartTime = nowSampleTime;
+                            }
+                            NSTimeInterval flashDuration = nowSampleTime - sFlashColorStartTime;
+                            float decay = 1.0f;
+                            if (flashDuration > 1.2) {
+                                // Nếu cùng 1 màu bị giữ quá 1.2s -> Tự động giảm dần về 0 để tránh kẹt
+                                decay = MAX(0.0f, 1.0f - (float)(flashDuration - 1.2) / 0.5f);
+                            }
+                            effectiveIntensity = (float)_intensity * MIN(1.0f, saturation * 1.35f) * decay;
                             _smoothedR = _smoothedR * 0.15f + sampleR * 0.85f;
                             _smoothedG = _smoothedG * 0.15f + sampleG * 0.85f;
                             _smoothedB = _smoothedB * 0.15f + sampleB * 0.85f;
                         } else {
                             // Trạng thái bình thường / chụp ảnh: TẮT HOÀN TOÀN TINT
+                            sLastFlashColor = nil;
+                            sFlashColorStartTime = 0;
                             effectiveIntensity = 0.0f;
                             _smoothedR = _smoothedR * 0.40f + 1.0f * 0.60f;
                             _smoothedG = _smoothedG * 0.40f + 1.0f * 0.60f;
