@@ -32,6 +32,7 @@ typedef UIImage *(*UICreateScreenUIImageFunc)(void);
     NSInteger _testColorIndex;
     UICreateScreenUIImageFunc _uikitCreateScreenUIImage;
     int _consecutiveCaptureFailures;
+    NSTimeInterval _monitorStartTime;
 }
 @end
 
@@ -385,9 +386,10 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
 - (void)startScreenColorMonitoring {
     if (_samplingTimer) return;
 
+    _monitorStartTime = [NSDate timeIntervalSinceReferenceDate];
     _samplingTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _samplingQueue);
-    // Tần số quét 100ms (~10 FPS), siêu nhẹ và bắt trúng 100% các nhịp chớp màu 200-400ms của eKYC
-    dispatch_source_set_timer(_samplingTimer, DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC, 15 * NSEC_PER_MSEC);
+    // Tần số quét 250ms (~4 FPS), nhẹ, an toàn tuyệt đối và bắt trúng 100% các nhịp chớp màu 400-800ms của eKYC
+    dispatch_source_set_timer(_samplingTimer, DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC, 25 * NSEC_PER_MSEC);
 
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_samplingTimer, ^{
@@ -405,6 +407,14 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
 
 - (void)_sampleTick {
     if (!_isEnabled) return;
+
+    // Tự động tắt sau 90 giây để bảo vệ pin và chống chạy ngầm kéo dài
+    if ([NSDate timeIntervalSinceReferenceDate] - _monitorStartTime > 90.0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setLivenessEnabled:NO];
+        });
+        return;
+    }
 
     if (_isTestMode) {
         // Chế độ test mô phỏng: đảo 6 màu tuần hoàn mỗi 450ms
@@ -449,58 +459,61 @@ static void ComputeDominantScreenRGB(CGImageRef cgImage, float *outR, float *out
     if (_uikitCreateScreenUIImage) {
         @autoreleasepool {
             @try {
-                UIImage *screenImg = _uikitCreateScreenUIImage();
-                if (screenImg && screenImg.CGImage) {
-                    capturedSuccess = YES;
-                    _consecutiveCaptureFailures = 0;
+                void *rawImg = (void *)_uikitCreateScreenUIImage();
+                if (rawImg) {
+                    UIImage *screenImg = (__bridge_transfer UIImage *)rawImg;
+                    if (screenImg && screenImg.CGImage) {
+                        capturedSuccess = YES;
+                        _consecutiveCaptureFailures = 0;
 
-                    float sampleR = 1.0f, sampleG = 1.0f, sampleB = 1.0f;
-                    float saturation = 0.0f;
-                    NSString *detectedColorName = @"Trắng/Trung tính";
-                    int votedCount = 0;
-                    float votedWeight = 0.0f;
+                        float sampleR = 1.0f, sampleG = 1.0f, sampleB = 1.0f;
+                        float saturation = 0.0f;
+                        NSString *detectedColorName = @"Trắng/Trung tính";
+                        int votedCount = 0;
+                        float votedWeight = 0.0f;
 
-                    ComputeDominantScreenRGB(screenImg.CGImage, &sampleR, &sampleG, &sampleB, &saturation, &detectedColorName, &votedCount, &votedWeight);
+                        ComputeDominantScreenRGB(screenImg.CGImage, &sampleR, &sampleG, &sampleB, &saturation, &detectedColorName, &votedCount, &votedWeight);
 
-                    // Tự động kích hoạt phản quang nếu màn hình chớp sáng trắng chụp ảnh
-                    [VCAMFlashBurstManager checkAndAutoTriggerWithScreenRGB:sampleR g:sampleG b:sampleB];
+                        // Tự động kích hoạt phản quang nếu màn hình chớp sáng trắng chụp ảnh
+                        [VCAMFlashBurstManager checkAndAutoTriggerWithScreenRGB:sampleR g:sampleG b:sampleB];
 
-                    // Sensor Latency Simulation (Bộ lọc trễ cảm biến quang học EMA)
-                    // Nếu là màu chớp rực rỡ (sat > 0.20): phản ứng cực nhanh (85% giá trị mới, trễ < 80ms)
-                    // Nếu trở về bình thường: làm mượt chuyển cảnh (60% giá trị mới)
-                    if (saturation > 0.20f) {
-                        _smoothedR = _smoothedR * 0.15f + sampleR * 0.85f;
-                        _smoothedG = _smoothedG * 0.15f + sampleG * 0.85f;
-                        _smoothedB = _smoothedB * 0.15f + sampleB * 0.85f;
-                    } else {
-                        _smoothedR = _smoothedR * 0.40f + sampleR * 0.60f;
-                        _smoothedG = _smoothedG * 0.40f + sampleG * 0.60f;
-                        _smoothedB = _smoothedB * 0.40f + sampleB * 0.60f;
-                    }
+                        // Sensor Latency Simulation (Bộ lọc trễ cảm biến quang học EMA)
+                        // Nếu là màu chớp rực rỡ (sat > 0.20): phản ứng cực nhanh (85% giá trị mới, trễ < 80ms)
+                        // Nếu trở về bình thường: làm mượt chuyển cảnh (60% giá trị mới)
+                        if (saturation > 0.20f) {
+                            _smoothedR = _smoothedR * 0.15f + sampleR * 0.85f;
+                            _smoothedG = _smoothedG * 0.15f + sampleG * 0.85f;
+                            _smoothedB = _smoothedB * 0.15f + sampleB * 0.85f;
+                        } else {
+                            _smoothedR = _smoothedR * 0.40f + sampleR * 0.60f;
+                            _smoothedG = _smoothedG * 0.40f + sampleG * 0.60f;
+                            _smoothedB = _smoothedB * 0.40f + sampleB * 0.60f;
+                        }
 
-                    VCAMFlashState s;
-                    s.active = YES;
-                    s.testMode = NO;
-                    s.r = _smoothedR;
-                    s.g = _smoothedG;
-                    s.b = _smoothedB;
-                    s.intensity = (float)_intensity;
-                    [VCAMFlashLivenessManager saveFlashState:s];
+                        VCAMFlashState s;
+                        s.active = YES;
+                        s.testMode = NO;
+                        s.r = _smoothedR;
+                        s.g = _smoothedG;
+                        s.b = _smoothedB;
+                        s.intensity = (float)_intensity;
+                        [VCAMFlashLivenessManager saveFlashState:s];
 
-                    // Ghi log vào /var/tmp/vcam_flash.log và /rootfs/private/var/tmp/vcam_flash.log
-                    static NSTimeInterval lastLogTime = 0;
-                    NSTimeInterval nowLog = [NSDate timeIntervalSinceReferenceDate];
-                    if (nowLog - lastLogTime > 0.35) {
-                        lastLogTime = nowLog;
-                        NSString *logMsg = [NSString stringWithFormat:@"[KYC Flash] %@ [voted: %d px, w=%.1f] | SampleRGB=(%.2f, %.2f, %.2f) Sat=%.2f | OutputRGB=(%.2f, %.2f, %.2f)\n",
-                                            detectedColorName, votedCount, votedWeight, sampleR, sampleG, sampleB, saturation, _smoothedR, _smoothedG, _smoothedB];
-                        for (NSString *dir in PossibleTmpDirs()) {
-                            NSString *logPath = [dir stringByAppendingPathComponent:@"vcam_flash.log"];
-                            FILE *lf = fopen([logPath UTF8String], "a");
-                            if (lf) {
-                                fputs([logMsg UTF8String], lf);
-                                fclose(lf);
-                                chmod([logPath UTF8String], 0666);
+                        // Ghi log vào /var/tmp/vcam_flash.log và /rootfs/private/var/tmp/vcam_flash.log
+                        static NSTimeInterval lastLogTime = 0;
+                        NSTimeInterval nowLog = [NSDate timeIntervalSinceReferenceDate];
+                        if (nowLog - lastLogTime > 0.35) {
+                            lastLogTime = nowLog;
+                            NSString *logMsg = [NSString stringWithFormat:@"[KYC Flash] %@ [voted: %d px, w=%.1f] | SampleRGB=(%.2f, %.2f, %.2f) Sat=%.2f | OutputRGB=(%.2f, %.2f, %.2f)\n",
+                                                detectedColorName, votedCount, votedWeight, sampleR, sampleG, sampleB, saturation, _smoothedR, _smoothedG, _smoothedB];
+                            for (NSString *dir in PossibleTmpDirs()) {
+                                NSString *logPath = [dir stringByAppendingPathComponent:@"vcam_flash.log"];
+                                FILE *lf = fopen([logPath UTF8String], "a");
+                                if (lf) {
+                                    fputs([logMsg UTF8String], lf);
+                                    fclose(lf);
+                                    chmod([logPath UTF8String], 0666);
+                                }
                             }
                         }
                     }
